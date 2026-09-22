@@ -44,14 +44,14 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 # PERFORMANCE & DETECTION CONFIGURATION
 # Configurable parameters for speed, ROI, and temporal confirmation
 # ============================================================
-IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 416))           # 416 or 512 for fast inference (was 640)
+IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for reliable small plate detection
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
-USE_FP16 = DEVICE == "cuda"
+USE_FP16 = False  # Keep false on CPU to prevent warnings
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 2
@@ -1151,6 +1151,7 @@ class VehicleConfirmationManager:
                     det["status"] = "CONFIRMED"
                     det["consistency"] = 1.0
                     det["is_newly_confirmed"] = True
+                    det.pop("plate_crop", None)
                 return detections
 
             # Mode Stream / Live CCTV
@@ -1205,6 +1206,8 @@ class VehicleConfirmationManager:
                     det["analyzing_frame_count"] = len(track.frames)
                     det["analyzing_max_frames"] = MAX_OBSERVATIONS
 
+                # PENTING: Jangan kirim plate_crop (ndarray) ke client / JSON response
+                det.pop("plate_crop", None)
                 updated_detections.append(det)
 
             return updated_detections
@@ -1243,17 +1246,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
     ih, iw = img.shape[:2]
 
-    # 1. YOLO INFERENCE (Configurable imgsz=416/512, device, FP16)
+    # 1. YOLO INFERENCE (Configurable imgsz=640, device)
     t_yolo_0 = time.time()
     if is_stream:
         fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml",
-                               conf=m_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
+                               conf=m_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)
     else:
         fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
-                               imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
+                               imgsz=IMG_SIZE, device=DEVICE, verbose=False)
 
     fut_p = ai_pool.submit(plate_model.predict, img, conf=p_conf_thresh,
-                           imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
+                           imgsz=IMG_SIZE, device=DEVICE, verbose=False)
     vdet = fut_v.result()[0]
     pdet_global = fut_p.result()[0]
     t_yolo = time.time() - t_yolo_0
@@ -1296,7 +1299,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_body_total = 0.0
     t_ocr_total = 0.0
 
-    # Jika kendaraan terdeteksi di dalam ROI
+    # Jika kendaraan terdeteksi
     if candidates:
         if single_vehicle_mode and len(candidates) > 1:
             if global_plates:
@@ -1358,7 +1361,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 plate_conf_val = matched_plate["conf"]
                 abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
             elif vehicle_crop.size > 0:
-                pdet_crop = plate_model.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)[0]
+                pdet_crop = plate_model.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                 if len(pdet_crop.boxes) > 0:
                     best_b = max(pdet_crop.boxes, key=lambda b: float(b.conf[0]))
                     cpx1, cpy1, cpx2, cpy2 = map(int, best_b.xyxy[0].tolist())
@@ -1399,6 +1402,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_track_0 = time.time()
     results_out = confirmation_manager.update(results_out, is_stream=is_stream)
     t_track = time.time() - t_track_0
+
+    # Pastikan ndarray tidak pernah dikirim ke JSON / client
+    for d in results_out:
+        d.pop("plate_crop", None)
 
     t_total = time.time() - t_start
     fps = 1.0 / max(1e-4, t_total)
