@@ -749,9 +749,11 @@ def ensemble_plate_reading(plate_crop):
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     """
-    Sistem klasifikasi bodi kendaraan & harmonisasi tipe kendaraan terpadu v2:
-    - Menghilangkan misklasifikasi mobil keluarga (Innova, Avanza, Ertiga, Xpander) menjadi Bus atau Sports Car.
-    - Mengelompokkan kendaraan Indonesia secara presisi: MPV, SUV, Sedan, Hatchback, Pickup, Truk, Minibus, Bus, Motor.
+    Sistem klasifikasi bodi kendaraan 12 kelas (11 model body style + Motor):
+    - Mendukung penuh: Crossover, SUV, MPV, Hatchback, Sedan, Fastback, Wagon,
+      Minibus, Pickup Truck, Convertible, Sports_HardtopConvertible, dan Motor.
+    - Dilengkapi aturan Front-View CCTV agar mobil compact (seperti BYD Dolphin/Seagull)
+      tidak salah terdeteksi SUV, dan Crossover modern (seperti Hyundai IONIQ 5) terdeteksi tepat.
     """
     if initial_vtype == "motorcycle":
         return "motorcycle", "Motor", round(v_conf, 3)
@@ -781,63 +783,72 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
+    # Harmonisasi jika mobil penumpang terdeteksi sebagai truck oleh model deteksi
+    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_fastback
+    if initial_vtype == "truck" and passenger_signal > 0.60 and p_pickup < 0.25:
+        initial_vtype = "car"
+
     # 1. KENDARAAN DETEKSI TRUK (vehicle_model)
     if initial_vtype == "truck":
-        # Pickup Bak Ringan (Carry, Gran Max Bak, L300)
-        if p_pickup >= 0.35:
-            return 'truck', 'Pickup', round(p_pickup, 3)
-        # Isuzu Elf travel van (Hanya jika benar-benar travel bus microbus dengan keyakinan minibus ekstrem)
-        if p_minibus >= 0.95 and v_conf < 0.70:
+        if p_pickup >= 0.30:
+            return 'truck', 'Pickup Truck', round(p_pickup, 3)
+        if p_minibus >= 0.90 and v_conf < 0.70:
             return 'bus', 'Minibus', round(p_minibus, 3)
-        # Truk Komersial murni (Canter, Dutro, Dump Truck, Box, Fuso, Tronton)
         return 'truck', 'Truk', round(v_conf, 3)
 
     # 2. KENDARAAN DETEKSI BUS (vehicle_model)
     if initial_vtype == "bus":
-        if p_minibus >= 0.35:
+        if p_minibus >= 0.30:
             return 'bus', 'Minibus', round(p_minibus, 3)
         return 'bus', 'Bus', round(v_conf, 3)
 
-    # 3. KENDARAAN DETEKSI MOBIL PENUMPANG (CAR)
-    # Filter ketat Sports Car: Hanya jika probabilitas tinggi dan bodi sangat ceper (aspect < 0.52)
-    if (p_sports + p_conv) >= 0.65 and aspect < 0.52:
-        return 'car', 'Sports Car', round(p_sports + p_conv, 3)
+    # 3. KENDARAAN MOBIL PENUMPANG (CAR) - 11 Kategori Lengkap
+    score_conv = p_conv
+    score_sports = p_sports
+    score_fastback = p_fastback * 0.4  # Aturan CCTV: Jangan tebak Fastback dari tampak depan murni
+    score_pickup = p_pickup
+    score_minibus = p_minibus
+    score_wagon = p_wagon
+    score_mpv = p_mpv * 1.3 + p_wagon * 0.7
+    score_suv = p_suv * 1.2
+    score_crossover = p_crossover * 1.2
+    score_hatch = p_hatch * 1.2
+    score_sedan = p_sedan * 1.2
 
-    # Filter Minibus Komersial murni (HiAce, Staria, Alphard panjang):
-    # Hanya jika p_minibus sangat dominan dan rasio bodi tinggi boxy
-    if p_minibus >= 0.75 and aspect >= 0.80 and (car_w * car_h) > 150000:
-        return 'bus', 'Minibus', round(p_minibus, 3)
+    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah Crossover atau Sedan
+    if p_fastback >= 0.25 or p_sports >= 0.25:
+        if aspect >= 0.70:
+            # Bodi agak jangkung / raised -> Crossover (seperti Hyundai IONIQ 5)
+            score_crossover += (p_fastback * 0.85) + (p_sports * 0.75)
+        else:
+            # Bodi ceper -> Sedan
+            score_sedan += (p_fastback * 0.85) + (p_sports * 0.75)
 
-    # Pickup / Double Cabin terdeteksi sebagai car
-    if p_pickup >= 0.55:
-        return 'truck', 'Pickup', round(p_pickup, 3)
+    # Aturan CCTV Tampak Depan: Hatchback vs SUV (Mobil kecil tampak tinggi dari sudut CCTV)
+    if p_hatch >= 0.30 and p_suv >= 0.30:
+        score_hatch += 0.20
 
-    # Untuk mobil penumpang harian di Indonesia:
-    # Gabungkan sinyal MPV: Di model barat, MPV keluarga Indonesia (Innova, Avanza, Ertiga, Calya)
-    # sering terpecah sinyalnya ke MPV + Wagon + Minibus + Crossover
-    score_mpv = p_mpv * 1.5 + p_wagon * 1.2 + p_minibus * 0.9
-    score_suv = p_suv * 1.3 + p_crossover * 1.0
-    score_hatch = p_hatch * 1.3 + p_fastback * 0.8
-    score_sedan = p_sedan * 1.3
-
-    # Penyesuaian proporsi fisik (Aspect Ratio & Ground Clearance):
-    if aspect >= 0.72:
-        # Bodi jangkung (MPV / SUV)
-        score_mpv += 0.20
-        score_suv += 0.15
-        score_sedan = max(0.0, score_sedan - 0.30)
-    elif aspect <= 0.62:
-        # Bodi rendah / ceper (Sedan / Hatchback)
-        score_sedan += 0.20
-        score_hatch += 0.15
-        score_mpv = max(0.0, score_mpv - 0.25)
-        score_suv = max(0.0, score_suv - 0.25)
+    # Penyesuaian proporsi fisik (Aspect Ratio & Ground Clearance)
+    if aspect >= 0.82:
+        score_mpv += 0.10
+        score_suv += 0.08
+        score_minibus += 0.10
+    elif aspect <= 0.60:
+        score_sedan += 0.10
+        score_hatch += 0.08
 
     scores = {
-        'MPV': score_mpv,
+        'Crossover': score_crossover,
         'SUV': score_suv,
+        'MPV': score_mpv,
         'Hatchback': score_hatch,
-        'Sedan': score_sedan
+        'Sedan': score_sedan,
+        'Fastback': score_fastback,
+        'Wagon': score_wagon,
+        'Minibus': score_minibus,
+        'Pickup Truck': score_pickup,
+        'Convertible': score_conv,
+        'Sports_HardtopConvertible': score_sports
     }
 
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
@@ -853,12 +864,6 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
 def map_indonesian_body_style(probs_dict, bbox, img_shape):
     """Wrapper kompatibilitas mundur untuk pemanggilan lawas."""
     top1_name = max(probs_dict.items(), key=lambda kv: kv[1])[0]
-    if top1_name == 'Wagon':
-        return 'MPV', round(probs_dict[top1_name], 3)
-    elif top1_name == 'Crossover':
-        return 'SUV', round(probs_dict[top1_name], 3)
-    elif top1_name in ['Convertible', 'Sports_HardtopConvertible']:
-        return 'Sports Car', round(probs_dict[top1_name], 3)
     return top1_name, round(probs_dict[top1_name], 3)
 
 
