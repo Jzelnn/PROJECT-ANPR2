@@ -30,9 +30,57 @@ if not hasattr(np, 'sctypes'):
 from ultralytics import YOLO
 import easyocr
 
+try:
+    import torch
+    HAS_CUDA = torch.cuda.is_available()
+except ImportError:
+    HAS_CUDA = False
+
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 CAPTURES_DIR = os.path.join(MODEL_DIR, "captures")
 os.makedirs(CAPTURES_DIR, exist_ok=True)
+
+# ============================================================
+# PERFORMANCE & DETECTION CONFIGURATION
+# Configurable parameters for speed, ROI, and temporal confirmation
+# ============================================================
+IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 416))           # 416 or 512 for fast inference (was 640)
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
+MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
+PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
+IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
+FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
+DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
+USE_FP16 = DEVICE == "cuda"
+
+# ROI Configuration (Normalized 0.0 to 1.0)
+# Default: active gate lane (width: 8% to 92%, height: 12% to 98%)
+ROI_CONFIG = {
+    "x_min": float(os.environ.get("ANPR_ROI_X_MIN", 0.08)),
+    "y_min": float(os.environ.get("ANPR_ROI_Y_MIN", 0.12)),
+    "x_max": float(os.environ.get("ANPR_ROI_X_MAX", 0.92)),
+    "y_max": float(os.environ.get("ANPR_ROI_Y_MAX", 0.98))
+}
+
+# Fast Temporal Confirmation Configuration
+MIN_OBSERVATIONS = 2
+MAX_OBSERVATIONS = 3
+TEMPORAL_WINDOW_SEC = 0.25  # 150-250 ms max window
+CONSISTENCY_THRESH = 0.70   # 70%
+CONFIRM_CONF_THRESH = 0.80  # 80-85%
+
+
+def is_in_roi(bbox, img_w, img_h, roi=ROI_CONFIG):
+    """
+    Cek apakah deteksi kendaraan berada di dalam Region of Interest (ROI) gerbang.
+    Dihitung berdasarkan titik tengah (cx, cy) dari bbox kendaraan.
+    """
+    if not bbox or len(bbox) < 4:
+        return False
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2.0 / max(1, img_w)
+    cy = (y1 + y2) / 2.0 / max(1, img_h)
+    return (roi["x_min"] <= cx <= roi["x_max"]) and (roi["y_min"] <= cy <= roi["y_max"])
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -927,31 +975,43 @@ def get_gate_plate_priority(p, img_w, img_h):
 
 
 # ============================================================
-# FAST TEMPORAL CONFIRMATION & VEHICLE TRACKING
-# 3-5 frame buffer (300-500ms) with confidence-weighted voting.
+# FAST TEMPORAL CONFIRMATION & VEHICLE TRACKING (OPTIMIZED)
+# 2-3 frame buffer (150-250ms) with early confirmation & deferred OCR.
 # Guarantees exactly ONE confirmed record per vehicle in Entry History.
 # ============================================================
 class VehicleTrack:
     """
-    Melacak dan mengonfirmasi kendaraan secara temporal (3-5 frame / 300-500ms).
+    Melacak dan mengonfirmasi kendaraan secara temporal cepat (2-3 frame / 150-250ms).
     State Machine: DETECTED -> ANALYZING -> CONFIRMED -> HISTORY_SAVED
     """
     def __init__(self, track_id, initial_det=None):
         self.track_id = track_id
         self.created_at = time.time()
         self.last_seen = time.time()
-        self.frames = deque(maxlen=6)
+        self.frames = deque(maxlen=MAX_OBSERVATIONS)
         self.status = "DETECTED"  # DETECTED, ANALYZING, CONFIRMED, HISTORY_SAVED
         self.confirmed_data = None
         self.confirmation_score = 0.0
         self.history_saved = False
         self.last_bbox = None
+        # Cache body style to avoid re-classifying every frame
+        self.cached_body_style = None
+        self.cached_body_conf = 0.0
+        self.cached_vtype = None
+        self.best_plate_crop = None
+        self.best_plate_conf = 0.0
         if initial_det:
             self.add_frame(initial_det)
 
     def add_frame(self, det):
         self.last_seen = time.time()
         self.last_bbox = det.get("bbox")
+        p_crop = det.get("plate_crop")
+        p_conf = det.get("plate_confidence", 0.0) or 0.0
+        if p_crop is not None and getattr(p_crop, 'size', 0) > 0 and p_conf > self.best_plate_conf:
+            self.best_plate_crop = p_crop
+            self.best_plate_conf = p_conf
+
         self.frames.append({
             "time": self.last_seen,
             "vehicle_type": det.get("vehicle_type"),
@@ -959,7 +1019,8 @@ class VehicleTrack:
             "body_style": det.get("body_style"),
             "body_conf": det.get("body_style_confidence", 0.0) or 0.0,
             "license_plate": det.get("license_plate"),
-            "plate_conf": det.get("plate_confidence", 0.0) or 0.0,
+            "plate_conf": p_conf,
+            "plate_crop": p_crop,
             "bbox": det.get("bbox"),
             "plate_bbox": det.get("plate_bbox"),
             "ocr_method": det.get("ocr_method")
@@ -975,46 +1036,24 @@ class VehicleTrack:
 
     def _evaluate_confirmation(self):
         n = len(self.frames)
-        if n < 3:
+        if n < MIN_OBSERVATIONS:
             return
 
-        # 1. Early Confirmation Check:
-        # Jika 3 frame berturut-turut memprediksi body_style yang sama dengan confidence >= 0.80
-        recent_3 = list(self.frames)[-3:]
-        b_styles = [f["body_style"] for f in recent_3 if f["body_style"]]
-        b_confs = [f["body_conf"] for f in recent_3 if f["body_style"]]
+        # 1. EARLY CONFIRMATION (Frame 2):
+        # Jika ada 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= 80%
+        # Contoh: Frame 1: Motorcycle 0.91, Frame 2: Motorcycle 0.94 -> CONFIRM immediately!
+        f1, f2 = self.frames[0], self.frames[1]
+        same_vtype = (f1["vehicle_type"] == f2["vehicle_type"]) and (f1["v_conf"] >= CONFIRM_CONF_THRESH) and (f2["v_conf"] >= CONFIRM_CONF_THRESH)
+        same_bstyle = bool(f1["body_style"] and f2["body_style"] and (f1["body_style"] == f2["body_style"]) and (f1["body_conf"] >= CONFIRM_CONF_THRESH) and (f2["body_conf"] >= CONFIRM_CONF_THRESH))
 
-        if len(b_styles) == 3 and len(set(b_styles)) == 1 and all(c >= 0.80 for c in b_confs):
-            self._finalize_confirmation(reason="early_consistency")
+        if same_vtype or same_bstyle:
+            self._finalize_confirmation(reason="early_consistency_2_frames")
             return
 
-        # Hitung distribusi voting saat ini
-        counts = {}
-        style_weights = {}
-        total_w = 0.0
-        for f in self.frames:
-            bs = f["body_style"]
-            if bs:
-                counts[bs] = counts.get(bs, 0) + 1
-                w = max(0.1, f["body_conf"])
-                style_weights[bs] = style_weights.get(bs, 0.0) + w
-                total_w += w
-
-        top_count = max(counts.values()) if counts else 0
-        top_weight = max(style_weights.values()) if style_weights else 0.0
-        consistency = top_weight / max(1e-5, total_w)
-
-        # 2. Majority Confirmation di Frame 4:
-        # Jika ada mayoritas jelas (minimal 3 dari 4 frame, atau consistency >= 65%)
-        if n == 4:
-            if top_count >= 3 or consistency >= 0.65:
-                self._finalize_confirmation(reason="majority_at_4")
-                return
-
-        # 3. Finalize di Frame 5 (Maksimum Buffer 5 frame / ~500ms):
+        # 2. Maximum observations (3 frames) atau time window >= 250ms reached:
         time_span = self.frames[-1]["time"] - self.frames[0]["time"]
-        if n >= 5 or (n >= 4 and time_span >= 0.45):
-            self._finalize_confirmation(reason="buffer_max_reached")
+        if n >= MAX_OBSERVATIONS or time_span >= TEMPORAL_WINDOW_SEC:
+            self._finalize_confirmation(reason="buffer_max_3_frames")
 
     def _finalize_confirmation(self, reason="buffer_voting"):
         # A. Voting Body Style (Weighted Confidence)
@@ -1048,31 +1087,29 @@ class VehicleTrack:
             type_weights[vt] = type_weights.get(vt, 0.0) + w
         best_type = max(type_weights, key=type_weights.get) if type_weights else self.frames[-1]["vehicle_type"]
 
-        # C. Voting Plat Nomor (Normalisasi & Confidence-Weighted)
-        plate_weights = {}
-        plate_display = {}
-        plate_confs_dict = {}
-        for f in self.frames:
-            p = f["license_plate"]
-            if not p or p in ["TIDAK_TERBACA", "Unreadable", "-"]:
-                continue
-            clean_p = re.sub(r'[^A-Za-z0-9]', '', p).upper()
-            if len(clean_p) < 3:
-                continue
-            pw = max(0.2, f["plate_conf"])
-            plate_weights[clean_p] = plate_weights.get(clean_p, 0.0) + pw
-            plate_display[clean_p] = p
-            if clean_p not in plate_confs_dict:
-                plate_confs_dict[clean_p] = []
-            plate_confs_dict[clean_p].append(f["plate_conf"])
+        # C. DEFERRED OCR: Jalankan OCR HANYA saat kendaraan TERKONFIRMASI!
+        # Ambil plate_crop terbaik yang terkumpul di buffer
+        best_plate = None
+        best_plate_conf = None
+        ocr_method = None
 
-        if plate_weights:
-            best_clean = max(plate_weights, key=plate_weights.get)
-            best_plate = plate_display[best_clean]
-            best_plate_conf = float(np.mean(plate_confs_dict[best_clean]))
-        else:
-            best_plate = self.frames[-1]["license_plate"]
-            best_plate_conf = self.frames[-1]["plate_conf"]
+        target_crop = self.best_plate_crop
+        if target_crop is None or getattr(target_crop, 'size', 0) == 0:
+            for f in reversed(self.frames):
+                if f.get("plate_crop") is not None and getattr(f["plate_crop"], 'size', 0) > 0:
+                    target_crop = f["plate_crop"]
+                    break
+
+        if target_crop is not None and getattr(target_crop, 'size', 0) > 0:
+            try:
+                t_ocr_0 = time.time()
+                ensemble_res = ensemble_plate_reading(target_crop)
+                best_plate = ensemble_res["final"]
+                ocr_method = ensemble_res["method"]
+                best_plate_conf = ensemble_res["confidence"]
+                print(f"[PERF] Deferred OCR executed for Track #{self.track_id}: '{best_plate}' in {round((time.time() - t_ocr_0)*1000, 1)}ms")
+            except Exception as ocr_err:
+                print(f"[WARN] Deferred OCR error: {ocr_err}")
 
         # Frame terbaik untuk snapshot / bounding box
         best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
@@ -1087,7 +1124,7 @@ class VehicleTrack:
             "consistency": round(consistency_score, 2),
             "bbox": best_f["bbox"],
             "plate_bbox": best_f["plate_bbox"],
-            "ocr_method": best_f.get("ocr_method")
+            "ocr_method": ocr_method
         }
         self.confirmation_score = round(consistency_score, 2)
         self.status = "CONFIRMED"
@@ -1097,7 +1134,7 @@ class VehicleTrack:
             return 1.0
         counts = {}
         for f in self.frames:
-            b = f["body_style"]
+            b = f["body_style"] or f["vehicle_type"]
             if b:
                 counts[b] = counts.get(b, 0) + 1
         return round(max(counts.values()) / len(self.frames), 2) if counts else 1.0
@@ -1188,7 +1225,7 @@ class VehicleConfirmationManager:
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.get_current_consistency()
                     det["analyzing_frame_count"] = len(track.frames)
-                    det["analyzing_max_frames"] = 3
+                    det["analyzing_max_frames"] = MAX_OBSERVATIONS
 
                 updated_detections.append(det)
 
@@ -1211,8 +1248,12 @@ class VehicleConfirmationManager:
 confirmation_manager = VehicleConfirmationManager()
 
 
-def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.20, single_vehicle_mode=True, is_stream=False):
-    start_time = time.time()
+def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False):
+    t_start = time.time()
+    v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
+    m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
+    p_conf_thresh = plate_conf if plate_conf is not None else PLATE_CONF_THRESH
+
     if isinstance(image_input, np.ndarray):
         img = image_input
         image_path = "memory_frame"
@@ -1224,25 +1265,38 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
 
     ih, iw = img.shape[:2]
 
-    # 1. Deteksi/Tracking Kendaraan & 2. Deteksi Plat Nomor secara Paralel (Multi-core ThreadPool, imgsz=640)
+    # 1. YOLO INFERENCE (Configurable imgsz=416/512, device, FP16)
+    t_yolo_0 = time.time()
     if is_stream:
-        fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml", conf=motorcycle_conf, imgsz=640, verbose=False)
+        fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml",
+                               conf=m_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
     else:
-        fut_v = ai_pool.submit(vehicle_model.predict, img, conf=motorcycle_conf, imgsz=640, verbose=False)
+        fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
+                               imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
 
-    fut_p = ai_pool.submit(plate_model.predict, img, conf=plate_conf, imgsz=640, verbose=False)
+    fut_p = ai_pool.submit(plate_model.predict, img, conf=p_conf_thresh,
+                           imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)
     vdet = fut_v.result()[0]
     pdet_global = fut_p.result()[0]
+    t_yolo = time.time() - t_yolo_0
+
+    # 2. EARLY ROI FILTERING (Buang langsung objek di luar ROI gerbang)
+    t_roi_0 = time.time()
     candidates = []
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
         v_conf = float(box.conf[0])
         track_id = int(box.id[0]) if (box.id is not None) else None
         vehicle_type = VEHICLE_CLASS_NAMES[v_cls]
-        threshold = motorcycle_conf if vehicle_type == "motorcycle" else vehicle_conf
+        threshold = m_conf_thresh if vehicle_type == "motorcycle" else v_conf_thresh
         if v_conf < threshold:
             continue
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+        # EARLY ROI FILTER: Discard immediately if outside ROI!
+        if not is_in_roi([x1, y1, x2, y2], iw, ih):
+            continue
+
         area = (x2 - x1) * (y2 - y1)
         candidates.append({
             "track_id": track_id,
@@ -1254,6 +1308,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
             "y2": min(ih, y2),
             "area": area
         })
+    t_roi = time.time() - t_roi_0
 
     # Ekstraksi hasil deteksi plat nomor global
     global_plates = []
@@ -1266,11 +1321,12 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
         })
 
     results_out = []
+    t_body_total = 0.0
+    t_ocr_total = 0.0
 
-    # Jika kendaraan terdeteksi
+    # Jika kendaraan terdeteksi di dalam ROI
     if candidates:
         if single_vehicle_mode and len(candidates) > 1:
-            # Utamakan kendaraan yang berada di lajur gerbang aktif (memuat plat dengan skor prioritas gerbang tertinggi)
             if global_plates:
                 best_global_p = max(global_plates, key=lambda p: get_gate_plate_priority(p, iw, ih))
                 g_cx = (best_global_p["box"][0] + best_global_p["box"][2]) / 2.0
@@ -1291,9 +1347,24 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
             x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
             vehicle_crop = img[y1:y2, x1:x2]
 
-            vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
-                img, [x1, y1, x2, y2], initial_vtype, v_conf
-            )
+            # 3. BODY STYLE CACHING PER TRACK ID
+            t_b0 = time.time()
+            existing_trk = confirmation_manager.tracks.get(cand_track_id) if cand_track_id else None
+            if existing_trk and existing_trk.cached_body_style and existing_trk.cached_body_conf >= 0.80:
+                # REUSE CACHED RESULT (0 ms!)
+                vehicle_type = existing_trk.cached_vtype or initial_vtype
+                body_style = existing_trk.cached_body_style
+                body_style_conf = existing_trk.cached_body_conf
+            else:
+                # Jalankan klasifikasi bodi jika track baru atau confidence sebelumnya < 0.80
+                vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
+                    img, [x1, y1, x2, y2], initial_vtype, v_conf
+                )
+                if existing_trk:
+                    existing_trk.cached_body_style = body_style
+                    existing_trk.cached_body_conf = body_style_conf
+                    existing_trk.cached_vtype = vehicle_type
+            t_body_total += (time.time() - t_b0)
 
             matched_plate = None
             for p in global_plates:
@@ -1305,10 +1376,9 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                         p["matched"] = True
                         break
 
-            plate_text = None
             plate_conf_val = None
-            ocr_method = None
             abs_plate_bbox = None
+            plate_crop = np.array([])
 
             if matched_plate is not None:
                 gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
@@ -1316,7 +1386,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                 plate_conf_val = matched_plate["conf"]
                 abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
             elif vehicle_crop.size > 0:
-                pdet_crop = plate_model.predict(vehicle_crop, conf=plate_conf, imgsz=640, verbose=False)[0]
+                pdet_crop = plate_model.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, half=USE_FP16, verbose=False)[0]
                 if len(pdet_crop.boxes) > 0:
                     best_b = max(pdet_crop.boxes, key=lambda b: float(b.conf[0]))
                     cpx1, cpy1, cpx2, cpy2 = map(int, best_b.xyxy[0].tolist())
@@ -1324,15 +1394,18 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                     abs_plate_bbox = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
                     plate_crop = crop_plate_with_padding(img, abs_plate_bbox[0], abs_plate_bbox[1],
                                                          abs_plate_bbox[2], abs_plate_bbox[3])
-                else:
-                    plate_crop = np.array([])
-            else:
-                plate_crop = np.array([])
 
-            if plate_crop.size > 0:
+            plate_text = None
+            ocr_method = None
+
+            # 4. DEFERRED OCR: Jangan jalankan OCR di setiap frame stream!
+            # Hanya jalankan OCR jika mode single photo upload manual (bukan stream)
+            if not is_stream and plate_crop.size > 0:
+                t_o0 = time.time()
                 ensemble_res = ensemble_plate_reading(plate_crop)
                 plate_text = ensemble_res["final"]
                 ocr_method = ensemble_res["method"]
+                t_ocr_total += (time.time() - t_o0)
 
             results_out.append({
                 "track_id": cand_track_id,
@@ -1345,20 +1418,37 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                 "plate_confidence": round(plate_conf_val, 3) if plate_conf_val else None,
                 "bbox": [x1, y1, x2, y2],
                 "plate_bbox": abs_plate_bbox,
+                "plate_crop": plate_crop if is_stream else None,
                 "image_width": iw,
                 "image_height": ih,
             })
 
-    # Evaluasi konfirmasi temporal (Fast Temporal Confirmation)
+    # 5. FAST TEMPORAL CONFIRMATION (Evaluasi & Deferred OCR saat Confirmed)
+    t_track_0 = time.time()
     results_out = confirmation_manager.update(results_out, is_stream=is_stream)
+    t_track = time.time() - t_track_0
 
-    elapsed = time.time() - start_time
+    t_total = time.time() - t_start
+    fps = 1.0 / max(1e-4, t_total)
+
+    # 6. PERFORMANCE TELEMETRY LOGGING
+    print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | ROI: {round(t_roi*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+
     return {
         "detections": results_out,
-        "detection_time_sec": round(elapsed, 3),
+        "detection_time_sec": round(t_total, 3),
         "source": image_path,
         "image_width": iw,
-        "image_height": ih
+        "image_height": ih,
+        "perf_breakdown": {
+            "yolo_ms": round(t_yolo * 1000, 1),
+            "roi_ms": round(t_roi * 1000, 1),
+            "track_ms": round(t_track * 1000, 1),
+            "body_ms": round(t_body_total * 1000, 1),
+            "ocr_ms": round(t_ocr_total * 1000, 1),
+            "total_ms": round(t_total * 1000, 1),
+            "fps": round(fps, 1)
+        }
     }
 
 

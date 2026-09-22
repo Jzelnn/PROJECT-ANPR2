@@ -1279,7 +1279,8 @@ function handleDetectionResult(data, silent=false){
       showToast(`Entry Confirmed: ${trackText}${plateShow}${timeMs}`);
     } else if (!silent){
       const trackText = det.track_id ? `[#${det.track_id}] ` : '';
-      const statusText = det.status === 'ANALYZING' ? `Analyzing (${det.analyzing_frame_count || 1}/3)...` : 'Tracked';
+      const maxF = det.analyzing_max_frames || 2;
+      const statusText = det.status === 'ANALYZING' ? `Analyzing (${det.analyzing_frame_count || 1}/${maxF})...` : 'Tracked';
       showToast(`${trackText}${plateShow} - ${statusText}${timeMs}`);
     }
   } else {
@@ -1484,7 +1485,8 @@ function drawBoxes(det){
 
       const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
       const trackPrefix = det.track_id ? `[#${det.track_id}] ` : '';
-      const statusBadge = isConfirmed ? 'CONFIRMED' : `ANALYZING (${det.analyzing_frame_count || 1}/3)`;
+      const maxF = det.analyzing_max_frames || 2;
+      const statusBadge = isConfirmed ? 'CONFIRMED' : `ANALYZING (${det.analyzing_frame_count || 1}/${maxF})`;
       const baseLabel = det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type;
       const consistencyTxt = det.consistency ? ` • ${Math.round(det.consistency * 100)}%` : '';
       const labelText = `${trackPrefix}${baseLabel} • ${statusBadge}${consistencyTxt}`;
@@ -1523,7 +1525,7 @@ function drawBoxes(det){
       boxPlate.style.top = Math.round(offsetY + y1 * scale) + 'px';
       boxPlate.style.width = Math.round((x2 - x1) * scale) + 'px';
       boxPlate.style.height = Math.round((y2 - y1) * scale) + 'px';
-      boxPlate.querySelector('.det-label').textContent = det.license_plate || 'PLATE';
+      boxPlate.querySelector('.det-label').textContent = det.license_plate || 'PLATE DETECTED';
     } else if (boxPlate){
       boxPlate.style.display = 'none';
     }
@@ -1558,8 +1560,8 @@ function updateResultCard(det, detMs){
     tagBody.style.display = 'none';
   }
 
+  const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
   if (tagStatus){
-    const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
     tagStatus.style.display = 'inline-block';
     if (isConfirmed) {
       tagStatus.style.background = '#d1fae5';
@@ -1571,11 +1573,13 @@ function updateResultCard(det, detMs){
       tagStatus.style.background = '#eff6ff';
       tagStatus.style.color = '#1d4ed8';
       tagStatus.style.borderColor = '#bfdbfe';
-      tagStatus.textContent = `ANALYZING (${det.analyzing_frame_count || 1}/3)`;
+      const maxF = det.analyzing_max_frames || 2;
+      tagStatus.textContent = `ANALYZING (${det.analyzing_frame_count || 1}/${maxF})`;
     }
   }
 
-  document.getElementById('plateText').textContent = det.license_plate || 'Unreadable';
+  const plateDisplay = det.license_plate || (isConfirmed ? 'Unreadable' : (det.plate_bbox ? 'Reading plate...' : 'Detecting...'));
+  document.getElementById('plateText').textContent = plateDisplay;
   const confPct = det.plate_confidence ? Math.round(det.plate_confidence*100)+'%' : (det.vehicle_confidence ? Math.round(det.vehicle_confidence*100)+'%' : '-');
   document.getElementById('pctConf').textContent = confPct;
 
