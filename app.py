@@ -44,7 +44,7 @@ GATE_COOLDOWN_SEC = 3.0
 
 
 def save_parking_record(det, source_img=None, source_img_path=None):
-    """Menyimpan hasil deteksi langsung ke memory RAM (0ms) dengan Anti-Passback Cooldown (3s)."""
+    """Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms) dengan Anti-Passback Cooldown (3s)."""
     global LATEST_RECORDS, LAST_RECORDED_PLATES
     now = datetime.datetime.now()
     now_epoch = time.time()
@@ -55,6 +55,8 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     if not isinstance(plate_text, str):
         plate_text = str(plate_text)
     safe_plate = re.sub(r'[^A-Za-z0-9]', '', plate_text) or "UNKNOWN"
+
+    track_id = det.get("track_id")
 
     # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 3 detik lalu, gunakan record yang ada
     if safe_plate != "UNKNOWN" and safe_plate in LAST_RECORDED_PLATES:
@@ -73,15 +75,18 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     except Exception:
         snapshot_filename = None
 
-    conf_val = det.get("plate_confidence") or det.get("vehicle_confidence") or 0.0
+    conf_val = det.get("plate_confidence") or det.get("body_style_confidence") or det.get("vehicle_confidence") or 0.0
 
     rec = {
         "id": int(now_epoch * 1000) % 1000000,
+        "track_id": track_id,
         "timestamp": timestamp_str,
         "license_plate": det.get("license_plate"),
         "vehicle_type": det.get("vehicle_type"),
         "body_style": det.get("body_style"),
         "confidence": round(conf_val, 3) if conf_val else None,
+        "consistency": det.get("consistency", 1.0),
+        "status": "CONFIRMED",
         "latency_ms": det.get("latency_ms"),
         "snapshot_url": f"/captures/{snapshot_filename}" if snapshot_filename else None
     }
@@ -141,6 +146,8 @@ class CameraStreamManager:
         self.status = "disconnected"
         self.latest_frame = None
         self.latest_jpeg = None
+        if 'confirmation_manager' in globals():
+            confirmation_manager.reset()
         self.condition.notify_all()
 
     def get_latest_frame(self):
@@ -914,7 +921,292 @@ def get_gate_plate_priority(p, img_w, img_h):
     return area * (conf ** 0.5) * y_weight * lane_weight
 
 
-def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.20, single_vehicle_mode=True):
+# ============================================================
+# FAST TEMPORAL CONFIRMATION & VEHICLE TRACKING
+# 3-5 frame buffer (300-500ms) with confidence-weighted voting.
+# Guarantees exactly ONE confirmed record per vehicle in Entry History.
+# ============================================================
+class VehicleTrack:
+    """
+    Melacak dan mengonfirmasi kendaraan secara temporal (3-5 frame / 300-500ms).
+    State Machine: DETECTED -> ANALYZING -> CONFIRMED -> HISTORY_SAVED
+    """
+    def __init__(self, track_id, initial_det=None):
+        self.track_id = track_id
+        self.created_at = time.time()
+        self.last_seen = time.time()
+        self.frames = deque(maxlen=6)
+        self.status = "DETECTED"  # DETECTED, ANALYZING, CONFIRMED, HISTORY_SAVED
+        self.confirmed_data = None
+        self.confirmation_score = 0.0
+        self.history_saved = False
+        self.last_bbox = None
+        if initial_det:
+            self.add_frame(initial_det)
+
+    def add_frame(self, det):
+        self.last_seen = time.time()
+        self.last_bbox = det.get("bbox")
+        self.frames.append({
+            "time": self.last_seen,
+            "vehicle_type": det.get("vehicle_type"),
+            "v_conf": det.get("vehicle_confidence", 0.0) or 0.0,
+            "body_style": det.get("body_style"),
+            "body_conf": det.get("body_style_confidence", 0.0) or 0.0,
+            "license_plate": det.get("license_plate"),
+            "plate_conf": det.get("plate_confidence", 0.0) or 0.0,
+            "bbox": det.get("bbox"),
+            "plate_bbox": det.get("plate_bbox"),
+            "ocr_method": det.get("ocr_method")
+        })
+
+        if self.status in ["CONFIRMED", "HISTORY_SAVED"]:
+            return
+
+        if len(self.frames) >= 1:
+            self.status = "ANALYZING"
+
+        self._evaluate_confirmation()
+
+    def _evaluate_confirmation(self):
+        n = len(self.frames)
+        if n < 3:
+            return
+
+        # 1. Early Confirmation Check:
+        # Jika 3 frame berturut-turut memprediksi body_style yang sama dengan confidence >= 0.80
+        recent_3 = list(self.frames)[-3:]
+        b_styles = [f["body_style"] for f in recent_3 if f["body_style"]]
+        b_confs = [f["body_conf"] for f in recent_3 if f["body_style"]]
+
+        if len(b_styles) == 3 and len(set(b_styles)) == 1 and all(c >= 0.80 for c in b_confs):
+            self._finalize_confirmation(reason="early_consistency")
+            return
+
+        # Hitung distribusi voting saat ini
+        counts = {}
+        style_weights = {}
+        total_w = 0.0
+        for f in self.frames:
+            bs = f["body_style"]
+            if bs:
+                counts[bs] = counts.get(bs, 0) + 1
+                w = max(0.1, f["body_conf"])
+                style_weights[bs] = style_weights.get(bs, 0.0) + w
+                total_w += w
+
+        top_count = max(counts.values()) if counts else 0
+        top_weight = max(style_weights.values()) if style_weights else 0.0
+        consistency = top_weight / max(1e-5, total_w)
+
+        # 2. Majority Confirmation di Frame 4:
+        # Jika ada mayoritas jelas (minimal 3 dari 4 frame, atau consistency >= 65%)
+        if n == 4:
+            if top_count >= 3 or consistency >= 0.65:
+                self._finalize_confirmation(reason="majority_at_4")
+                return
+
+        # 3. Finalize di Frame 5 (Maksimum Buffer 5 frame / ~500ms):
+        time_span = self.frames[-1]["time"] - self.frames[0]["time"]
+        if n >= 5 or (n >= 4 and time_span >= 0.45):
+            self._finalize_confirmation(reason="buffer_max_reached")
+
+    def _finalize_confirmation(self, reason="buffer_voting"):
+        # A. Voting Body Style (Weighted Confidence)
+        style_weights = {}
+        total_style_weight = 0.0
+        for f in self.frames:
+            bs = f["body_style"]
+            if not bs:
+                continue
+            w = max(0.1, f["body_conf"])
+            style_weights[bs] = style_weights.get(bs, 0.0) + w
+            total_style_weight += w
+
+        if style_weights:
+            best_style = max(style_weights, key=style_weights.get)
+            consistency_score = style_weights[best_style] / max(1e-5, total_style_weight)
+            style_confs = [f["body_conf"] for f in self.frames if f["body_style"] == best_style and f["body_conf"] > 0]
+            avg_style_conf = float(np.mean(style_confs)) if style_confs else 0.85
+        else:
+            best_style = self.frames[-1]["body_style"]
+            consistency_score = 1.0
+            avg_style_conf = self.frames[-1]["body_conf"]
+
+        # B. Voting Vehicle Type
+        type_weights = {}
+        for f in self.frames:
+            vt = f["vehicle_type"]
+            if not vt:
+                continue
+            w = max(0.1, f["v_conf"])
+            type_weights[vt] = type_weights.get(vt, 0.0) + w
+        best_type = max(type_weights, key=type_weights.get) if type_weights else self.frames[-1]["vehicle_type"]
+
+        # C. Voting Plat Nomor (Normalisasi & Confidence-Weighted)
+        plate_weights = {}
+        plate_display = {}
+        plate_confs_dict = {}
+        for f in self.frames:
+            p = f["license_plate"]
+            if not p or p in ["TIDAK_TERBACA", "Unreadable", "-"]:
+                continue
+            clean_p = re.sub(r'[^A-Za-z0-9]', '', p).upper()
+            if len(clean_p) < 3:
+                continue
+            pw = max(0.2, f["plate_conf"])
+            plate_weights[clean_p] = plate_weights.get(clean_p, 0.0) + pw
+            plate_display[clean_p] = p
+            if clean_p not in plate_confs_dict:
+                plate_confs_dict[clean_p] = []
+            plate_confs_dict[clean_p].append(f["plate_conf"])
+
+        if plate_weights:
+            best_clean = max(plate_weights, key=plate_weights.get)
+            best_plate = plate_display[best_clean]
+            best_plate_conf = float(np.mean(plate_confs_dict[best_clean]))
+        else:
+            best_plate = self.frames[-1]["license_plate"]
+            best_plate_conf = self.frames[-1]["plate_conf"]
+
+        # Frame terbaik untuk snapshot / bounding box
+        best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
+
+        self.confirmed_data = {
+            "track_id": self.track_id,
+            "vehicle_type": best_type,
+            "body_style": best_style,
+            "body_style_confidence": round(avg_style_conf, 3) if avg_style_conf else None,
+            "license_plate": best_plate,
+            "plate_confidence": round(best_plate_conf, 3) if best_plate_conf else None,
+            "consistency": round(consistency_score, 2),
+            "bbox": best_f["bbox"],
+            "plate_bbox": best_f["plate_bbox"],
+            "ocr_method": best_f.get("ocr_method")
+        }
+        self.confirmation_score = round(consistency_score, 2)
+        self.status = "CONFIRMED"
+
+    def get_current_consistency(self):
+        if not self.frames:
+            return 1.0
+        counts = {}
+        for f in self.frames:
+            b = f["body_style"]
+            if b:
+                counts[b] = counts.get(b, 0) + 1
+        return round(max(counts.values()) / len(self.frames), 2) if counts else 1.0
+
+
+class VehicleConfirmationManager:
+    """
+    Mengelola multi-object tracking dan konfirmasi temporal kendaraan.
+    Menjamin setiap kendaraan unik hanya dicatat 1x ke Entry History saat terkonfirmasi.
+    """
+    def __init__(self):
+        self.tracks = {}
+        self.lock = threading.Lock()
+        self.next_fallback_id = 1
+
+    def reset(self):
+        with self.lock:
+            self.tracks.clear()
+            self.next_fallback_id = 1
+
+    def update(self, detections, is_stream=False):
+        with self.lock:
+            now = time.time()
+            # Bersihkan track yang tidak terlihat > 3.0 detik
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 3.0]
+            for tid in stale_ids:
+                del self.tracks[tid]
+
+            if not detections:
+                return []
+
+            # Jika single photo upload manual (bukan live stream)
+            if not is_stream:
+                for det in detections:
+                    det["track_id"] = 1
+                    det["status"] = "CONFIRMED"
+                    det["consistency"] = 1.0
+                    det["is_newly_confirmed"] = True
+                return detections
+
+            # Mode Stream / Live CCTV
+            updated_detections = []
+            for det in detections:
+                tid = det.get("track_id")
+
+                # Fallback IoU matching jika box.id dari YOLO ByteTrack None
+                if tid is None:
+                    tid = self._match_iou(det.get("bbox"))
+                    if tid is None:
+                        tid = self.next_fallback_id
+                        self.next_fallback_id += 1
+                    det["track_id"] = tid
+
+                if tid not in self.tracks:
+                    self.tracks[tid] = VehicleTrack(tid, det)
+                    track = self.tracks[tid]
+                else:
+                    track = self.tracks[tid]
+                    track.add_frame(det)
+
+                # Pasang status temporal konfirmasi ke detection object
+                if track.history_saved:
+                    det["status"] = "HISTORY_SAVED"
+                    det["is_newly_confirmed"] = False
+                    det["consistency"] = track.confirmation_score
+                    if track.confirmed_data:
+                        det["body_style"] = track.confirmed_data["body_style"]
+                        det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
+                        if track.confirmed_data.get("license_plate"):
+                            det["license_plate"] = track.confirmed_data["license_plate"]
+                            det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                elif track.status == "CONFIRMED":
+                    det["status"] = "CONFIRMED"
+                    det["is_newly_confirmed"] = True  # Sinyal untuk simpan ke Entry History!
+                    track.status = "HISTORY_SAVED"
+                    track.history_saved = True
+                    det["consistency"] = track.confirmation_score
+                    if track.confirmed_data:
+                        det["body_style"] = track.confirmed_data["body_style"]
+                        det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
+                        if track.confirmed_data.get("license_plate"):
+                            det["license_plate"] = track.confirmed_data["license_plate"]
+                            det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                else:
+                    det["status"] = "ANALYZING"
+                    det["is_newly_confirmed"] = False
+                    det["consistency"] = track.get_current_consistency()
+                    det["analyzing_frame_count"] = len(track.frames)
+                    det["analyzing_max_frames"] = 3
+
+                updated_detections.append(det)
+
+            return updated_detections
+
+    def _match_iou(self, bbox, iou_thresh=0.30):
+        if not bbox:
+            return None
+        best_id = None
+        best_iou = iou_thresh
+        for tid, trk in self.tracks.items():
+            if trk.last_bbox:
+                iou = compute_iou(bbox, trk.last_bbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_id = tid
+        return best_id
+
+
+confirmation_manager = VehicleConfirmationManager()
+
+
+def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.20, single_vehicle_mode=True, is_stream=False):
     start_time = time.time()
     if isinstance(image_input, np.ndarray):
         img = image_input
@@ -927,8 +1219,12 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
 
     ih, iw = img.shape[:2]
 
-    # 1. Deteksi Kendaraan & 2. Deteksi Plat Nomor secara Paralel (Multi-core ThreadPool, imgsz=640)
-    fut_v = ai_pool.submit(vehicle_model.predict, img, conf=motorcycle_conf, imgsz=640, verbose=False)
+    # 1. Deteksi/Tracking Kendaraan & 2. Deteksi Plat Nomor secara Paralel (Multi-core ThreadPool, imgsz=640)
+    if is_stream:
+        fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml", conf=motorcycle_conf, imgsz=640, verbose=False)
+    else:
+        fut_v = ai_pool.submit(vehicle_model.predict, img, conf=motorcycle_conf, imgsz=640, verbose=False)
+
     fut_p = ai_pool.submit(plate_model.predict, img, conf=plate_conf, imgsz=640, verbose=False)
     vdet = fut_v.result()[0]
     pdet_global = fut_p.result()[0]
@@ -936,6 +1232,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
         v_conf = float(box.conf[0])
+        track_id = int(box.id[0]) if (box.id is not None) else None
         vehicle_type = VEHICLE_CLASS_NAMES[v_cls]
         threshold = motorcycle_conf if vehicle_type == "motorcycle" else vehicle_conf
         if v_conf < threshold:
@@ -943,6 +1240,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         area = (x2 - x1) * (y2 - y1)
         candidates.append({
+            "track_id": track_id,
             "vehicle_type": vehicle_type,
             "v_conf": v_conf,
             "x1": max(0, x1),
@@ -984,6 +1282,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
         for cand in candidates:
             initial_vtype = cand["vehicle_type"]
             v_conf = cand["v_conf"]
+            cand_track_id = cand.get("track_id")
             x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
             vehicle_crop = img[y1:y2, x1:x2]
 
@@ -1031,6 +1330,7 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                 ocr_method = ensemble_res["method"]
 
             results_out.append({
+                "track_id": cand_track_id,
                 "vehicle_type": vehicle_type,
                 "body_style": body_style,
                 "body_style_confidence": round(body_style_conf, 3) if body_style_conf else None,
@@ -1043,6 +1343,9 @@ def run_anpr(image_input, vehicle_conf=0.25, motorcycle_conf=0.08, plate_conf=0.
                 "image_width": iw,
                 "image_height": ih,
             })
+
+    # Evaluasi konfirmasi temporal (Fast Temporal Confirmation)
+    results_out = confirmation_manager.update(results_out, is_stream=is_stream)
 
     elapsed = time.time() - start_time
     return {
@@ -1159,17 +1462,19 @@ def detect_current():
         return jsonify({"error": "Belum ada frame video di memory. Pastikan kamera CCTV sudah terhubung dan aktif."}), 400
 
     t0 = time.time()
-    result = run_anpr(frame)
+    result = run_anpr(frame, is_stream=True)
     det_time = time.time() - t0
     result["detection_time_sec"] = round(det_time, 3)
 
     if result.get("detections"):
         primary_det = result["detections"][0]
         primary_det["latency_ms"] = round(det_time * 1000)
-        rec = save_parking_record(primary_det, source_img=frame)
-        primary_det["record"] = rec
-        if rec and rec.get("snapshot_url"):
-            result["image_url"] = rec["snapshot_url"]
+        # HANYA simpan ke Entry History jika kendaraan baru saja TERKONFIRMASI (1x per kendaraan)
+        if primary_det.get("is_newly_confirmed"):
+            rec = save_parking_record(primary_det, source_img=frame)
+            primary_det["record"] = rec
+            if rec and rec.get("snapshot_url"):
+                result["image_url"] = rec["snapshot_url"]
 
     return jsonify(result)
 
@@ -1189,6 +1494,7 @@ def upload_video():
     dest_path = os.path.join(MODEL_DIR, "uploaded_test_video.mp4")
     file.save(dest_path)
 
+    confirmation_manager.reset()
     ok, msg = camera_stream_manager.start(dest_path)
     return jsonify({
         "status": "ok" if ok else "error",
@@ -1208,15 +1514,19 @@ def detect():
     file.save(temp_path)
     try:
         t0 = time.time()
-        result = run_anpr(temp_path)
+        is_stream = request.form.get("is_stream", "false").lower() in ["true", "1"]
+        result = run_anpr(temp_path, is_stream=is_stream)
         det_time = time.time() - t0
         result["detection_time_sec"] = round(det_time, 3)
-        # Simpan ke memory RAM (0ms) jika terdeteksi kendaraan
+        # Simpan ke memory RAM jika kendaraan terkonfirmasi (atau single photo upload)
         if result.get("detections"):
             primary_det = result["detections"][0]
             primary_det["latency_ms"] = round(det_time * 1000)
-            rec = save_parking_record(primary_det, source_img_path=temp_path)
-            primary_det["record"] = rec
+            if primary_det.get("is_newly_confirmed"):
+                rec = save_parking_record(primary_det, source_img_path=temp_path)
+                primary_det["record"] = rec
+                if rec and rec.get("snapshot_url"):
+                    result["image_url"] = rec["snapshot_url"]
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1279,14 +1589,15 @@ def stream_capture():
     if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
         frame = camera_stream_manager.get_latest_frame()
         t0 = time.time()
-        result = run_anpr(frame)
+        result = run_anpr(frame, is_stream=True)
         result["detection_time_sec"] = round(time.time() - t0, 3)
         if result.get("detections"):
             primary_det = result["detections"][0]
-            rec = save_parking_record(primary_det, source_img=frame)
-            primary_det["record"] = rec
-            if rec and rec.get("snapshot_url"):
-                result["image_url"] = rec["snapshot_url"]
+            if primary_det.get("is_newly_confirmed"):
+                rec = save_parking_record(primary_det, source_img=frame)
+                primary_det["record"] = rec
+                if rec and rec.get("snapshot_url"):
+                    result["image_url"] = rec["snapshot_url"]
         return jsonify(result)
 
     if not stream_url:

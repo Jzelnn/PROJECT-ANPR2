@@ -492,6 +492,7 @@
         <div class="tags">
           <span class="tag on" id="tagVehicle">-</span>
           <span class="tag" id="tagBodyStyle">-</span>
+          <span class="tag" id="tagStatus" style="display:none;">-</span>
         </div>
         <div class="plate" id="plateText">-</div>
         <div class="meta">
@@ -1221,6 +1222,7 @@ async function performDetectCycle(silent=true){
             if (!blob){ resolve(); return; }
             const formData = new FormData();
             formData.append("image", blob, src === 'video_file' ? "video_frame.jpg" : "webcam_frame.jpg");
+            formData.append("is_stream", "true");
             try {
               const reqStart = performance.now();
               const resp = await fetch(API_URL, { method: "POST", body: formData });
@@ -1267,21 +1269,18 @@ function handleDetectionResult(data, silent=false){
     updateResultCard(det, detMs);
 
     const plateStr = (det.license_plate || '').trim();
-    const nowMs = Date.now();
-    const plateKey = plateStr || (det.body_style || det.vehicle_type || 'VEHICLE');
+    const plateShow = plateStr || det.body_style || det.vehicle_type || 'Vehicle';
+    const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
 
-    // Begitu latency & deteksi terbaca, langsung catat ke Entry History!
-    // Cooldown 3 detik untuk kendaraan/plat yang persis sama agar tabel tidak spam per 300ms
-    if (!lastLoggedPlate || plateKey !== lastLoggedPlate || (nowMs - lastLoggedTime > 3000)){
+    // Entry History HANYA mencatat kendaraan yang TERKONFIRMASI (1x per kendaraan)
+    if (det.is_newly_confirmed){
       addLogRow(det);
-      lastLoggedPlate = plateKey;
-      lastLoggedTime = nowMs;
-      const timeMs = detMs > 0 ? ` (${detMs} ms)` : (data.detection_time_sec ? ` (${data.detection_time_sec}s)` : '');
-      const plateShow = plateStr || det.body_style || det.vehicle_type;
-      showToast(`Plat terdeteksi: ${plateShow}${timeMs}`);
+      const trackText = det.track_id ? `[#${det.track_id}] ` : '';
+      showToast(`Entry Confirmed: ${trackText}${plateShow}${timeMs}`);
     } else if (!silent){
-      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-      showToast(`Plat: ${plateStr || 'Vehicle detected'}${timeMs}`);
+      const trackText = det.track_id ? `[#${det.track_id}] ` : '';
+      const statusText = det.status === 'ANALYZING' ? `Analyzing (${det.analyzing_frame_count || 1}/3)...` : 'Tracked';
+      showToast(`${trackText}${plateShow} - ${statusText}${timeMs}`);
     }
   } else {
     // Kalau tidak ada kendaraan sama sekali, langsung bersihkan bounding box seketika
@@ -1482,9 +1481,23 @@ function drawBoxes(det){
       boxVeh.style.top = Math.round(offsetY + y1 * scale) + 'px';
       boxVeh.style.width = Math.round((x2 - x1) * scale) + 'px';
       boxVeh.style.height = Math.round((y2 - y1) * scale) + 'px';
+
+      const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+      const trackPrefix = det.track_id ? `[#${det.track_id}] ` : '';
+      const statusBadge = isConfirmed ? 'CONFIRMED' : `ANALYZING (${det.analyzing_frame_count || 1}/3)`;
       const baseLabel = det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type;
-      const labelText = det.latency_ms ? `${baseLabel} • ${det.latency_ms}ms` : baseLabel;
-      boxVeh.querySelector('.det-label').textContent = labelText;
+      const consistencyTxt = det.consistency ? ` • ${Math.round(det.consistency * 100)}%` : '';
+      const labelText = `${trackPrefix}${baseLabel} • ${statusBadge}${consistencyTxt}`;
+
+      const labelElem = boxVeh.querySelector('.det-label');
+      labelElem.textContent = labelText;
+      if (isConfirmed) {
+        boxVeh.style.borderColor = '#10b981';
+        labelElem.style.background = '#10b981';
+      } else {
+        boxVeh.style.borderColor = '#2f6fed';
+        labelElem.style.background = '#2f6fed';
+      }
     } else if (boxVeh){
       boxVeh.style.display = 'none';
     }
@@ -1536,6 +1549,7 @@ function updateResultCard(det, detMs){
   const bStyle = det.body_style || '';
   const tagVeh = document.getElementById('tagVehicle');
   const tagBody = document.getElementById('tagBodyStyle');
+  const tagStatus = document.getElementById('tagStatus');
   tagVeh.textContent = vType;
   if (bStyle && bStyle.toLowerCase() !== vType.toLowerCase()){
     tagBody.style.display = 'inline-block';
@@ -1543,6 +1557,24 @@ function updateResultCard(det, detMs){
   } else {
     tagBody.style.display = 'none';
   }
+
+  if (tagStatus){
+    const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+    tagStatus.style.display = 'inline-block';
+    if (isConfirmed) {
+      tagStatus.style.background = '#d1fae5';
+      tagStatus.style.color = '#065f46';
+      tagStatus.style.borderColor = '#a7f3d0';
+      const pct = det.consistency ? Math.round(det.consistency * 100) : 100;
+      tagStatus.textContent = `CONFIRMED (${pct}%)`;
+    } else {
+      tagStatus.style.background = '#eff6ff';
+      tagStatus.style.color = '#1d4ed8';
+      tagStatus.style.borderColor = '#bfdbfe';
+      tagStatus.textContent = `ANALYZING (${det.analyzing_frame_count || 1}/3)`;
+    }
+  }
+
   document.getElementById('plateText').textContent = det.license_plate || 'Unreadable';
   const confPct = det.plate_confidence ? Math.round(det.plate_confidence*100)+'%' : (det.vehicle_confidence ? Math.round(det.vehicle_confidence*100)+'%' : '-');
   document.getElementById('pctConf').textContent = confPct;
@@ -1579,10 +1611,12 @@ function addLogRow(det, isInit=false){
   row.className = 'log-row';
   const ms = det.latency_ms;
   const latText = ms ? ` <span style="font-size:11px; color:#10b981; font-weight:600;">(${ms}ms)</span>` : '';
+  const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';
+  const confScore = det.consistency ? `<span style="font-size:11px; background:#d1fae5; color:#065f46; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600;">${Math.round(det.consistency * 100)}%</span>` : '';
   row.innerHTML = `
     <span class="log-time">${timeStr}</span>
-    <span class="log-plate">${det.license_plate || '-'}</span>
-    <span class="log-type">${(det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type)}${latText}</span>
+    <span class="log-plate">${trackPrefix}${det.license_plate || '-'}</span>
+    <span class="log-type">${(det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type)}${confScore}${latText}</span>
   `;
   const logList = document.getElementById('logList');
   if (isInit) {
