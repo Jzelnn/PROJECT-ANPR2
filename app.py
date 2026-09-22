@@ -805,9 +805,11 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
-    # Harmonisasi jika mobil penumpang terdeteksi sebagai truck oleh model deteksi
-    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_fastback
+    # Harmonisasi jika mobil penumpang/MPV terdeteksi sebagai truck atau bus oleh model deteksi
+    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_wagon + p_fastback
     if initial_vtype == "truck" and passenger_signal > 0.60 and p_pickup < 0.25:
+        initial_vtype = "car"
+    elif initial_vtype == "bus" and (passenger_signal > 0.40 or p_mpv >= 0.15) and p_minibus < 0.50:
         initial_vtype = "car"
 
     # 1. KENDARAAN DETEKSI TRUK (vehicle_model)
@@ -837,15 +839,18 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     score_pickup = p_pickup
     score_minibus = p_minibus
     score_wagon = p_wagon
-    score_mpv = p_mpv * 1.3 + p_wagon * 0.7
+    score_mpv = p_mpv * 1.35 + p_wagon * 0.7
     score_suv = p_suv * 1.2
     score_crossover = p_crossover * 1.2
     score_hatch = p_hatch * 1.2
     score_sedan = p_sedan * 1.2
 
-    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah SUV, Crossover, atau Sedan
+    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah SUV, Crossover, Sedan, atau MPV
     if p_sports >= 0.25 or p_fastback >= 0.25:
-        if aspect >= 0.85:
+        if aspect >= 0.80 and p_mpv >= 0.15:
+            # Bodi tinggi boxy dengan sinyal MPV kuat (seperti Toyota Alphard, Vellfire, Serena, Voxy)
+            score_mpv += (p_fastback * 0.60) + (p_sports * 0.40)
+        elif aspect >= 0.85:
             # Sangat tinggi dan jangkung (seperti BMW iX atau SUV sport) -> SUV
             score_suv += (p_sports * 0.95) + (p_fastback * 0.50)
         elif aspect >= 0.68:
@@ -860,10 +865,10 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         score_hatch += 0.20
 
     # Penyesuaian proporsi fisik (Aspect Ratio & Ground Clearance)
-    if aspect >= 0.82:
-        score_mpv += 0.10
-        score_suv += 0.08
+    if aspect >= 0.80:
+        score_mpv += 0.15
         score_minibus += 0.10
+        score_suv += 0.05
     elif aspect <= 0.60:
         score_sedan += 0.10
         score_hatch += 0.08
