@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+
+# Database & Runtime Data
+*.db
+*.sqlite3
+
+# Snapshots / dynamic captures (keep directory via .gitkeep)
+captures/*
+!captures/.gitkeep
+
+# Temporary upload files
+temp_upload.jpg
