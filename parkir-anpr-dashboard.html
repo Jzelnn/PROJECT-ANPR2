@@ -402,6 +402,7 @@
           <option value="cctv_rtsp">CCTV IP Camera (RTSP)</option>
           <option value="zerotier_stream">Server Parkir ZeroTier (:54321)</option>
           <option value="webcam">Webcam / DroidCam PC</option>
+          <option value="video_file">Upload Video File (Live Playback)</option>
         </select>
         <select id="videoDeviceSelect" class="source-select" style="display:none; max-width:200px;" onchange="switchVideoDevice()"></select>
       </div>
@@ -418,9 +419,15 @@
           <span>Auto-Scan</span>
         </label>
 
-        <!-- Upload File Button -->
+        <!-- Upload File Buttons -->
         <button class="upload-btn" id="uploadBtn" onclick="document.getElementById('fileInput').click()">Upload Photo</button>
         <input type="file" id="fileInput" accept="image/*" style="display:none;">
+        
+        <button class="upload-btn" id="uploadVideoBtn" onclick="document.getElementById('videoFileInput').click()" style="display:inline-flex; align-items:center; gap:5px; background:rgba(47,111,237,0.08); border-color:rgba(47,111,237,0.25); color:var(--blue);" title="Upload & test video in real-time live view">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+          Upload Video
+        </button>
+        <input type="file" id="videoFileInput" accept="video/mp4,video/webm,video/ogg,video/quicktime,video/x-msvideo,video/*" style="display:none;">
         
         <div class="live-pill" id="liveIndicator">
           <span class="dot" id="liveDot"></span>
@@ -671,6 +678,21 @@ function switchCamSource(){
     if (placeholderMsg){
       placeholderMsg.innerHTML = `<strong>Server Parkir ZeroTier Ready</strong><br>Stream: <code>http://172.30.61.172:54321/stream/player/172.16.90.31</code><br>Pastikan ZeroTier di laptop sudah terhubung ke jaringan, lalu klik <strong>"Connect"</strong>.`;
     }
+  } else if (src === 'video_file'){
+    if (isapiBar) isapiBar.style.display = 'none';
+    urlBar.style.display = 'none';
+    btnRpiCapture.style.display = 'none';
+    btnRpiPing.style.display = 'none';
+    btnConnectCam.style.display = 'inline-flex';
+    btnConnectCam.textContent = "Choose Video";
+    btnConnectCam.className = "ctrl-btn secondary";
+    btnConnectCam.onclick = () => document.getElementById('videoFileInput').click();
+    btnScanNow.style.display = 'none';
+    autoScanWrap.style.display = 'none';
+    updateLiveIndicator(false, "OFFLINE");
+    if (placeholderMsg){
+      placeholderMsg.innerHTML = `<strong>Local Video Player Mode</strong><br>Click <strong>"Choose Video"</strong> or <strong>"Upload Video"</strong> to load an MP4 video file and test real-time ANPR live view.`;
+    }
   } else {
     // Webcam Laptop / DroidCam
     urlBar.style.display = 'none';
@@ -835,15 +857,25 @@ async function toggleCamera(){
   }
 
   if (isCameraConnected){
-    // Disconnect camera
+    // Disconnect camera or stop video
     stopFpsMonitor();
     stopContinuousAutoDetect();
     stopCameraStream();
-    if (src !== 'webcam'){
+    const vidElem = document.getElementById('liveVideo');
+    if (vidElem) {
+      vidElem.pause();
+      vidElem.src = "";
+    }
+    if (src !== 'webcam' && src !== 'video_file'){
       fetch(STREAM_STOP_URL, { method: "POST" }).catch(() => {});
     }
-    btn.textContent = "Connect";
-    btn.className = "ctrl-btn";
+    btn.textContent = (src === 'video_file') ? "Choose Video" : "Connect";
+    btn.className = (src === 'video_file') ? "ctrl-btn secondary" : "ctrl-btn";
+    if (src === 'video_file') {
+      btn.onclick = () => document.getElementById('videoFileInput').click();
+    } else {
+      btn.onclick = toggleCamera;
+    }
     document.getElementById('btnScanNow').style.display = "none";
     document.getElementById('autoScanWrap').style.display = "none";
     document.getElementById('chkAutoScan').checked = false;
@@ -851,8 +883,8 @@ async function toggleCamera(){
     updateLatencyIndicator(0);
     feedBody.innerHTML = `
       <div class="feed-msg">
-        <strong>Camera disconnected</strong>
-        Click "Connect" to start the stream again
+        <strong>${src === 'video_file' ? 'Video playback stopped' : 'Camera disconnected'}</strong>
+        ${src === 'video_file' ? 'Click "Choose Video" to select another video' : 'Click "Connect" to start the stream again'}
       </div>
       <canvas id="captureCanvas" style="display:none;"></canvas>
     `;
@@ -1175,10 +1207,10 @@ async function performDetectCycle(silent=true){
       if (!resp.ok) throw new Error(data.error || "Gagal membaca frame kamera");
       data.roundtrip_ms = roundtripMs;
       handleDetectionResult(data, silent);
-    } else if (src === 'webcam'){
+    } else if (src === 'webcam' || src === 'video_file'){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
-      if (video && video.videoWidth > 0){
+      if (video && video.videoWidth > 0 && !video.paused){
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         const ctx = canvas.getContext('2d');
@@ -1188,7 +1220,7 @@ async function performDetectCycle(silent=true){
           canvas.toBlob(async (blob) => {
             if (!blob){ resolve(); return; }
             const formData = new FormData();
-            formData.append("image", blob, "webcam_frame.jpg");
+            formData.append("image", blob, src === 'video_file' ? "video_frame.jpg" : "webcam_frame.jpg");
             try {
               const reqStart = performance.now();
               const resp = await fetch(API_URL, { method: "POST", body: formData });
@@ -1198,7 +1230,7 @@ async function performDetectCycle(silent=true){
                 handleDetectionResult(data, silent);
               }
             } catch(e){
-              console.warn("Webcam detect error:", e);
+              console.warn("Video/Webcam detect error:", e);
             } finally {
               resolve();
             }
@@ -1332,6 +1364,44 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     uploadBtn.disabled = false;
     uploadBtn.textContent = "Upload Photo";
   }
+});
+
+// ============================================================
+// REAL-TIME VIDEO FILE UPLOAD & LIVE PLAYBACK
+// ============================================================
+document.getElementById('videoFileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  if (isCameraConnected) await toggleCamera();
+
+  const videoURL = URL.createObjectURL(file);
+  const feedBody = document.getElementById('feedBody');
+  feedBody.innerHTML = `
+    <div class="feed-wrap">
+      <video id="liveVideo" src="${videoURL}" autoplay loop playsinline muted controls style="width:100%; height:100%; object-fit:contain;"></video>
+    </div>
+    <canvas id="captureCanvas" style="display:none;"></canvas>
+  `;
+
+  document.getElementById('camSourceSelect').value = 'video_file';
+  isCameraConnected = true;
+
+  const btnConnectCam = document.getElementById('btnConnectCam');
+  btnConnectCam.style.display = "inline-flex";
+  btnConnectCam.textContent = "Stop Video";
+  btnConnectCam.className = "ctrl-btn danger";
+  btnConnectCam.onclick = toggleCamera;
+
+  document.getElementById('btnScanNow').style.display = "inline-flex";
+  document.getElementById('autoScanWrap').style.display = "inline-flex";
+  document.getElementById('chkAutoScan').checked = true;
+
+  updateLiveIndicator(true, "VIDEO LIVE");
+  showToast(`Video "${file.name}" dimuat - Real-time ANPR aktif!`);
+
+  // Mulai loop deteksi otomatis secara hands-free pada video yang sedang berputar
+  startContinuousAutoDetect();
 });
 
 // ============================================================

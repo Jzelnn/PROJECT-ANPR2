@@ -218,9 +218,20 @@ class CameraStreamManager:
         fps_timer = time.time()
         fail_count = 0
 
+        is_video_file = not is_rtsp and os.path.isfile(source_url)
+        video_fps = cap.get(cv2.CAP_PROP_FPS) if is_video_file else 25.0
+        if not video_fps or video_fps <= 0 or video_fps > 60:
+            video_fps = 25.0
+        frame_delay = 1.0 / video_fps if is_video_file else 0.0
+
         while self.running:
             ret, frame = cap.read()
             if not ret or frame is None:
+                if is_video_file:
+                    # Loop video kembali ke awal secara terus-menerus
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.04)
+                    continue
                 fail_count += 1
                 if fail_count > 30:
                     print("[STREAM WARN] Kehilangan sinyal video, mencoba menghubungkan ulang...")
@@ -233,6 +244,9 @@ class CameraStreamManager:
                     fail_count = 0
                 time.sleep(0.05)
                 continue
+
+            if is_video_file and frame_delay > 0:
+                time.sleep(frame_delay * 0.85)
 
             fail_count = 0
             frame_count += 1
@@ -1149,6 +1163,29 @@ def detect_current():
             result["image_url"] = rec["snapshot_url"]
 
     return jsonify(result)
+
+
+@app.route("/api/upload_video", methods=["POST", "OPTIONS"])
+def upload_video():
+    """
+    Menerima file video dan langsung menyiarkannya sebagai stream CCTV real-time di background.
+    Memungkinkan simulasi feed CCTV berbasis rekaman video parkir dengan auto-detect.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+    if "video" not in request.files:
+        return jsonify({"error": "Tidak ada file 'video' yang dikirim"}), 400
+    file = request.files["video"]
+    filename = file.filename or "uploaded_video.mp4"
+    dest_path = os.path.join(MODEL_DIR, "uploaded_test_video.mp4")
+    file.save(dest_path)
+
+    ok, msg = camera_stream_manager.start(dest_path)
+    return jsonify({
+        "status": "ok" if ok else "error",
+        "message": f"Video '{filename}' siap disiarkan secara real-time",
+        "video_path": dest_path
+    })
 
 
 @app.route("/api/detect", methods=["POST", "OPTIONS"])
