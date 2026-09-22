@@ -818,8 +818,14 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         return 'bus', 'Bus', round(v_conf, 3)
 
     # 3. KENDARAAN MOBIL PENUMPANG (CAR) - 11 Kategori Lengkap
-    score_conv = p_conv
-    score_sports = p_sports
+    # Aturan CCTV: Mobil berbadan tinggi (aspect >= 0.70) tidak bisa Convertible / Sports Hardtop Convertible
+    if aspect >= 0.70:
+        score_conv = p_conv * 0.1
+        score_sports = p_sports * 0.1
+    else:
+        score_conv = p_conv
+        score_sports = p_sports
+
     score_fastback = p_fastback * 0.4  # Aturan CCTV: Jangan tebak Fastback dari tampak depan murni
     score_pickup = p_pickup
     score_minibus = p_minibus
@@ -830,10 +836,13 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     score_hatch = p_hatch * 1.2
     score_sedan = p_sedan * 1.2
 
-    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah Crossover atau Sedan
-    if p_fastback >= 0.25 or p_sports >= 0.25:
-        if aspect >= 0.70:
-            # Bodi agak jangkung / raised -> Crossover (seperti Hyundai IONIQ 5)
+    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah SUV, Crossover, atau Sedan
+    if p_sports >= 0.25 or p_fastback >= 0.25:
+        if aspect >= 0.85:
+            # Sangat tinggi dan jangkung (seperti BMW iX atau SUV sport) -> SUV
+            score_suv += (p_sports * 0.95) + (p_fastback * 0.50)
+        elif aspect >= 0.68:
+            # Bodi agak jangkung / raised (seperti Hyundai IONIQ 5) -> Crossover
             score_crossover += (p_fastback * 0.85) + (p_sports * 0.75)
         else:
             # Bodi ceper -> Sedan
