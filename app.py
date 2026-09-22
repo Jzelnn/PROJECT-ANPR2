@@ -42,12 +42,12 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 
 # ============================================================
 # PERFORMANCE & DETECTION CONFIGURATION
-# Configurable parameters for speed, dark vehicle detection, and temporal confirmation
+# Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for reliable small plate detection
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.10))  # 0.10 for fast detection on dark cars/dim light
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.20))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
-PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.18))
+PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
@@ -58,7 +58,7 @@ MIN_OBSERVATIONS = 2
 MAX_OBSERVATIONS = 3
 TEMPORAL_WINDOW_SEC = 0.25  # 150-250 ms max window
 CONSISTENCY_THRESH = 0.70   # 70%
-CONFIRM_CONF_THRESH = 0.55  # 55% for fast confirmation even with glare/dark body
+CONFIRM_CONF_THRESH = 0.80  # 80-85% for early confirmation at Frame 2
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -1014,30 +1014,25 @@ class VehicleTrack:
 
     def _evaluate_confirmation(self):
         n = len(self.frames)
-        if n < 1:
-            return
-
-        # 1. PLATE-ASSISTED FAST CONFIRMATION:
-        # Jika ada plat nomor yang terdeteksi dengan baik (conf >= 0.30)
-        # Plat nomor adalah bukti paling kuat kendaraan di gerbang parkir!
-        has_clear_plate = any((f.get("plate_conf") or 0) >= 0.30 for f in self.frames)
-        if has_clear_plate:
-            # Konfirmasi seketika di Frame 2 (atau Frame 1 jika conf plat >= 0.40)
-            if n >= 2 or ((self.frames[0].get("plate_conf") or 0) >= 0.40):
-                self._finalize_confirmation(reason="plate_assisted_fast_confirmation")
-                return
-
         if n < MIN_OBSERVATIONS:
             return
 
-        # 2. EARLY CONFIRMATION (Frame 2):
-        # Jika ada 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= CONFIRM_CONF_THRESH
+        # 1. EARLY CONFIRMATION (Frame 2):
+        # Jika ada setidaknya 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= CONFIRM_CONF_THRESH (0.80)
+        # Contoh: Frame 1: Car 0.88, Frame 2: Car 0.91 -> CONFIRM immediately!
         f1, f2 = self.frames[0], self.frames[1]
         same_vtype = (f1["vehicle_type"] == f2["vehicle_type"]) and (f1["v_conf"] >= CONFIRM_CONF_THRESH) and (f2["v_conf"] >= CONFIRM_CONF_THRESH)
         same_bstyle = bool(f1["body_style"] and f2["body_style"] and (f1["body_style"] == f2["body_style"]) and (f1["body_conf"] >= CONFIRM_CONF_THRESH) and (f2["body_conf"] >= CONFIRM_CONF_THRESH))
 
         if same_vtype or same_bstyle:
             self._finalize_confirmation(reason="early_consistency_2_frames")
+            return
+
+        # 2. PLATE-ASSISTED FAST CONFIRMATION:
+        # Jika plat nomor terdeteksi konsisten (conf >= 0.20)
+        has_clear_plate = any((f.get("plate_conf") or 0) >= PLATE_CONF_THRESH for f in self.frames)
+        if has_clear_plate and n >= MIN_OBSERVATIONS:
+            self._finalize_confirmation(reason="plate_assisted_fast_confirmation")
             return
 
         # 3. Maximum observations (3 frames) atau time window >= 250ms reached:
