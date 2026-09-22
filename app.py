@@ -53,34 +53,12 @@ FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of ev
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = DEVICE == "cuda"
 
-# ROI Configuration (Normalized 0.0 to 1.0)
-# Default: active gate lane (width: 8% to 92%, height: 12% to 98%)
-ROI_CONFIG = {
-    "x_min": float(os.environ.get("ANPR_ROI_X_MIN", 0.08)),
-    "y_min": float(os.environ.get("ANPR_ROI_Y_MIN", 0.12)),
-    "x_max": float(os.environ.get("ANPR_ROI_X_MAX", 0.92)),
-    "y_max": float(os.environ.get("ANPR_ROI_Y_MAX", 0.98))
-}
-
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 2
 MAX_OBSERVATIONS = 3
 TEMPORAL_WINDOW_SEC = 0.25  # 150-250 ms max window
 CONSISTENCY_THRESH = 0.70   # 70%
 CONFIRM_CONF_THRESH = 0.80  # 80-85%
-
-
-def is_in_roi(bbox, img_w, img_h, roi=ROI_CONFIG):
-    """
-    Cek apakah deteksi kendaraan berada di dalam Region of Interest (ROI) gerbang.
-    Dihitung berdasarkan titik tengah (cx, cy) dari bbox kendaraan.
-    """
-    if not bbox or len(bbox) < 4:
-        return False
-    x1, y1, x2, y2 = bbox
-    cx = (x1 + x2) / 2.0 / max(1, img_w)
-    cy = (y1 + y2) / 2.0 / max(1, img_h)
-    return (roi["x_min"] <= cx <= roi["x_max"]) and (roi["y_min"] <= cy <= roi["y_max"])
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -1280,8 +1258,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     pdet_global = fut_p.result()[0]
     t_yolo = time.time() - t_yolo_0
 
-    # 2. EARLY ROI FILTERING (Buang langsung objek di luar ROI gerbang)
-    t_roi_0 = time.time()
+    # 2. EKSTRAKSI KANDIDAT KENDARAAN
     candidates = []
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
@@ -1292,10 +1269,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         if v_conf < threshold:
             continue
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-
-        # EARLY ROI FILTER: Discard immediately if outside ROI!
-        if not is_in_roi([x1, y1, x2, y2], iw, ih):
-            continue
 
         area = (x2 - x1) * (y2 - y1)
         candidates.append({
@@ -1308,7 +1281,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "y2": min(ih, y2),
             "area": area
         })
-    t_roi = time.time() - t_roi_0
 
     # Ekstraksi hasil deteksi plat nomor global
     global_plates = []
@@ -1431,8 +1403,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_total = time.time() - t_start
     fps = 1.0 / max(1e-4, t_total)
 
-    # 6. PERFORMANCE TELEMETRY LOGGING
-    print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | ROI: {round(t_roi*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+    # 5. PERFORMANCE TELEMETRY LOGGING
+    print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
 
     return {
         "detections": results_out,
@@ -1442,7 +1414,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "image_height": ih,
         "perf_breakdown": {
             "yolo_ms": round(t_yolo * 1000, 1),
-            "roi_ms": round(t_roi * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
             "body_ms": round(t_body_total * 1000, 1),
             "ocr_ms": round(t_ocr_total * 1000, 1),
