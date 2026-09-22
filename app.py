@@ -763,7 +763,8 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     car_h = max(1, y2 - y1)
     aspect = car_h / float(car_w)
 
-    crop = crop_vehicle_with_context(image, x1, y1, x2, y2, pad_ratio=0.04)
+    # Gunakan tight crop (pad_ratio=0.0) agar lantai/plafon basement tidak menambah tinggi bodi semu (false SUV)
+    crop = image[y1:y2, x1:x2]
     if crop.size == 0:
         fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else ("Bus" if initial_vtype == "bus" else "Motor"))
         return initial_vtype, fallback_name, round(v_conf, 3)
