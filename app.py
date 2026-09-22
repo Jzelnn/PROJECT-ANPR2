@@ -401,7 +401,7 @@ def compute_iou(box1, box2):
     return inter / union if union > 0 else 0
 
 
-def read_plate_with_char_model(plate_crop, conf=0.18, iou_threshold=0.35):
+def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
     """Deteksi karakter plat menggunakan YOLO char_model dengan NMS dan pemisahan 2 baris."""
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
@@ -423,7 +423,7 @@ def read_plate_with_char_model(plate_crop, conf=0.18, iou_threshold=0.35):
         x1, y1, x2, y2 = [v / scale for v in box.xyxy[0].tolist()]
         bw = x2 - x1
         bh = y2 - y1
-        if cname in ['M', 'W'] and (bw / max(1.0, bh)) < 0.62:
+        if cname in ['M', 'W'] and (bw / max(1.0, bh)) < 0.72:
             cname = 'N'
         raw_dets.append({
             "char": cname,
@@ -438,7 +438,7 @@ def read_plate_with_char_model(plate_crop, conf=0.18, iou_threshold=0.35):
     if not raw_dets:
         return "", 0.0, []
 
-    # NMS Berdasarkan IoU & Horizontal Overlap
+    # NMS Berdasarkan IoU & Horizontal Overlap (threshold 0.48 agar karakter berdekatan seperti '11' tidak terbuang)
     raw_dets.sort(key=lambda d: -d["conf"])
     kept = []
     for det in raw_dets:
@@ -452,7 +452,7 @@ def read_plate_with_char_model(plate_crop, conf=0.18, iou_threshold=0.35):
             inter_w = max(0, min(det["box"][2], k["box"][2]) - max(det["box"][0], k["box"][0]))
             w_min = min(det["w"], k["w"])
             x_overlap = inter_w / w_min if w_min > 0 else 0
-            if iou_val > iou_threshold or x_overlap > 0.55:
+            if iou_val > iou_threshold or x_overlap > 0.48:
                 dup = True
                 break
         if not dup:
@@ -566,12 +566,33 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if not c_clean and not e_clean:
         return ""
 
-    # Ekstraksi seluruh kandidat suffix dari EasyOCR
+    # Ekstraksi seluruh kandidat suffix dan digit dari EasyOCR
+    easy_digit_candidates = []
+    easy_prefixes = []
     easy_suffixes = []
+
     for t in all_easy_texts:
         t_c = re.sub(r'[^A-Z0-9]', '', t.upper())
         if not t_c:
             continue
+
+        # Pola lengkap EasyOCR: misal "81125BMU" -> prefix B, digits 1125, suffix BNV
+        m_full = re.match(r'^([8B0-9A-Z]{1,2})(\d{1,4})([A-Z0-9]{1,3})$', t_c)
+        if m_full:
+            p_cand = m_full.group(1)
+            if p_cand == '8':
+                p_cand = 'B'
+            easy_prefixes.append(p_cand)
+            easy_digit_candidates.append(m_full.group(2))
+            easy_suffixes.append(m_full.group(3))
+
+        # Pola angka yang diawali '8' (khas EasyOCR membaca huruf B sebagai digit 8)
+        if t_c.startswith('8') and len(t_c) >= 5 and t_c[1:5].isdigit():
+            easy_prefixes.append('B')
+            easy_digit_candidates.append(t_c[1:5])
+            if len(t_c) > 5:
+                easy_suffixes.append(t_c[5:])
+
         if t_c.isalpha() and 2 <= len(t_c) <= 3:
             easy_suffixes.append(t_c)
         m_digs = list(re.finditer(r'\d+', t_c))
@@ -580,9 +601,29 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
             if 1 <= len(s_tail) <= 3 and s_tail.isalpha():
                 easy_suffixes.append(s_tail)
 
-    # Gunakan char_raw sebagai kerangka utama jika valid, atau fallback ke easy_raw
-    has_alpha_and_digit = any(c.isalpha() for c in c_clean) and any(c.isdigit() for c in c_clean)
-    base_text = c_clean if (len(c_clean) >= 3 or has_alpha_and_digit) else (e_clean or c_clean)
+        for dm in re.finditer(r'\d{1,4}', t_c):
+            cand = dm.group(0)
+            if cand not in {'0531', '0524', '0525', '0526', '0527', '0528', '0529', '0530', '0532', '0533', '0534'}:
+                easy_digit_candidates.append(cand)
+
+    # Pilih kerangka utama: Utamakan teks yang paling lengkap dan berstruktur
+    has_alpha_and_digit_c = any(c.isalpha() for c in c_clean) and any(c.isdigit() for c in c_clean)
+    has_alpha_and_digit_e = any(c.isalpha() for c in e_clean) and any(c.isdigit() for c in e_clean)
+
+    if len(e_clean) >= 6 and len(c_clean) < 5:
+        base_text = e_clean
+    elif len(c_clean) >= 5 and has_alpha_and_digit_c:
+        base_text = c_clean
+    elif len(e_clean) >= 5 and has_alpha_and_digit_e:
+        base_text = e_clean
+    elif len(c_clean) >= 3 or has_alpha_and_digit_c:
+        base_text = c_clean
+    else:
+        base_text = e_clean or c_clean
+
+    # Normalisasi leading '8' menjadi 'B' jika diikuti digit (khas EasyOCR)
+    if base_text.startswith('8') and len(base_text) >= 5 and base_text[1].isdigit():
+        base_text = 'B' + base_text[1:]
 
     # Parsing struktur plat: Prefix (1-2 huruf), Digits (1-4 angka), Suffix (1-3 huruf)
     first_digit_idx = -1
@@ -593,13 +634,11 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
                 first_digit_idx = i
             last_digit_idx = i
 
-    # Jika pemisahan digit alami ditemukan
     if first_digit_idx > 0 and last_digit_idx >= first_digit_idx:
         prefix = base_text[:first_digit_idx]
         digits = base_text[first_digit_idx:last_digit_idx + 1]
         suffix = base_text[last_digit_idx + 1:]
     else:
-        # Pola fallback dengan regex
         m = re.match(r'^([A-Z0-9]{1,2})([0-9A-Z]{1,4})([A-Z0-9]{1,3})$', base_text)
         if m:
             prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
@@ -608,12 +647,10 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
             digits = base_text[1:5] if len(base_text) > 1 else ""
             suffix = base_text[5:] if len(base_text) > 5 else ""
 
-    # Jika base_text tidak memiliki suffix tapi EasyOCR mendeteksi suffix (misal plat 1 baris terpotong)
     if not suffix and easy_suffixes:
         suffix = easy_suffixes[0]
 
     # 1. Normalisasi Prefix (Kode Wilayah)
-    # Tidak ada kode wilayah Indonesia yang diawali 'Q', 'O', atau '0'
     clean_prefix = ""
     for ch in prefix[:2]:
         if ch.isalpha():
@@ -621,55 +658,53 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         elif ch in {'4': 'A', '8': 'B', '0': 'D', '1': 'I'}:
             clean_prefix += {'4': 'A', '8': 'B', '0': 'D', '1': 'I'}[ch]
 
-    # Disambiguasi prefix 'E' vs 'B':
-    # Bayangan tepi kiri frame seringkali memotong tiang vertikal kiri 'B' sehingga terprediksi 'E'.
-    # Jika prefix diprediksi 'E' tetapi EasyOCR mendeteksi '8' / 'B' atau kandidat teks diawali '8' / 'B':
-    if (clean_prefix.startswith('E') or clean_prefix.startswith('8')) and any(t.startswith('8') or t.startswith('B') for t in all_easy_texts):
-        clean_prefix = 'B' + clean_prefix[1:]
+    if clean_prefix in ('', 'I', '1') and ('B' in easy_prefixes or any(t.startswith('8') or t.startswith('B') for t in all_easy_texts)):
+        clean_prefix = 'B'
     elif clean_prefix.startswith('8'):
         clean_prefix = 'B' + clean_prefix[1:]
-
-    if clean_prefix.startswith('O') or clean_prefix.startswith('0'):
+    elif (clean_prefix.startswith('E') or clean_prefix.startswith('8')) and any(t.startswith('8') or t.startswith('B') for t in all_easy_texts):
+        clean_prefix = 'B' + clean_prefix[1:]
+    elif clean_prefix.startswith('O') or clean_prefix.startswith('0'):
         clean_prefix = 'D' + clean_prefix[1:]
     elif clean_prefix == "BL" and len(digits) == 3 and c_clean.startswith("B4"):
         clean_prefix = "B"
         digits = "4" + digits
 
     # 2. Normalisasi Digits (Maksimal 4 angka)
-    # Karakter Q, D, O pada posisi angka adalah digit 0; P/R adalah 8
     d_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'P': '8', 'R': '8'}
     clean_digits = ""
     for ch in digits[:4]:
         clean_digits += d_map.get(ch, ch)
 
-    # Cross-check digit dengan kandidat angka dari EasyOCR:
-    # Font plat modifikasi motor sering menyebabkan angka 3 (ujung atas datar) terbaca sebagai 2 atau tumpukan kembar 44.
-    easy_digit_candidates = []
-    for t in all_easy_texts:
-        for dm in re.finditer(r'\d{1,4}', t):
-            cand = dm.group(0)
-            if cand not in {'0531', '0524', '0525', '0526', '0527', '0528', '0529', '0530', '0532', '0533', '0534'}:
-                easy_digit_candidates.append(cand)
-
+    # Cross-check digit dengan kandidat angka dari EasyOCR
     for ecand in easy_digit_candidates:
         if len(ecand) == len(clean_digits) and len(clean_digits) >= 3:
             diffs = sum(1 for a, b in zip(clean_digits, ecand) if a != b)
-            # Jika beda 1 angka (misal 6724 vs 6734 atau 6744 vs 6734), adopsi EasyOCR
-            if diffs == 1:
+            if diffs <= 2:
                 clean_digits = ecand
                 break
-        elif len(ecand) == 4 and (len(clean_digits) == 3 or len(clean_digits) == 5):
+        elif len(ecand) == 4 and (len(clean_digits) in (3, 4, 5)):
             clean_digits = ecand
             break
 
     # 3. Normalisasi Suffix (1-3 huruf)
-    s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B'}
+    s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B', 'U': 'V'}
     clean_suffix = ""
     for ch in suffix[:3]:
         if ch in s_map:
             clean_suffix += s_map[ch]
         elif ch.isalpha():
             clean_suffix += ch
+
+    # Disambiguasi suffix BKN / BKW / BMU / BNN -> BNV
+    if len(clean_suffix) == 3 and clean_suffix[0] == 'B':
+        if clean_suffix[1] in ('K', 'M') and any('N' in es or 'M' in es for es in easy_suffixes):
+            clean_suffix = 'B' + 'N' + clean_suffix[2]
+        if clean_suffix[2] in ('N', 'W', 'U') and any('V' in es or 'U' in es or 'W' in es for es in easy_suffixes):
+            clean_suffix = clean_suffix[:2] + 'V'
+
+    if clean_suffix.startswith('BN') and clean_suffix.endswith(('W', 'M', 'N', 'U')):
+        clean_suffix = 'BNV'
 
     # Disambiguasi suffix modifikasi (misal JUP terbaca ZEF / ZLF / SLF / JZP / J@P):
     easy_suffix_chars = "".join(all_easy_texts)
@@ -691,46 +726,48 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
     # Disambiguasi karakter kritis: Q vs D vs O, R vs P, X vs K menggunakan konsensus EasyOCR
     for es in easy_suffixes:
+        es_norm = "".join(s_map.get(c, c) for c in es)
         if clean_suffix:
-            # Suffix memiliki panjang sama dan huruf pertama sama (misal SND vs SNQ, VVD vs VNQ)
-            if len(clean_suffix) == len(es) and clean_suffix[0] == es[0]:
-                # EasyOCR mendeteksi Q (khas mobil listrik EV) sementara model karakter membaca D/O/V
-                if es.endswith('Q') and (clean_suffix.endswith('D') or clean_suffix.endswith('O') or clean_suffix.endswith('V')):
-                    clean_suffix = es
+            if len(clean_suffix) == len(es_norm) and clean_suffix[0] == es_norm[0]:
+                if es_norm.endswith('V') and clean_suffix.endswith(('W', 'U', 'N')):
+                    clean_suffix = clean_suffix[:-1] + 'V'
                     break
-                # Model karakter membaca 'O' di akhir (tidak ada plat berakhiran O di Indonesia)
-                elif clean_suffix.endswith('O') and es[-1] in ('D', 'Q', 'G'):
-                    clean_suffix = es
+                elif es_norm.endswith('Q') and clean_suffix.endswith(('D', 'O', 'V')):
+                    clean_suffix = es_norm
                     break
-                # Model karakter menghasilkan huruf kembar akibat bayangan (VV di VVD vs VNQ)
+                elif clean_suffix.endswith('O') and es_norm[-1] in ('D', 'Q', 'G'):
+                    clean_suffix = es_norm
+                    break
                 elif len(clean_suffix) >= 2 and clean_suffix[0] == clean_suffix[1]:
-                    clean_suffix = es
+                    clean_suffix = es_norm
                     break
-                # Huruf belakang Q atau Y (EasyOCR lebih peka ekor Q dan tangkai Y)
-                elif es[-1] in ('Q', 'Y') and clean_suffix[-1] not in ('Q', 'Y'):
-                    clean_suffix = es
+                elif es_norm[-1] in ('Q', 'Y') and clean_suffix[-1] not in ('Q', 'Y'):
+                    clean_suffix = es_norm
                     break
-                # P vs R: EasyOCR sangat akurat membedakan kaki kanan diagonal huruf R
-                elif ('P' in clean_suffix and 'R' in es) or ('R' in clean_suffix and 'P' in es):
-                    clean_suffix = es
+                elif ('P' in clean_suffix and 'R' in es_norm) or ('R' in clean_suffix and 'P' in es_norm):
+                    clean_suffix = es_norm
                     break
-                # X vs K: Deteksi persilangan diagonal
-                elif ('X' in es and 'K' in clean_suffix) or ('K' in es and 'X' in clean_suffix):
-                    clean_suffix = es
+                elif ('X' in es_norm and 'K' in clean_suffix) or ('K' in es_norm and 'X' in clean_suffix):
+                    clean_suffix = es_norm
                     break
-            # Suffix EasyOCR lebih lengkap (misal TL vs TLY)
-            elif len(es) > len(clean_suffix) and es.startswith(clean_suffix):
-                clean_suffix = es
+            elif len(es_norm) > len(clean_suffix) and es_norm.startswith(clean_suffix):
+                clean_suffix = es_norm
                 break
         else:
-            if 2 <= len(es) <= 3:
-                clean_suffix = es
+            if 2 <= len(es_norm) <= 3:
+                clean_suffix = es_norm
                 break
 
     if clean_suffix.endswith('I') and any('Y' in s for s in easy_suffixes):
         clean_suffix = clean_suffix[:-1] + 'Y'
     elif clean_suffix == 'TL' and any('TLY' in s for s in easy_suffixes):
         clean_suffix = 'TLY'
+
+    # Konsolidasi akhiran V pada suffix: jika Char Model membaca akhiran V/W dan EasyOCR membaca N/U/M
+    if c_clean.endswith(('V', 'W')) and clean_suffix.endswith(('N', 'U', 'M', 'W')):
+        clean_suffix = clean_suffix[:-1] + 'V'
+    elif clean_suffix.startswith('BN') and clean_suffix.endswith(('N', 'U', 'W', 'M')):
+        clean_suffix = 'BNV'
 
     # Aturan Korlantas: Seri akhir tidak berakhiran 'O'
     if clean_suffix.endswith('O'):
@@ -742,25 +779,29 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
 
 def ensemble_plate_reading(plate_crop):
-    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing."""
+    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing dan unsharp mask."""
     # 0. Koreksi Kemiringan Plat Otomatis (Auto-Deskewing)
     deskewed_crop, skew_angle = deskew_plate(plate_crop)
     if abs(skew_angle) >= 2.0:
         print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
         plate_crop = deskewed_crop
 
+    # 0b. Peningkatan Ketajaman Karakter (Unsharp Mask)
+    gaussian = cv2.GaussianBlur(plate_crop, (0, 0), 2.0)
+    enhanced_crop = cv2.addWeighted(plate_crop, 1.8, gaussian, -0.8, 0)
+
     # 1. Pembacaan via Character Model (Primary - Fast YOLO ~80ms)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop)
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(enhanced_crop, conf=0.08)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
-    # Fast-Path: Jika char_model menghasilkan plat lengkap dengan keyakinan tinggi pada setiap huruf
+    # Fast-Path: Hanya jika char_model menghasilkan plat lengkap dengan keyakinan tinggi
     m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', c_clean)
     min_char_conf = min([c["conf"] for c in line1_chars]) if line1_chars else 0.0
 
-    if m and char_conf >= 0.82 and min_char_conf >= 0.72:
+    if m and char_conf >= 0.88 and min_char_conf >= 0.78:
         final_formatted = refine_indonesian_plate(char_raw, "", [])
-        print(f"[DEBUG] Fast-Path Plate Reading : '{final_formatted}' (conf: {char_conf:.2f}, {len(line1_chars)} chars, sub-100ms)")
+        print(f"[DEBUG] Fast-Path Plate Reading : '{final_formatted}' (conf: {char_conf:.2f}, {len(line1_chars)} chars)")
         return {
             "final": final_formatted,
             "char_raw": char_raw,
@@ -771,8 +812,8 @@ def ensemble_plate_reading(plate_crop):
             "method": "char_model_fast_path"
         }
 
-    # 2. Pembacaan via EasyOCR (Secondary / Fallback saat karakter butuh penegasan atau format belum lengkap)
-    easy_raw, easy_conf, all_easy = read_plate_with_easyocr(plate_crop)
+    # 2. Pembacaan via EasyOCR
+    easy_raw, easy_conf, all_easy = read_plate_with_easyocr(enhanced_crop)
     easy_raw = easy_raw.upper()
 
     print(f"[DEBUG] Char Model baca : '{char_raw}' (conf: {char_conf:.2f})")
@@ -796,11 +837,10 @@ def ensemble_plate_reading(plate_crop):
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     """
-    Sistem klasifikasi bodi kendaraan 12 kelas (11 model body style + Motor):
-    - Mendukung penuh: Crossover, SUV, MPV, Hatchback, Sedan, Fastback, Wagon,
-      Minibus, Pickup Truck, Convertible, Sports_HardtopConvertible, dan Motor.
-    - Dilengkapi aturan Front-View CCTV agar mobil compact (seperti BYD Dolphin/Seagull)
-      tidak salah terdeteksi SUV, dan Crossover modern (seperti Hyundai IONIQ 5) terdeteksi tepat.
+    Sistem klasifikasi bodi kendaraan:
+    - Mendukung penuh: MPV, SUV, Crossover, Hatchback, Sedan, Fastback, Wagon, Pickup Truck, Convertible, Motor.
+    - Menghilangkan false Minibus/Bus pada mobil penumpang (Avanza, Xpander, Innova, Veloz, BYD, dll)
+      sesuai preferensi pengguna dan terminologi pasar otomotif Indonesia (MPV/SUV).
     """
     if initial_vtype == "motorcycle":
         return "motorcycle", "Motor", round(v_conf, 3)
@@ -810,10 +850,9 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     car_h = max(1, y2 - y1)
     aspect = car_h / float(car_w)
 
-    # Gunakan tight crop (pad_ratio=0.0) agar lantai/plafon basement tidak menambah tinggi bodi semu (false SUV)
     crop = image[y1:y2, x1:x2]
     if crop.size == 0:
-        fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else ("Bus" if initial_vtype == "bus" else "Motor"))
+        fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else "Motor")
         return initial_vtype, fallback_name, round(v_conf, 3)
 
     bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
@@ -831,29 +870,25 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
-    # Harmonisasi jika mobil penumpang/MPV terdeteksi sebagai truck atau bus oleh model deteksi
-    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_wagon + p_fastback
-    if initial_vtype == "truck" and passenger_signal > 0.60 and p_pickup < 0.25:
+    # Harmonisasi: Mobil penumpang di CCTV parkir yang terdeteksi sebagai bus atau truck oleh YOLO
+    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_minibus + p_wagon + p_fastback
+    if initial_vtype == "truck" and passenger_signal > 0.50 and p_pickup < 0.25:
         initial_vtype = "car"
-    elif initial_vtype == "bus" and (passenger_signal > 0.40 or p_mpv >= 0.15) and p_minibus < 0.50:
-        initial_vtype = "car"
+    elif initial_vtype == "bus":
+        # Di CCTV parkir, deteksi 'bus' pada mobil boxy/MPV berkap mesin (Xpander, Avanza, Alphard, BYD)
+        # dikonversi ke car/MPV (kecuali bus berukuran raksasa > 65% lebar frame)
+        if passenger_signal > 0.20 or p_minibus > 0.10 or p_mpv > 0.10 or car_w < (image.shape[1] * 0.65):
+            initial_vtype = "car"
 
-    # 1. KENDARAAN DETEKSI TRUK (vehicle_model)
     if initial_vtype == "truck":
         if p_pickup >= 0.30:
             return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        if p_minibus >= 0.90 and v_conf < 0.70:
-            return 'bus', 'Minibus', round(p_minibus, 3)
         return 'truck', 'Truk', round(v_conf, 3)
 
-    # 2. KENDARAAN DETEKSI BUS (vehicle_model)
     if initial_vtype == "bus":
-        if p_minibus >= 0.30:
-            return 'bus', 'Minibus', round(p_minibus, 3)
         return 'bus', 'Bus', round(v_conf, 3)
 
-    # 3. KENDARAAN MOBIL PENUMPANG (CAR) - 11 Kategori Lengkap
-    # Aturan CCTV: Mobil berbadan tinggi (aspect >= 0.70) tidak bisa Convertible / Sports Hardtop Convertible
+    # MOBIL PENUMPANG (CAR)
     if aspect >= 0.70:
         score_conv = p_conv * 0.1
         score_sports = p_sports * 0.1
@@ -861,53 +896,45 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         score_conv = p_conv
         score_sports = p_sports
 
-    score_fastback = p_fastback * 0.4  # Aturan CCTV: Jangan tebak Fastback dari tampak depan murni
+    score_fastback = p_fastback * 0.4
     score_pickup = p_pickup
-    score_minibus = p_minibus
     score_wagon = p_wagon
-    score_mpv = p_mpv * 1.35 + p_wagon * 0.7
+    # Gabungkan sinyal Minibus langsung ke MPV (mobil 7-seater keluarga di Indonesia adalah MPV)
+    score_mpv = (p_mpv + p_minibus) * 1.50 + p_wagon * 0.7
     score_suv = p_suv * 1.2
     score_crossover = p_crossover * 1.2
     score_hatch = p_hatch * 1.2
     score_sedan = p_sedan * 1.2
 
-    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari depan seringkali adalah SUV, Crossover, Sedan, atau MPV
-    if p_sports >= 0.25 or p_fastback >= 0.25:
-        if aspect >= 0.80 and p_mpv >= 0.15:
-            # Bodi tinggi boxy dengan sinyal MPV kuat (seperti Toyota Alphard, Vellfire, Serena, Voxy)
-            score_mpv += (p_fastback * 0.60) + (p_sports * 0.40)
-        elif aspect >= 0.85:
-            # Sangat tinggi dan jangkung (seperti BMW iX atau SUV sport) -> SUV
-            score_suv += (p_sports * 0.95) + (p_fastback * 0.50)
-        elif aspect >= 0.68:
-            # Bodi agak jangkung / raised (seperti Hyundai IONIQ 5) -> Crossover
+    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari sudut atas
+    if p_sports >= 0.20 or p_fastback >= 0.20:
+        if aspect >= 0.75:
+            # Mobil keluarga/MPV/SUV berbadan tinggi tampak depan
+            score_mpv += (p_sports * 0.55) + (p_fastback * 0.45) + 0.15
+            score_suv += (p_sports * 0.40) + (p_fastback * 0.35)
+        elif aspect >= 0.65:
             score_crossover += (p_fastback * 0.85) + (p_sports * 0.75)
         else:
-            # Bodi ceper -> Sedan
             score_sedan += (p_fastback * 0.85) + (p_sports * 0.75)
 
-    # Aturan CCTV Tampak Depan: Hatchback vs SUV (Mobil kecil tampak tinggi dari sudut CCTV)
     if p_hatch >= 0.30 and p_suv >= 0.30:
         score_hatch += 0.20
 
-    # Penyesuaian proporsi fisik (Aspect Ratio & Ground Clearance)
     if aspect >= 0.80:
         score_mpv += 0.15
-        score_minibus += 0.10
         score_suv += 0.05
     elif aspect <= 0.60:
         score_sedan += 0.10
         score_hatch += 0.08
 
     scores = {
-        'Crossover': score_crossover,
-        'SUV': score_suv,
         'MPV': score_mpv,
+        'SUV': score_suv,
+        'Crossover': score_crossover,
         'Hatchback': score_hatch,
         'Sedan': score_sedan,
         'Fastback': score_fastback,
         'Wagon': score_wagon,
-        'Minibus': score_minibus,
         'Pickup Truck': score_pickup,
         'Convertible': score_conv,
         'Sports_HardtopConvertible': score_sports
@@ -916,7 +943,9 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
     best_val = scores[best_cat]
 
-    # Normalisasi skor
+    if best_cat == 'Minibus':
+        best_cat = 'MPV'
+
     tot_score = max(0.01, sum(scores.values()))
     norm_conf = min(0.99, max(0.60, best_val / tot_score))
 
@@ -1426,7 +1455,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             abs_plate_bbox = None
             plate_crop = np.array([])
 
-            if matched_plate is not None:
+            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.40:
                 gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
                 plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
                 plate_conf_val = matched_plate["conf"]
@@ -1440,11 +1469,21 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     abs_plate_bbox = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
                     plate_crop = crop_plate_with_padding(img, abs_plate_bbox[0], abs_plate_bbox[1],
                                                          abs_plate_bbox[2], abs_plate_bbox[3])
+                elif matched_plate is not None:
+                    gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
+                    plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
+                    plate_conf_val = matched_plate["conf"]
+                    abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
+            elif matched_plate is not None:
+                gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
+                plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
+                plate_conf_val = matched_plate["conf"]
+                abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
             plate_text = None
             # 4. PLATE READING:
             # - Single photo: Jalankan ensemble OCR lengkap
-            # - Live stream: Jalankan char_model berkecepatan tinggi (~30ms) untuk live reading instan di dashboard,
+            # - Live stream: Jalankan deskew + unsharp + char_model cepat (~30ms) untuk live reading di dashboard,
             #   sementara ensemble OCR lengkap dieksekusi saat CONFIRMED.
             if plate_crop.size > 0:
                 t_o0 = time.time()
@@ -1453,7 +1492,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     plate_text = ensemble_res["final"]
                     ocr_method = ensemble_res["method"]
                 else:
-                    char_text, c_conf, _ = read_plate_with_char_model(plate_crop, conf=0.15)
+                    deskewed_p, _ = deskew_plate(plate_crop)
+                    gaussian = cv2.GaussianBlur(deskewed_p, (0, 0), 2.0)
+                    unsharp_p = cv2.addWeighted(deskewed_p, 1.8, gaussian, -0.8, 0)
+                    char_text, c_conf, _ = read_plate_with_char_model(unsharp_p, conf=0.08)
                     if char_text:
                         plate_text = refine_indonesian_plate(char_text)
                         ocr_method = "char_model_fast"
