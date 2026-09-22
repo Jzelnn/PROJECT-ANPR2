@@ -42,12 +42,12 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 
 # ============================================================
 # PERFORMANCE & DETECTION CONFIGURATION
-# Configurable parameters for speed, ROI, and temporal confirmation
+# Configurable parameters for speed, dark vehicle detection, and temporal confirmation
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for reliable small plate detection
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.10))  # 0.10 for fast detection on dark cars/dim light
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
-PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
+PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.18))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
@@ -58,7 +58,7 @@ MIN_OBSERVATIONS = 2
 MAX_OBSERVATIONS = 3
 TEMPORAL_WINDOW_SEC = 0.25  # 150-250 ms max window
 CONSISTENCY_THRESH = 0.70   # 70%
-CONFIRM_CONF_THRESH = 0.80  # 80-85%
+CONFIRM_CONF_THRESH = 0.55  # 55% for fast confirmation even with glare/dark body
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -1014,12 +1014,24 @@ class VehicleTrack:
 
     def _evaluate_confirmation(self):
         n = len(self.frames)
+        if n < 1:
+            return
+
+        # 1. PLATE-ASSISTED FAST CONFIRMATION:
+        # Jika ada plat nomor yang terdeteksi dengan baik (conf >= 0.30)
+        # Plat nomor adalah bukti paling kuat kendaraan di gerbang parkir!
+        has_clear_plate = any((f.get("plate_conf") or 0) >= 0.30 for f in self.frames)
+        if has_clear_plate:
+            # Konfirmasi seketika di Frame 2 (atau Frame 1 jika conf plat >= 0.40)
+            if n >= 2 or ((self.frames[0].get("plate_conf") or 0) >= 0.40):
+                self._finalize_confirmation(reason="plate_assisted_fast_confirmation")
+                return
+
         if n < MIN_OBSERVATIONS:
             return
 
-        # 1. EARLY CONFIRMATION (Frame 2):
-        # Jika ada 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= 80%
-        # Contoh: Frame 1: Motorcycle 0.91, Frame 2: Motorcycle 0.94 -> CONFIRM immediately!
+        # 2. EARLY CONFIRMATION (Frame 2):
+        # Jika ada 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= CONFIRM_CONF_THRESH
         f1, f2 = self.frames[0], self.frames[1]
         same_vtype = (f1["vehicle_type"] == f2["vehicle_type"]) and (f1["v_conf"] >= CONFIRM_CONF_THRESH) and (f2["v_conf"] >= CONFIRM_CONF_THRESH)
         same_bstyle = bool(f1["body_style"] and f2["body_style"] and (f1["body_style"] == f2["body_style"]) and (f1["body_conf"] >= CONFIRM_CONF_THRESH) and (f2["body_conf"] >= CONFIRM_CONF_THRESH))
@@ -1028,7 +1040,7 @@ class VehicleTrack:
             self._finalize_confirmation(reason="early_consistency_2_frames")
             return
 
-        # 2. Maximum observations (3 frames) atau time window >= 250ms reached:
+        # 3. Maximum observations (3 frames) atau time window >= 250ms reached:
         time_span = self.frames[-1]["time"] - self.frames[0]["time"]
         if n >= MAX_OBSERVATIONS or time_span >= TEMPORAL_WINDOW_SEC:
             self._finalize_confirmation(reason="buffer_max_3_frames")
@@ -1133,11 +1145,44 @@ class VehicleConfirmationManager:
             self.tracks.clear()
             self.next_fallback_id = 1
 
+    def _match_track(self, bbox, img_w=1920, img_h=1080, iou_thresh=0.10, max_center_dist_ratio=0.35):
+        """
+        Mencocokkan bounding box baru dengan track kendaraan aktif yang sudah ada.
+        Menggunakan kombinasi IoU dan jarak pusat (Centroid) agar kendaraan yang bergerak
+        cepat pada low FPS tetap terhubung pada Track ID yang sama (mencegah ID jumping).
+        """
+        if not bbox:
+            return None
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+
+        best_id = None
+        best_score = -1.0
+
+        for tid, trk in self.tracks.items():
+            if trk.last_bbox:
+                lx1, ly1, lx2, ly2 = trk.last_bbox
+                lcx = (lx1 + lx2) / 2.0
+                lcy = (ly1 + ly2) / 2.0
+
+                iou = compute_iou(bbox, trk.last_bbox)
+                dx = abs(cx - lcx) / max(1, img_w)
+                dy = abs(cy - lcy) / max(1, img_h)
+                dist = (dx**2 + dy**2)**0.5
+
+                # Cocok jika IoU >= 0.10 ATAU jarak pusat mobil berdekatan (< 35% ukuran frame)
+                if iou >= iou_thresh or dist <= max_center_dist_ratio:
+                    score = iou + (1.0 - min(1.0, dist / max_center_dist_ratio))
+                    if score > best_score:
+                        best_score = score
+                        best_id = tid
+        return best_id
+
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            # Bersihkan track yang tidak terlihat > 3.0 detik
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 3.0]
+            # Bersihkan track yang tidak terlihat > 8.0 detik
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 8.0]
             for tid in stale_ids:
                 del self.tracks[tid]
 
@@ -1157,15 +1202,22 @@ class VehicleConfirmationManager:
             # Mode Stream / Live CCTV
             updated_detections = []
             for det in detections:
-                tid = det.get("track_id")
+                raw_tid = det.get("track_id")
+                bbox = det.get("bbox")
+                iw = det.get("image_width", 1920)
+                ih = det.get("image_height", 1080)
 
-                # Fallback IoU matching jika box.id dari YOLO ByteTrack None
-                if tid is None:
-                    tid = self._match_iou(det.get("bbox"))
-                    if tid is None:
-                        tid = self.next_fallback_id
-                        self.next_fallback_id += 1
-                    det["track_id"] = tid
+                # Prioritaskan pencocokan spasial dengan track aktif yang sudah ada
+                matched_id = self._match_track(bbox, img_w=iw, img_h=ih)
+                if matched_id is not None:
+                    tid = matched_id
+                elif raw_tid is not None:
+                    tid = raw_tid
+                else:
+                    tid = self.next_fallback_id
+                    self.next_fallback_id += 1
+
+                det["track_id"] = tid
 
                 if tid not in self.tracks:
                     self.tracks[tid] = VehicleTrack(tid, det)
@@ -1211,19 +1263,6 @@ class VehicleConfirmationManager:
                 updated_detections.append(det)
 
             return updated_detections
-
-    def _match_iou(self, bbox, iou_thresh=0.30):
-        if not bbox:
-            return None
-        best_id = None
-        best_iou = iou_thresh
-        for tid, trk in self.tracks.items():
-            if trk.last_bbox:
-                iou = compute_iou(bbox, trk.last_bbox)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_id = tid
-        return best_id
 
 
 confirmation_manager = VehicleConfirmationManager()
@@ -1294,6 +1333,43 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "conf": float(pbox.conf[0]),
             "matched": False
         })
+
+    # FALLBACK UNTUK MOBIL GELAP / HITAM:
+    # Jika mobil hitam/gelap tidak terdeteksi YOLO vehicle di atas threshold karena menyatu dengan aspal/glare,
+    # tetapi plat nomor terdeteksi oleh plate_model:
+    if not candidates and global_plates:
+        best_p = max(global_plates, key=lambda p: p["conf"])
+        if best_p["conf"] >= 0.15:
+            px1, py1, px2, py2 = best_p["box"]
+            pw = px2 - px1
+            ph = py2 - py1
+            # Cek apakah ada box kendaraan di vdet yang menaungi plat meskipun conf rendah
+            found_box = None
+            for box in vdet.boxes:
+                bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                if bx1 - 30 <= (px1 + px2) / 2 <= bx2 + 30 and by1 - 30 <= (py1 + py2) / 2 <= by2 + 30:
+                    found_box = box
+                    break
+            if found_box is not None:
+                v_cls = int(found_box.cls[0])
+                v_conf = float(found_box.conf[0])
+                x1, y1, x2, y2 = map(int, found_box.xyxy[0].tolist())
+            else:
+                v_cls = 0  # car
+                v_conf = max(0.55, best_p["conf"])
+                # Rekonstruksi bbox kendaraan proporsional terhadap plat nomor
+                x1 = max(0, int(px1 - pw * 2.2))
+                x2 = min(iw, int(px2 + pw * 2.2))
+                y1 = max(0, int(py1 - ph * 4.5))
+                y2 = min(ih, int(py2 + ph * 1.0))
+            candidates.append({
+                "track_id": None,
+                "vehicle_type": VEHICLE_CLASS_NAMES[v_cls],
+                "v_conf": v_conf,
+                "x1": max(0, x1), "y1": max(0, y1),
+                "x2": min(iw, x2), "y2": min(ih, y2),
+                "area": (x2 - x1) * (y2 - y1)
+            })
 
     results_out = []
     t_body_total = 0.0
@@ -1371,15 +1447,21 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                                          abs_plate_bbox[2], abs_plate_bbox[3])
 
             plate_text = None
-            ocr_method = None
-
-            # 4. DEFERRED OCR: Jangan jalankan OCR di setiap frame stream!
-            # Hanya jalankan OCR jika mode single photo upload manual (bukan stream)
-            if not is_stream and plate_crop.size > 0:
+            # 4. PLATE READING:
+            # - Single photo: Jalankan ensemble OCR lengkap
+            # - Live stream: Jalankan char_model berkecepatan tinggi (~30ms) untuk live reading instan di dashboard,
+            #   sementara ensemble OCR lengkap dieksekusi saat CONFIRMED.
+            if plate_crop.size > 0:
                 t_o0 = time.time()
-                ensemble_res = ensemble_plate_reading(plate_crop)
-                plate_text = ensemble_res["final"]
-                ocr_method = ensemble_res["method"]
+                if not is_stream:
+                    ensemble_res = ensemble_plate_reading(plate_crop)
+                    plate_text = ensemble_res["final"]
+                    ocr_method = ensemble_res["method"]
+                else:
+                    char_text, c_conf, _ = read_plate_with_char_model(plate_crop, conf=0.15)
+                    if char_text:
+                        plate_text = refine_indonesian_plate(char_text)
+                        ocr_method = "char_model_fast"
                 t_ocr_total += (time.time() - t_o0)
 
             results_out.append({
