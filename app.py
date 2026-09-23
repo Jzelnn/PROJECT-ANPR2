@@ -352,6 +352,64 @@ def crop_vehicle_with_context(image, x1, y1, x2, y2, pad_ratio=0.04):
     return image[cy1:cy2, cx1:cx2]
 
 
+SAMSAT_PREFIXES = {
+    'A', 'B', 'D', 'E', 'F', 'G', 'H', 'K', 'L', 'M', 'N', 'P', 'R', 'S', 'T', 'W', 'Z',
+    'AA', 'AB', 'AD', 'AE', 'AG', 'BA', 'BB', 'BD', 'BE', 'BG', 'BH', 'BK', 'BL', 'BM', 'BN',
+    'BP', 'DA', 'DB', 'DC', 'DD', 'DE', 'DF', 'DG', 'DH', 'DK', 'DM', 'DN', 'DP', 'DR', 'DT',
+    'DW', 'EA', 'EB', 'ED', 'KB', 'KH', 'KT', 'KU'
+}
+
+
+def is_valid_plate_box(box, img_w, img_h):
+    """Memvalidasi geometri bounding box plat untuk menyingkirkan deteksi palsu (grille, bumper, garis aspal)."""
+    x1, y1, x2, y2 = box
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    aspect = w / float(h)
+    w_ratio = w / float(img_w)
+    h_ratio = h / float(img_h)
+    area_ratio = (w * h) / float(img_w * img_h)
+    # Plat nomor Indonesia: rasio aspek ~ 1.8 - 6.0, lebar <= 45% frame, luas <= 10% frame
+    if aspect < 1.6 or aspect > 6.2:
+        return False
+    if w_ratio > 0.45 or h_ratio > 0.28:
+        return False
+    if area_ratio > 0.10:
+        return False
+    return True
+
+
+def compute_crop_quality(crop, p_conf=0.5):
+    """
+    Menghitung skor kualitas gambar plat nomor pada kendaraan bergerak.
+    Memprioritaskan frame yang tajam (bebas motion blur) dan beresolusi cukup saat mobil mendekat.
+    """
+    if crop is None or getattr(crop, 'size', 0) == 0:
+        return 0.0
+    h, w = crop.shape[:2]
+    if h < 14 or w < 28:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    res_factor = min(3.0, (h * w) / (32.0 * 95.0))
+    aspect = w / float(max(1, h))
+    aspect_factor = 1.0 if 2.0 <= aspect <= 5.0 else 0.6
+    quality = res_factor * (sharpness ** 0.5) * (max(0.2, p_conf) ** 0.5) * aspect_factor
+    return quality
+
+
+def enhance_moving_plate_crop(crop):
+    """
+    Peningkatan ketajaman adaptif (Unsharp Masking) untuk mengurangi motion blur kendaraan yang sedang berjalan.
+    Membuat kontur karakter angka dan huruf plat menjadi tegas dan kontras (<2ms CPU).
+    """
+    if crop is None or getattr(crop, 'size', 0) == 0:
+        return crop
+    gaussian = cv2.GaussianBlur(crop, (0, 0), sigmaX=2.0)
+    sharpened = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
+    return sharpened
+
+
 def deskew_plate(plate_crop):
     """
     Mendeteksi dan meluruskan sudut kemiringan plat nomor secara otomatis (Auto-Deskewing).
@@ -796,23 +854,31 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
 
 def ensemble_plate_reading(plate_crop):
-    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing."""
-    # 0. Koreksi Kemiringan Plat Otomatis (Auto-Deskewing)
+    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing dan motion-blur sharpening."""
+    # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
+    plate_crop = enhance_moving_plate_crop(plate_crop)
+
+    # 0b. Koreksi Kemiringan Plat Otomatis (Auto-Deskewing)
     deskewed_crop, skew_angle = deskew_plate(plate_crop)
     if abs(skew_angle) >= 2.0:
         print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
         plate_crop = deskewed_crop
 
-    # 1. Pembacaan via Character Model (Primary - Fast YOLO ~80ms)
+    # 1. Pembacaan via Character Model (Primary - Fast YOLO ~40-80ms)
     char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.08)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
-    # Fast-Path: Hanya jika char_model menghasilkan plat lengkap dengan keyakinan tinggi
+    # Fast-Path: Model Karakter YOLO (~40ms di CPU, sangat akurat pada karakter plat Indonesia)
+    # Menghindari delay 1.5 - 3.0 detik dari EasyOCR ketika mobil bergerak
     m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', c_clean)
     min_char_conf = min([c["conf"] for c in line1_chars]) if line1_chars else 0.0
 
-    if m and char_conf >= 0.88 and min_char_conf >= 0.78:
+    # Lolos fast-path jika:
+    # A. Struktur plat Indonesia lengkap (Prefix 1-2 huruf terdaftar Samsat, 1-4 digit, 1-3 huruf) dengan char_conf >= 0.65
+    # B. Keyakinan tinggi (char_conf >= 0.80 dan min_char_conf >= 0.55)
+    is_samsat = m and (m.group(1) in SAMSAT_PREFIXES or c_clean[0] in {'B', 'D', 'F', 'E', 'L', 'N', 'A', 'H', 'G', 'K', 'R', 'T', 'Z'})
+    if (m and is_samsat and char_conf >= 0.65 and len(c_clean) >= 5) or (m and char_conf >= 0.80 and min_char_conf >= 0.55):
         final_formatted = refine_indonesian_plate(char_raw, "", [])
         print(f"[DEBUG] Fast-Path Plate Reading : '{final_formatted}' (conf: {char_conf:.2f}, {len(line1_chars)} chars)")
         return {
@@ -825,7 +891,7 @@ def ensemble_plate_reading(plate_crop):
             "method": "char_model_fast_path"
         }
 
-    # 2. Pembacaan via EasyOCR
+    # 2. Pembacaan via EasyOCR (Hanya fallback jika char_model tidak lengkap)
     easy_raw, easy_conf, all_easy = read_plate_with_easyocr(plate_crop)
     easy_raw = easy_raw.upper()
 
@@ -1112,7 +1178,9 @@ class VehicleTrack:
         self.cached_body_conf = 0.0
         self.cached_vtype = None
         self.best_plate_crop = None
+        self.best_crop_quality = -1.0
         self.best_plate_conf = 0.0
+        self.plate_readings = []
         if initial_det:
             self.add_frame(initial_det)
 
@@ -1121,9 +1189,27 @@ class VehicleTrack:
         self.last_bbox = det.get("bbox")
         p_crop = det.get("plate_crop")
         p_conf = det.get("plate_confidence", 0.0) or 0.0
-        if p_crop is not None and getattr(p_crop, 'size', 0) > 0 and p_conf > self.best_plate_conf:
-            self.best_plate_crop = p_crop
-            self.best_plate_conf = p_conf
+        p_text = det.get("license_plate")
+
+        # 1. Update best_plate_crop menggunakan metrik Crop Quality (Sharpness & Resolusi saat mobil mendekat)
+        if p_crop is not None and getattr(p_crop, 'size', 0) > 0:
+            quality = compute_crop_quality(p_crop, p_conf)
+            if quality > self.best_crop_quality:
+                self.best_plate_crop = p_crop
+                self.best_crop_quality = quality
+                self.best_plate_conf = p_conf
+
+        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan untuk Temporal Consensus
+        if p_text and p_text != "TIDAK_TERBACA":
+            p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper())
+            if len(p_clean) >= 4:
+                self.plate_readings.append({
+                    "text": p_text,
+                    "clean": p_clean,
+                    "conf": p_conf or 0.75,
+                    "quality": getattr(self, 'best_crop_quality', 1.0),
+                    "time": self.last_seen
+                })
 
         self.frames.append({
             "time": self.last_seen,
@@ -1152,28 +1238,34 @@ class VehicleTrack:
         if n < MIN_OBSERVATIONS:
             return
 
-        # 1. EARLY CONFIRMATION (Frame 2):
-        # Jika ada setidaknya 2 observasi berturut-turut dengan kelas kendaraan sama dan confidence >= CONFIRM_CONF_THRESH (0.80)
-        # Contoh: Frame 1: Car 0.88, Frame 2: Car 0.91 -> CONFIRM immediately!
+        valid_plates = [r for r in self.plate_readings if len(r["clean"]) >= 4]
+
+        # 1. PLATE-ASSISTED FAST CONFIRMATION:
+        # Jika plat nomor sudah terdeteksi dan terbaca valid (>= 4 karakter), langsung konfirmasi instan!
+        if valid_plates and n >= MIN_OBSERVATIONS:
+            self._finalize_confirmation(reason="plate_assisted_fast_confirmation")
+            return
+
+        # 2. EARLY CONFIRMATION UNTUK KENDARAAN DI DEPAN KAMERA (GATE ZONE):
+        # Jika mobil belum terbaca platnya tapi sudah berada di area dekat kamera (bawah frame / ukuran besar):
+        last_box = self.last_bbox or [0, 0, 0, 0]
+        bw = max(1, last_box[2] - last_box[0])
+        bh = max(1, last_box[3] - last_box[1])
+        is_in_gate_zone = (last_box[3] >= 480) or (bw * bh >= 35000)
+
         f1, f2 = self.frames[0], self.frames[1]
         same_vtype = (f1["vehicle_type"] == f2["vehicle_type"]) and (f1["v_conf"] >= CONFIRM_CONF_THRESH) and (f2["v_conf"] >= CONFIRM_CONF_THRESH)
         same_bstyle = bool(f1["body_style"] and f2["body_style"] and (f1["body_style"] == f2["body_style"]) and (f1["body_conf"] >= CONFIRM_CONF_THRESH) and (f2["body_conf"] >= CONFIRM_CONF_THRESH))
 
-        if same_vtype or same_bstyle:
-            self._finalize_confirmation(reason="early_consistency_2_frames")
+        # Hanya konfirmasi jika sudah di gate zone ATAU observasi sudah mencapai buffer 3-4 frame
+        if (same_vtype or same_bstyle) and (is_in_gate_zone or n >= 3):
+            self._finalize_confirmation(reason="early_consistency_gate_zone")
             return
 
-        # 2. PLATE-ASSISTED FAST CONFIRMATION:
-        # Jika plat nomor terdeteksi konsisten (conf >= 0.20)
-        has_clear_plate = any((f.get("plate_conf") or 0) >= PLATE_CONF_THRESH for f in self.frames)
-        if has_clear_plate and n >= MIN_OBSERVATIONS:
-            self._finalize_confirmation(reason="plate_assisted_fast_confirmation")
-            return
-
-        # 3. Maximum observations (3 frames) atau time window >= 250ms reached:
+        # 3. Maximum observations reached (atau time window tercapai)
         time_span = self.frames[-1]["time"] - self.frames[0]["time"]
         if n >= MAX_OBSERVATIONS or time_span >= TEMPORAL_WINDOW_SEC:
-            self._finalize_confirmation(reason="buffer_max_3_frames")
+            self._finalize_confirmation(reason="buffer_max_frames")
 
     def _finalize_confirmation(self, reason="buffer_voting"):
         # A. Voting Body Style (Weighted Confidence)
@@ -1207,12 +1299,12 @@ class VehicleTrack:
             type_weights[vt] = type_weights.get(vt, 0.0) + w
         best_type = max(type_weights, key=type_weights.get) if type_weights else self.frames[-1]["vehicle_type"]
 
-        # C. DEFERRED OCR: Jalankan OCR HANYA saat kendaraan TERKONFIRMASI!
-        # Ambil plate_crop terbaik yang terkumpul di buffer
+        # C. KONSENSUS PLAT NOMOR MULTI-FRAME (TEMPORAL OCR FUSION)
         best_plate = None
         best_plate_conf = None
         ocr_method = None
 
+        # 1. Jalankan ensemble OCR pada best_plate_crop (crop tertajam & terbaik selama mobil bergerak)
         target_crop = self.best_plate_crop
         if target_crop is None or getattr(target_crop, 'size', 0) == 0:
             for f in reversed(self.frames):
@@ -1224,12 +1316,26 @@ class VehicleTrack:
             try:
                 t_ocr_0 = time.time()
                 ensemble_res = ensemble_plate_reading(target_crop)
-                best_plate = ensemble_res["final"]
-                ocr_method = ensemble_res["method"]
-                best_plate_conf = ensemble_res["confidence"]
-                print(f"[PERF] Deferred OCR executed for Track #{self.track_id}: '{best_plate}' in {round((time.time() - t_ocr_0)*1000, 1)}ms")
+                if ensemble_res.get("final"):
+                    best_plate = ensemble_res["final"]
+                    ocr_method = ensemble_res["method"]
+                    best_plate_conf = ensemble_res["confidence"]
+                    print(f"[PERF] Best-Crop OCR for Track #{self.track_id}: '{best_plate}' in {round((time.time() - t_ocr_0)*1000, 1)}ms")
             except Exception as ocr_err:
-                print(f"[WARN] Deferred OCR error: {ocr_err}")
+                print(f"[WARN] Best-Crop OCR error: {ocr_err}")
+
+        # 2. Temporal Majority Voting dari frame-frame yang terkumpul:
+        # Jika selama mobil bergerak ada plat yang terbaca berulang kali dengan konsisten
+        if self.plate_readings:
+            plate_counts = {}
+            for r in self.plate_readings:
+                p_text = r["text"]
+                plate_counts[p_text] = plate_counts.get(p_text, 0) + 1
+            most_common, count = max(plate_counts.items(), key=lambda kv: kv[1])
+            if not best_plate or (count >= 2 and len(re.sub(r'[^A-Z0-9]', '', most_common)) >= 5):
+                best_plate = most_common
+                best_plate_conf = max(best_plate_conf or 0.85, 0.90)
+                ocr_method = "temporal_consensus"
 
         # Frame terbaik untuk snapshot / bounding box
         best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
@@ -1361,6 +1467,24 @@ class VehicleConfirmationManager:
                     det["status"] = "HISTORY_SAVED"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.confirmation_score
+
+                    # Active Plate Upgrading saat mobil terus bergerak mendekat:
+                    curr_plate = det.get("license_plate")
+                    curr_conf = det.get("plate_confidence", 0.0) or 0.0
+                    if curr_plate and curr_plate != "TIDAK_TERBACA":
+                        curr_clean = re.sub(r'[^A-Z0-9]', '', curr_plate.upper())
+                        old_plate = track.confirmed_data.get("license_plate") if track.confirmed_data else None
+                        old_clean = re.sub(r'[^A-Z0-9]', '', old_plate.upper()) if old_plate else ""
+                        if (len(old_clean) < 4 and len(curr_clean) >= 4) or (len(curr_clean) > len(old_clean) and len(curr_clean) >= 5):
+                            if track.confirmed_data:
+                                track.confirmed_data["license_plate"] = curr_plate
+                                track.confirmed_data["plate_confidence"] = curr_conf or 0.88
+                            for rec in LATEST_RECORDS:
+                                if rec.get("track_id") == tid:
+                                    rec["license_plate"] = curr_plate
+                                    rec["confidence"] = curr_conf or 0.88
+                                    break
+
                     if track.confirmed_data:
                         det["body_style"] = track.confirmed_data["body_style"]
                         det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
@@ -1570,36 +1694,46 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             abs_plate_bbox = None
             plate_crop = np.array([])
 
-            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.40:
+            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.35:
                 gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
-                plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
-                plate_conf_val = matched_plate["conf"]
-                abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
-            elif vehicle_crop.size > 0:
+                if is_valid_plate_box([gpx1, gpy1, gpx2, gpy2], iw, ih):
+                    plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
+                    plate_conf_val = matched_plate["conf"]
+                    abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
+
+            if plate_crop.size == 0 and vehicle_crop.size > 0:
                 pdet_crop = plate_model.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
-                if len(pdet_crop.boxes) > 0:
-                    best_b = max(pdet_crop.boxes, key=lambda b: float(b.conf[0]))
-                    cpx1, cpy1, cpx2, cpy2 = map(int, best_b.xyxy[0].tolist())
-                    plate_conf_val = float(best_b.conf[0])
-                    abs_plate_bbox = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
+                valid_crops = []
+                for b in pdet_crop.boxes:
+                    cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                    abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
+                    if is_valid_plate_box(abs_box, iw, ih):
+                        valid_crops.append((abs_box, float(b.conf[0])))
+                if valid_crops:
+                    valid_crops.sort(key=lambda x: -x[1])
+                    best_abs, best_c = valid_crops[0]
+                    plate_conf_val = best_c
+                    abs_plate_bbox = best_abs
                     plate_crop = crop_plate_with_padding(img, abs_plate_bbox[0], abs_plate_bbox[1],
                                                          abs_plate_bbox[2], abs_plate_bbox[3])
                 elif matched_plate is not None:
                     gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
+                    if is_valid_plate_box([gpx1, gpy1, gpx2, gpy2], iw, ih):
+                        plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
+                        plate_conf_val = matched_plate["conf"]
+                        abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
+            elif matched_plate is not None and plate_crop.size == 0:
+                gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
+                if is_valid_plate_box([gpx1, gpy1, gpx2, gpy2], iw, ih):
                     plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
                     plate_conf_val = matched_plate["conf"]
                     abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
-            elif matched_plate is not None:
-                gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
-                plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
-                plate_conf_val = matched_plate["conf"]
-                abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
             plate_text = None
             ocr_method = None
             # 4. PLATE READING:
             # - Single photo: Jalankan ensemble OCR lengkap
-            # - Live stream: Jalankan deskew + char_model cepat (~30ms) untuk live reading di dashboard,
+            # - Live stream: Jalankan enhance + deskew + char_model cepat (~30ms) untuk live reading di dashboard,
             #   sementara ensemble OCR lengkap dieksekusi saat CONFIRMED.
             if plate_crop.size > 0:
                 t_o0 = time.time()
@@ -1608,7 +1742,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     plate_text = ensemble_res["final"]
                     ocr_method = ensemble_res["method"]
                 else:
-                    deskewed_p, _ = deskew_plate(plate_crop)
+                    enhanced_p = enhance_moving_plate_crop(plate_crop)
+                    deskewed_p, _ = deskew_plate(enhanced_p)
                     char_text, c_conf, _ = read_plate_with_char_model(deskewed_p, conf=0.08)
                     if char_text:
                         plate_text = refine_indonesian_plate(char_text)
