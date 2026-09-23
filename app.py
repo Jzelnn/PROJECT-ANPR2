@@ -779,9 +779,9 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     elif clean_suffix.startswith('BN') and clean_suffix.endswith(('N', 'U', 'W', 'M')):
         clean_suffix = 'BNV'
 
-    # Aturan Korlantas: Seri akhir tidak berakhiran 'O'
-    if clean_suffix.endswith('O'):
-        clean_suffix = clean_suffix[:-1] + 'D'
+    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti dengan 'O')
+    if 'Q' in clean_suffix:
+        clean_suffix = clean_suffix.replace('Q', 'O')
 
     parts = [p for p in [clean_prefix, clean_digits, clean_suffix] if p]
     final_text = " ".join(parts) if parts else base_text
@@ -849,12 +849,10 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     """
     Sistem klasifikasi kendaraan dan bodi terkalibrasi untuk lingkungan parkir Indonesia:
     - Membedakan jenis kendaraan utama: car, motorcycle, truck, bus.
-    - Menangani misklasifikasi YOLO COCO (di mana mobil penumpang seperti Innova, Avanza,
-      Sigra sering salah dideteksi sebagai 'bus' atau 'truck').
-    - Untuk 'truck': menghasilkan vehicle_type='truck', body_style='Truk' (atau 'Pickup Truck').
-    - Untuk 'bus': hanya untuk bus komersial berukuran besar (Jetbus, bus pariwisata, TransJakarta).
-    - Untuk 'motorcycle': menghasilkan vehicle_type='motorcycle', body_style='Motor'.
-    - Untuk 'car': mengklasifikasikan ke kategori bodi: MPV, SUV, Hatchback, Sedan, Crossover, dll.
+    - Menangani Isuzu Elf, HiAce, travel van -> masuk ke 'bus', 'Minibus' (bukan Truk).
+    - Menangani bus besar / medium bus -> masuk ke 'bus', 'Bus'.
+    - Menangani truk kargo komersial -> 'truck', 'Truk' (atau 'Pickup Truck').
+    - Menangani mobil penumpang: Sedan, Hatchback, SUV, MPV, Crossover, Pickup Truck.
     """
     if initial_vtype == "motorcycle":
         return "motorcycle", "Motor", round(v_conf, 3)
@@ -890,48 +888,54 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
-    # 1. EVALUASI TRUK (YOLO vehicle_model)
+    p_mpv_total = p_mpv + (p_minibus * 0.9)
+
+    # 1. EVALUASI BUS & MINIBUS (Isuzu Elf, HiAce, Jetbus, Medium Bus)
+    # Isuzu Elf menggunakan sasis Isuzu NKR sehingga YOLO COCO sering mendeteksinya sebagai 'truck'
+    # Jika model bodi mendeteksi 'Minibus' dominan (>= 0.45) atau deteksi awal adalah bus:
+    if p_minibus >= 0.45 or initial_vtype == "bus":
+        is_large_bus = (area_ratio >= 0.35) or (w_ratio >= 0.60) or (h_ratio >= 0.65)
+        if p_minibus >= 0.45:
+            # Bedakan Medium/Big Bus vs Minibus (Isuzu Elf / HiAce)
+            if aspect >= 0.95 or h_ratio >= 0.65 or 'bus' in initial_vtype:
+                if p_minibus >= 0.80 and (w_ratio >= 0.65 or h_ratio >= 0.65):
+                    if aspect >= 0.95:
+                        return 'bus', 'Bus', round(p_minibus, 3)
+                    else:
+                        return 'bus', 'Minibus', round(p_minibus, 3)
+            return 'bus', 'Minibus', round(p_minibus, 3)
+        elif is_large_bus and not (p_fastback >= 0.30 or p_sports >= 0.30 or p_hatch >= 0.30 or p_sedan >= 0.30):
+            return 'bus', 'Bus', round(v_conf, 3)
+        # Jika bukan bus/minibus nyata -> reclassify ke mobil penumpang di bawah
+
+    # 2. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
     if initial_vtype == "truck":
         if p_pickup >= 0.35:
             return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        # Jika dimensi mobil penumpang biasa dan bukan truk besar:
-        p_passenger = p_mpv + p_minibus + p_suv + p_crossover + p_hatch + p_sedan
+        # Jika bukan pickup dan bukan minibus, cek apakah mobil penumpang yang salah deteksi
+        p_passenger = p_mpv + p_suv + p_crossover + p_hatch + p_sedan
         if area_ratio < 0.28 and w_ratio < 0.55 and p_passenger >= 0.60:
             pass  # Reclassify as passenger car (lanjut ke evaluasi bodi mobil di bawah)
         else:
             return 'truck', 'Truk', round(v_conf, 3)
 
-    # 2. EVALUASI BUS (YOLO vehicle_model)
-    if initial_vtype == "bus":
-        # Bus komersial sungguhan (Jetbus, bus pariwisata, TransJakarta):
-        # Memiliki dimensi fisik sangat besar di kamera parkir (area > 32%, lebar > 58%, atau tinggi > 65%)
-        # DAN tidak memiliki karakteristik mobil penumpang (MPV/SUV/Hatchback/Fastback)
-        is_massive = (area_ratio >= 0.32) or (w_ratio >= 0.58) or (h_ratio >= 0.65)
-        if is_massive and p_minibus >= 0.55 and not (p_fastback >= 0.30 or p_sports >= 0.30):
-            return 'bus', 'Bus', round(v_conf, 3)
-        # Jika bukan bus besar komersial -> mobil penumpang (Innova, Sigra, Calya, Avanza) yang misklasifikasi oleh COCO!
-        # Reclassify as passenger car (lanjut ke penentuan tipe bodi MPV/SUV/Hatchback di bawah)
-
     # 3. KENDARAAN MOBIL PENUMPANG (CAR)
-    # Evaluasi bodi mobil seimbang untuk ekosistem kendaraan di Indonesia (Sedan, Hatchback, SUV, MPV, Crossover, Pickup)
-    # A. Prediksi langsung dengan keyakinan tinggi dari AI model (tanpa distorsi)
+    # A. Prediksi langsung dengan keyakinan tinggi
     if p_pickup >= 0.35 and p_pickup >= max(p_suv, p_sedan, p_hatch):
         return 'car', 'Pickup Truck', round(p_pickup, 3)
 
-    if p_suv >= 0.35 and p_suv >= max(p_sedan, p_hatch, p_mpv + p_minibus):
+    if p_suv >= 0.40 and p_suv >= max(p_sedan, p_hatch, p_mpv_total):
         return 'car', 'SUV', round(p_suv, 3)
 
-    if p_sedan >= 0.35 and p_sedan >= max(p_suv, p_hatch, p_mpv + p_minibus):
+    if p_sedan >= 0.35 and p_sedan >= max(p_suv, p_hatch, p_mpv_total):
         return 'car', 'Sedan', round(p_sedan, 3)
 
-    if p_hatch >= 0.35 and p_hatch >= max(p_suv, p_sedan, p_mpv + p_minibus):
+    if p_hatch >= 0.40 and p_hatch >= max(p_suv, p_sedan, p_mpv_total):
         return 'car', 'Hatchback', round(p_hatch, 3)
 
-    if p_crossover >= 0.35 and p_crossover >= max(p_sedan, p_mpv + p_minibus):
+    if p_crossover >= 0.35 and p_crossover >= max(p_sedan, p_mpv_total):
         return 'car', 'Crossover', round(p_crossover, 3)
 
-    # Strong MPV prediction
-    p_mpv_total = p_mpv + (p_minibus * 0.9)
     if p_mpv_total >= 0.40 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
         return 'car', 'MPV', round(min(0.99, p_mpv_total), 3)
 
@@ -945,7 +949,14 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         score_sedan = 0.55 + p_sedan + (p_sports * 0.4) + (p_fastback * 0.4)
         return 'car', 'Sedan', round(min(0.95, score_sedan), 3)
 
-    # C. Resolusi ambiguitas umum untuk kelas non-standar (Fastback, Sports Convertible, Wagon)
+    # C. Resolusi Microcar / City Car / Hatchback (seperti Wuling Air EV)
+    # Wuling Air EV memiliki bodi kotak kecil 2-pintu tanpa kap mesin, sehingga model memprediksi Sports/Fastback
+    # tetapi p_mpv_total sangat kecil (< 0.12) dan tidak ada bagasi sedan
+    if p_mpv_total < 0.12 and (p_sports + p_fastback) >= 0.40 and p_sedan < 0.10 and p_suv < 0.20:
+        score_hatch = 0.60 + p_hatch + (p_sports * 0.3) + (p_fastback * 0.2)
+        return 'car', 'Hatchback', round(min(0.95, score_hatch), 3)
+
+    # D. Resolusi Ambiguitas Umum Multi-Kelas
     score_crossover = p_crossover + (p_suv * 0.3)
     p_roof_artifact = p_sports + p_conv
 
@@ -954,13 +965,15 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         score_sedan = p_sedan
         score_hatch = p_hatch + (p_wagon * 0.3)
         score_suv = p_suv + (p_crossover * 0.5)
-        score_mpv = p_mpv_total + (p_wagon * 0.5)
-        if p_suv > p_mpv_total:
-            score_suv += ((p_fastback + p_roof_artifact) * 0.6)
-            score_mpv += ((p_fastback + p_roof_artifact) * 0.3)
+        # Hanya tambahkan bonus ke MPV jika ada sinyal MPV dasar yang nyata
+        if p_mpv_total >= 0.12:
+            score_mpv = p_mpv_total + (p_wagon * 0.5) + ((p_fastback + p_roof_artifact) * 0.5)
         else:
-            score_mpv += ((p_fastback + p_roof_artifact) * 0.6)
-            score_suv += ((p_fastback + p_roof_artifact) * 0.3)
+            score_mpv = p_mpv_total
+            score_hatch += ((p_fastback + p_roof_artifact) * 0.5)
+
+        if p_suv > p_mpv_total and p_suv >= 0.20:
+            score_suv += ((p_fastback + p_roof_artifact) * 0.4)
     else:
         # Kendaraan bodi rendah / ceper (Sedan, Hatchback):
         score_sedan = p_sedan + (p_fastback * 0.7) + (p_wagon * 0.3) + (p_roof_artifact * 0.5)
