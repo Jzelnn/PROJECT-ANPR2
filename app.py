@@ -913,84 +913,66 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         return 'bus', 'Bus', round(v_conf, 3)
 
     # 3. KENDARAAN MOBIL PENUMPANG (CAR)
+    # Sistem klasifikasi 4 kelas standar: SUV, Sedan, Hatchback, MPV
+
     # A. Aturan mobil bodi rendah / ceper (Sedan / Coupe / Sports):
     # Secara fisik, mobil dengan aspect ratio rendah (<= 0.68) dari sudut depan / 3/4 depan
-    # memiliki roofline rendah dan ground clearance ceper -> TIDAK MUNGKIN SUV / Minibus!
+    # memiliki roofline rendah dan ground clearance ceper -> TIDAK MUNGKIN SUV / MPV!
     # (Contoh: Toyota Camry, Honda Civic, Vios, Corolla Altis)
     if aspect <= 0.68:
-        if p_pickup >= 0.40:
-            return 'car', 'Pickup Truck', round(p_pickup, 3)
         if p_hatch >= 0.55 and w_ratio < 0.35:
             return 'car', 'Hatchback', round(p_hatch, 3)
         score_sedan = max(0.85, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
-    # B. Resolusi Ambiguitas Sedan Tampak Depan:
-    # Grille horizontal lebar (seperti Camry / Altis) sering membuat model mengira Minibus
-    if p_minibus >= 0.45 and initial_vtype == "car":
-        if aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
-            return 'car', 'Sedan', round(max(0.88, p_minibus), 3)
-
-    # C. Resolusi Microcar / City Car / Hatchback (seperti Wuling Air EV):
+    # B. Resolusi Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
     if p_mpv_total < 0.20 and (p_hatch >= 0.20) and abs(p_suv - p_hatch) <= 0.08:
         score_hatch = max(0.85, p_hatch + p_suv * 0.5 + p_sports * 0.3)
         return 'car', 'Hatchback', round(min(0.95, score_hatch), 3)
 
-    # D. Prediksi langsung dengan keyakinan tinggi
-    if p_pickup >= 0.35 and p_pickup >= max(p_suv, p_sedan, p_hatch):
-        return 'car', 'Pickup Truck', round(p_pickup, 3)
+    # C. Ladder-frame SUV / Tall SUV (Toyota Fortuner, Mitsubishi Pajero Sport, Triton Double Cab, Daihatsu Rocky, dsb):
+    # Model bodi sering memprediksi Pickup Truck (karena platform moncong mirip Hilux/Triton) atau SUV
+    # Ketika bodi tinggi (aspect >= 0.70) dan terdapat sinyal pickup / suv / crossover:
+    if aspect >= 0.70 and (p_pickup + p_suv + p_crossover) >= 0.25:
+        if p_hatch < 0.40 and p_mpv < 0.35:
+            score_suv = max(0.85, p_suv + p_crossover + p_pickup)
+            return 'car', 'SUV', round(min(0.99, score_suv), 3)
 
-    if p_suv >= 0.40 and p_suv >= max(p_sedan, p_hatch, p_mpv_total):
-        return 'car', 'SUV', round(p_suv, 3)
+    # D. Resolusi Ambiguitas Sedan Tampak Depan:
+    # Grille horizontal lebar (seperti Camry / Altis) sering membuat model mengira Minibus
+    if p_minibus >= 0.45 and aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
+        if (p_pickup + p_suv) < 0.20 and p_mpv < 0.20:
+            return 'car', 'Sedan', round(max(0.88, p_minibus), 3)
 
-    if p_sedan >= 0.35 and p_sedan >= max(p_suv, p_hatch, p_mpv_total):
-        return 'car', 'Sedan', round(p_sedan, 3)
+    # E. Sistem Skor Terkalibrasi (HANYA 4 KELAS MOBIL: SUV, MPV, Sedan, Hatchback)
+    p_roof = p_sports + p_conv
 
-    if p_hatch >= 0.40 and p_hatch >= max(p_suv, p_sedan, p_mpv_total):
-        return 'car', 'Hatchback', round(p_hatch, 3)
+    # SUV: mencakup SUV murni, Crossover, dan Pickup Truck pada kategori mobil penumpang
+    score_suv = p_suv + p_crossover + p_pickup
+    if aspect >= 0.75 and (p_suv + p_crossover + p_pickup) >= 0.15:
+        score_suv += (p_roof * 0.35)
 
-    if p_crossover >= 0.35 and p_crossover >= max(p_sedan, p_mpv_total):
-        return 'car', 'Crossover', round(p_crossover, 3)
+    # MPV: mencakup MPV, Wagon, dan Minibus pada mobil penumpang
+    score_mpv = p_mpv + (p_wagon * 0.6) + (p_minibus * 0.7)
+    if aspect >= 0.75 and p_mpv >= 0.10:
+        score_mpv += (p_roof * 0.25)
 
-    if p_mpv_total >= 0.40 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
-        return 'car', 'MPV', round(min(0.99, p_mpv_total), 3)
-
-    # E. Resolusi Ambiguitas Sedan Tampak Depan (SUV vs Hatchback tied):
-    is_suv_hatch_tied = (min(p_suv, p_hatch) >= 0.18) and (max(p_suv, p_hatch) <= 0.38) and (abs(p_suv - p_hatch) <= 0.10)
-    has_sporty_or_low_signal = (p_sports + p_fastback + p_conv) >= 0.15
-    if is_suv_hatch_tied and has_sporty_or_low_signal and p_mpv_total < 0.25:
-        score_sedan = 0.55 + p_sedan + (p_sports * 0.4) + (p_fastback * 0.4)
-        return 'car', 'Sedan', round(min(0.95, score_sedan), 3)
-
-    # F. Resolusi Ambiguitas Umum Multi-Kelas
-    score_crossover = p_crossover + (p_suv * 0.3)
-    p_roof_artifact = p_sports + p_conv
-
-    if aspect >= 0.75:
-        score_sedan = p_sedan
-        score_hatch = p_hatch + (p_wagon * 0.3)
-        score_suv = p_suv + (p_crossover * 0.5)
-        if p_mpv_total >= 0.12:
-            score_mpv = p_mpv_total + (p_wagon * 0.5) + ((p_fastback + p_roof_artifact) * 0.5)
-        else:
-            score_mpv = p_mpv_total
-            score_hatch += ((p_fastback + p_roof_artifact) * 0.5)
-
-        if p_suv > p_mpv_total and p_suv >= 0.20:
-            score_suv += ((p_fastback + p_roof_artifact) * 0.4)
+    # Sedan: fastback dan bodi rendah mencerminkan sedan
+    if aspect <= 0.82:
+        score_sedan = p_sedan + (p_fastback * 0.85) + (p_sports * 0.4) + (p_conv * 0.4)
     else:
-        score_sedan = p_sedan + (p_fastback * 0.7) + (p_wagon * 0.3) + (p_roof_artifact * 0.5)
-        score_hatch = p_hatch + (p_fastback * 0.3) + (p_wagon * 0.5) + (p_roof_artifact * 0.3)
-        score_suv = p_suv + (p_crossover * 0.5)
-        score_mpv = p_mpv_total
+        score_sedan = p_sedan + (p_fastback * 0.5)
+
+    # Hatchback:
+    score_hatch = p_hatch + (p_wagon * 0.3)
+    if aspect <= 0.82:
+        score_hatch += (p_fastback * 0.2) + (p_sports * 0.3)
 
     scores = {
         'SUV': score_suv,
         'MPV': score_mpv,
         'Sedan': score_sedan,
-        'Hatchback': score_hatch,
-        'Crossover': score_crossover,
-        'Pickup Truck': p_pickup
+        'Hatchback': score_hatch
     }
 
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
