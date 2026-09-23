@@ -981,6 +981,58 @@ def get_gate_plate_priority(p, img_w, img_h):
     return area * (conf ** 0.5) * y_weight * lane_weight
 
 
+def get_front_of_camera_score(cand, plates, img_w, img_h):
+    """
+    Menghitung skor prioritas kendaraan 'di depan kamera'.
+    Memprioritaskan kendaraan foreground (bawah/tengah), berukuran signifikan,
+    dan menaungi plat nomor yang aktif di depan kamera.
+    Menyingkirkan objek background kecil (<2.5% area) atau kendaraan di tepi ekstrim gambar.
+    """
+    x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    area = bw * bh
+    area_ratio = area / float(max(1, img_w * img_h))
+
+    # 1. Filter out background noise
+    # Objek sangat kecil (< 2.5% luas frame) atau hanya berada di latar belakang jauh (y2 < 30% tinggi frame)
+    if area_ratio < 0.025:
+        return -1.0
+    if y2 < (img_h * 0.30):
+        return -1.0
+
+    cx = (x1 + x2) / 2.0
+    norm_cx = cx / float(max(1, img_w))
+    norm_y2 = y2 / float(max(1, img_h))
+
+    # Objek di tepi ekstrim kiri (< 10%) atau kanan (> 90%)
+    if norm_cx < 0.10 or norm_cx > 0.90:
+        return -1.0
+
+    # Skor kedekatan vertikal (foreground): kendaraan di depan kamera berada di bagian bawah frame
+    y_score = (norm_y2 ** 1.8) * 2.0
+
+    # Skor posisi tengah horizontal (kamera mengarah ke lajur tengah)
+    center_dist = abs(norm_cx - 0.5)
+    x_score = max(0.0, 1.0 - (center_dist * 1.6))
+
+    # Skor ukuran (semakin dekat semakin besar)
+    size_score = min(2.0, area_ratio * 6.0)
+
+    # Cek apakah menaungi plat nomor
+    has_plate = any(
+        (x1 - 25 <= (p["box"][0] + p["box"][2]) / 2.0 <= x2 + 25) and
+        (y1 - 25 <= (p["box"][1] + p["box"][3]) / 2.0 <= y2 + 25)
+        for p in plates
+    )
+    plate_bonus = 2.5 if has_plate else 0.0
+
+    # Confidence kendaraan
+    conf_score = cand.get("v_conf", 0.5) * 0.5
+
+    return y_score + x_score + size_score + plate_bonus + conf_score
+
+
 # ============================================================
 # FAST TEMPORAL CONFIRMATION & VEHICLE TRACKING (OPTIMIZED)
 # 2-3 frame buffer (150-250ms) with early confirmation & deferred OCR.
@@ -1399,21 +1451,23 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_body_total = 0.0
     t_ocr_total = 0.0
 
-    # Jika kendaraan terdeteksi
+    # 2b. FILTER & FOKUS KENDARAAN DI DEPAN KAMERA (Front-of-Camera Priority)
+    # Singkirkan objek background kecil (<2.5% area) atau kendaraan di tepi ekstrim gambar,
+    # dan fokuskan deteksi HANYA pada kendaraan utama yang berada di depan kamera.
     if candidates:
-        if single_vehicle_mode and len(candidates) > 1:
-            if global_plates:
-                best_global_p = max(global_plates, key=lambda p: get_gate_plate_priority(p, iw, ih))
-                g_cx = (best_global_p["box"][0] + best_global_p["box"][2]) / 2.0
-                g_cy = (best_global_p["box"][1] + best_global_p["box"][3]) / 2.0
-                cand_for_best_p = [c for c in candidates if (c["x1"] - 30 <= g_cx <= c["x2"] + 30 and c["y1"] - 30 <= g_cy <= c["y2"] + 30)]
-                if cand_for_best_p:
-                    candidates = [max(cand_for_best_p, key=lambda c: c["area"])]
-                else:
-                    candidates_with_plate = [c for c in candidates if any(c["x1"] <= (p["box"][0] + p["box"][2]) / 2 <= c["x2"] and c["y1"] <= (p["box"][1] + p["box"][3]) / 2 <= c["y2"] for p in global_plates)]
-                    candidates = [max(candidates_with_plate, key=lambda c: c["area"])] if candidates_with_plate else [max(candidates, key=lambda c: c["area"])]
-            else:
-                candidates = [max(candidates, key=lambda c: c["area"])]
+        scored_candidates = []
+        for c in candidates:
+            s = get_front_of_camera_score(c, global_plates, iw, ih)
+            if s > 0:
+                c["front_score"] = s
+                scored_candidates.append(c)
+
+        scored_candidates.sort(key=lambda c: -c["front_score"])
+
+        if single_vehicle_mode:
+            candidates = [scored_candidates[0]] if scored_candidates else []
+        else:
+            candidates = scored_candidates
 
         for cand in candidates:
             initial_vtype = cand["vehicle_type"]
