@@ -911,70 +911,63 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         # Reclassify as passenger car (lanjut ke penentuan tipe bodi MPV/SUV/Hatchback di bawah)
 
     # 3. KENDARAAN MOBIL PENUMPANG (CAR)
-    if aspect >= 0.70:
-        score_conv = p_conv * 0.1
-        score_sports = p_sports * 0.1
-    else:
-        score_conv = p_conv
-        score_sports = p_sports
+    # Evaluasi bodi mobil seimbang untuk ekosistem kendaraan di Indonesia (Sedan, Hatchback, SUV, MPV, Crossover, Pickup)
+    # A. Prediksi langsung dengan keyakinan tinggi dari AI model (tanpa distorsi)
+    if p_pickup >= 0.35 and p_pickup >= max(p_suv, p_sedan, p_hatch):
+        return 'car', 'Pickup Truck', round(p_pickup, 3)
 
-    score_fastback = p_fastback * 0.4
-    score_pickup = p_pickup
-    score_wagon = p_wagon
-    # Gabungkan sinyal Minibus langsung ke MPV (mobil 7-seater keluarga di Indonesia adalah MPV)
-    score_mpv = (p_mpv + p_minibus) * 1.50 + p_wagon * 0.7
-    score_suv = p_suv * 1.2
-    score_crossover = p_crossover * 1.2
-    score_hatch = p_hatch * 1.2
-    score_sedan = p_sedan * 1.2
+    if p_suv >= 0.35 and p_suv >= max(p_sedan, p_hatch, p_mpv + p_minibus):
+        return 'car', 'SUV', round(p_suv, 3)
 
-    # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari sudut atas
-    if p_sports >= 0.20 or p_fastback >= 0.20:
-        if aspect >= 0.75:
-            score_mpv += (p_sports * 0.55) + (p_fastback * 0.45) + 0.15
-            score_suv += (p_sports * 0.40) + (p_fastback * 0.35)
-        elif aspect >= 0.65:
-            score_crossover += (p_fastback * 0.85) + (p_sports * 0.75)
+    if p_sedan >= 0.35 and p_sedan >= max(p_suv, p_hatch, p_mpv + p_minibus):
+        return 'car', 'Sedan', round(p_sedan, 3)
+
+    if p_hatch >= 0.35 and p_hatch >= max(p_suv, p_sedan, p_mpv + p_minibus):
+        return 'car', 'Hatchback', round(p_hatch, 3)
+
+    if p_crossover >= 0.35 and p_crossover >= max(p_sedan, p_mpv + p_minibus):
+        return 'car', 'Crossover', round(p_crossover, 3)
+
+    p_mpv_total = p_mpv + (p_minibus * 0.9)
+    if p_mpv_total >= 0.35 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
+        return 'car', 'MPV', round(min(0.99, p_mpv_total), 3)
+
+    # B. Resolusi ambiguitas untuk kelas non-standar (Fastback, Sports Convertible, Wagon)
+    score_crossover = p_crossover + (p_suv * 0.3)
+    p_roof_artifact = p_sports + p_conv
+
+    if aspect >= 0.75:
+        # Kendaraan bodi tinggi (Innova, Avanza, SUV, MPV dari sudut atas):
+        score_sedan = p_sedan
+        score_hatch = p_hatch + (p_wagon * 0.3)
+        score_suv = p_suv + (p_crossover * 0.5)
+        score_mpv = p_mpv_total + (p_wagon * 0.5)
+        if p_suv > p_mpv_total:
+            score_suv += ((p_fastback + p_roof_artifact) * 0.6)
+            score_mpv += ((p_fastback + p_roof_artifact) * 0.3)
         else:
-            score_sedan += (p_fastback * 0.85) + (p_sports * 0.75)
-
-    if p_hatch >= 0.30 and p_suv >= 0.30:
-        score_hatch += 0.20
-
-    if aspect >= 0.80:
-        score_mpv += 0.15
-        score_suv += 0.05
-    elif aspect <= 0.60:
-        score_sedan += 0.10
-        score_hatch += 0.08
+            score_mpv += ((p_fastback + p_roof_artifact) * 0.6)
+            score_suv += ((p_fastback + p_roof_artifact) * 0.3)
+    else:
+        # Kendaraan bodi rendah / ceper (Sedan, Hatchback):
+        score_sedan = p_sedan + (p_fastback * 0.7) + (p_wagon * 0.3) + (p_roof_artifact * 0.5)
+        score_hatch = p_hatch + (p_fastback * 0.3) + (p_wagon * 0.5) + (p_roof_artifact * 0.3)
+        score_suv = p_suv + (p_crossover * 0.5)
+        score_mpv = p_mpv_total
 
     scores = {
-        'MPV': score_mpv,
         'SUV': score_suv,
-        'Crossover': score_crossover,
-        'Hatchback': score_hatch,
+        'MPV': score_mpv,
         'Sedan': score_sedan,
-        'Fastback': score_fastback,
-        'Wagon': score_wagon,
-        'Pickup Truck': score_pickup,
-        'Convertible': score_conv,
-        'Sports_HardtopConvertible': score_sports
+        'Hatchback': score_hatch,
+        'Crossover': score_crossover,
+        'Pickup Truck': p_pickup
     }
 
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
     best_val = scores[best_cat]
-
-    if best_cat in ('Minibus', 'Fastback', 'Sports_HardtopConvertible', 'Convertible', 'Wagon'):
-        # Map exotic / non-Indonesian categories to closest realistic Indonesian car category
-        if aspect >= 0.75:
-            best_cat = 'MPV'
-        elif aspect >= 0.65:
-            best_cat = 'SUV' if p_suv >= p_hatch else 'Hatchback'
-        else:
-            best_cat = 'Sedan'
-
     tot_score = max(0.01, sum(scores.values()))
-    norm_conf = min(0.99, max(0.60, best_val / tot_score))
+    norm_conf = min(0.99, max(0.55, best_val / tot_score))
 
     return 'car', best_cat, round(norm_conf, 3)
 
