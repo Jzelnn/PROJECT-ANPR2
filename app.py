@@ -837,10 +837,12 @@ def ensemble_plate_reading(plate_crop):
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     """
-    Sistem klasifikasi bodi kendaraan:
-    - Mendukung penuh: MPV, SUV, Crossover, Hatchback, Sedan, Fastback, Wagon, Pickup Truck, Convertible, Motor.
-    - Menghilangkan false Minibus/Bus pada mobil penumpang (Avanza, Xpander, Innova, Veloz, BYD, dll)
-      sesuai preferensi pengguna dan terminologi pasar otomotif Indonesia (MPV/SUV).
+    Sistem klasifikasi kendaraan dan bodi:
+    - Membedakan jenis kendaraan utama: car, motorcycle, truck, bus.
+    - Untuk 'truck': menghasilkan vehicle_type='truck', body_style='Truk' (atau 'Pickup Truck').
+    - Untuk 'bus': menghasilkan vehicle_type='bus', body_style='Bus'.
+    - Untuk 'motorcycle': menghasilkan vehicle_type='motorcycle', body_style='Motor'.
+    - Untuk 'car': mengklasifikasikan ke kategori: MPV, SUV, Crossover, Hatchback, Sedan, Convertible, Pickup Truck.
     """
     if initial_vtype == "motorcycle":
         return "motorcycle", "Motor", round(v_conf, 3)
@@ -852,9 +854,24 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
 
     crop = image[y1:y2, x1:x2]
     if crop.size == 0:
-        fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else "Motor")
+        fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else ("Bus" if initial_vtype == "bus" else "Motor"))
         return initial_vtype, fallback_name, round(v_conf, 3)
 
+    # 1. KENDARAAN DETEKSI TRUK (YOLO vehicle_model)
+    if initial_vtype == "truck":
+        # Cek apakah pickup truck kecil (seperti Hilux, Triton, Carry)
+        bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
+        probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
+        p_pickup = probs.get('Pickup Truck', 0.0)
+        if p_pickup >= 0.35:
+            return 'truck', 'Pickup Truck', round(p_pickup, 3)
+        return 'truck', 'Truk', round(v_conf, 3)
+
+    # 2. KENDARAAN DETEKSI BUS (YOLO vehicle_model)
+    if initial_vtype == "bus":
+        return 'bus', 'Bus', round(v_conf, 3)
+
+    # 3. KENDARAAN MOBIL PENUMPANG (CAR)
     bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
     probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
 
@@ -869,24 +886,6 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sedan = probs.get('Sedan', 0.0)
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
-
-    # Harmonisasi: Mobil penumpang di CCTV parkir yang terdeteksi sebagai bus atau truck oleh YOLO
-    passenger_signal = p_hatch + p_sedan + p_crossover + p_suv + p_mpv + p_minibus + p_wagon + p_fastback
-    if initial_vtype == "truck" and passenger_signal > 0.50 and p_pickup < 0.25:
-        initial_vtype = "car"
-    elif initial_vtype == "bus":
-        # Di CCTV parkir, deteksi 'bus' pada mobil boxy/MPV berkap mesin (Xpander, Avanza, Alphard, BYD)
-        # dikonversi ke car/MPV (kecuali bus berukuran raksasa > 65% lebar frame)
-        if passenger_signal > 0.20 or p_minibus > 0.10 or p_mpv > 0.10 or car_w < (image.shape[1] * 0.65):
-            initial_vtype = "car"
-
-    if initial_vtype == "truck":
-        if p_pickup >= 0.30:
-            return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        return 'truck', 'Truk', round(v_conf, 3)
-
-    if initial_vtype == "bus":
-        return 'bus', 'Bus', round(v_conf, 3)
 
     # MOBIL PENUMPANG (CAR)
     if aspect >= 0.70:
@@ -909,7 +908,6 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     # Aturan CCTV Tampak Depan: Sinyal Fastback & Sports Convertible dari sudut atas
     if p_sports >= 0.20 or p_fastback >= 0.20:
         if aspect >= 0.75:
-            # Mobil keluarga/MPV/SUV berbadan tinggi tampak depan
             score_mpv += (p_sports * 0.55) + (p_fastback * 0.45) + 0.15
             score_suv += (p_sports * 0.40) + (p_fastback * 0.35)
         elif aspect >= 0.65:
@@ -1535,6 +1533,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
             plate_text = None
+            ocr_method = None
             # 4. PLATE READING:
             # - Single photo: Jalankan ensemble OCR lengkap
             # - Live stream: Jalankan deskew + unsharp + char_model cepat (~30ms) untuk live reading di dashboard,
@@ -1553,6 +1552,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     if char_text:
                         plate_text = refine_indonesian_plate(char_text)
                         ocr_method = "char_model_fast"
+                    else:
+                        ocr_method = "none"
                 t_ocr_total += (time.time() - t_o0)
 
             results_out.append({
