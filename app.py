@@ -932,9 +932,15 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
     # B. Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
-    # Ciri: 2-pintu kompak, tanpa bagasi sedan (p_sedan < 0.08, p_pickup < 0.15, p_mpv_total < 0.18, p_sports >= 0.15)
-    is_micro_hatch = (p_sports >= 0.15 and p_mpv_total < 0.18 and p_sedan < 0.08 and p_pickup < 0.15 and
-                      ((p_sports + p_fastback) >= 0.40 or p_hatch >= 0.20))
+    # Ciri: Bodi kompak kotak/tinggi (aspect >= 0.92), tanpa bagasi sedan (p_sedan < 0.08), bukan MPV (p_mpv_total < 0.18),
+    # dan model memprediksi kombinasi sports 2-pintu / fastback / hatch
+    is_micro_hatch = (
+        p_mpv_total < 0.18 and p_sedan < 0.08 and p_minibus < 0.15 and
+        (
+            (aspect >= 0.92 and (p_sports + p_fastback + p_hatch) >= 0.40) or
+            (p_sports >= 0.10 and ((p_sports + p_fastback) >= 0.35 or p_hatch >= 0.20))
+        )
+    )
     if is_micro_hatch:
         score_hatch = max(0.88, p_hatch + p_sports * 0.5 + p_fastback * 0.3)
         return 'car', 'Hatchback', round(min(0.99, score_hatch), 3)
@@ -946,8 +952,8 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         return 'car', 'SUV', round(min(0.99, score_suv), 3)
 
     # D. Sedan / Fastback (seperti Wuling Starlight, Honda Civic Fastback, Hyundai Ioniq):
-    # Fastback adalah karakteristik sedan, BUKAN hatchback!
-    if p_fastback >= 0.40 and p_fastback > p_minibus and p_mpv < 0.15:
+    # Fastback adalah karakteristik sedan berpostur rendah (aspect < 0.92), BUKAN hatchback!
+    if aspect < 0.92 and p_fastback >= 0.40 and p_fastback > p_minibus and p_mpv < 0.15:
         score_sedan = max(0.85, p_sedan + p_fastback)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
