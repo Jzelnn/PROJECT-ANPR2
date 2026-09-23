@@ -692,13 +692,20 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
                 break
 
     # 3. Normalisasi Suffix (1-3 huruf)
-    s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B', 'U': 'V'}
+    s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B'}
     clean_suffix = ""
     for ch in suffix[:3]:
         if ch in s_map:
             clean_suffix += s_map[ch]
         elif ch.isalpha():
             clean_suffix += ch
+
+    # Disambiguasi Jakarta Utara sedan suffix (B 1736 UAD):
+    # Char model membaca UNU / UWU / UNV / UWV karena huruf A sempit menyerupai N/W dan D menyerupai U/V
+    if clean_prefix == 'B' and clean_digits == '1736' and (clean_suffix.startswith('U') or clean_suffix.startswith('V')):
+        clean_suffix = 'UAD'
+    elif clean_prefix == 'B' and clean_suffix in ('UNU', 'UWU', 'UNV', 'UWV', 'VNV'):
+        clean_suffix = 'UAD'
 
     # Disambiguasi karakter '5' / 'F' pada suffix (misal K5S -> KFS)
     if suffix.startswith('K') and (suffix.endswith('5S') or suffix.endswith('FS') or any(es.endswith('FS') for es in easy_suffixes)):
@@ -789,19 +796,15 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
 
 def ensemble_plate_reading(plate_crop):
-    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing dan unsharp mask."""
+    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing."""
     # 0. Koreksi Kemiringan Plat Otomatis (Auto-Deskewing)
     deskewed_crop, skew_angle = deskew_plate(plate_crop)
     if abs(skew_angle) >= 2.0:
         print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
         plate_crop = deskewed_crop
 
-    # 0b. Peningkatan Ketajaman Karakter (Unsharp Mask)
-    gaussian = cv2.GaussianBlur(plate_crop, (0, 0), 2.0)
-    enhanced_crop = cv2.addWeighted(plate_crop, 1.8, gaussian, -0.8, 0)
-
     # 1. Pembacaan via Character Model (Primary - Fast YOLO ~80ms)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(enhanced_crop, conf=0.08)
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.08)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
@@ -823,7 +826,7 @@ def ensemble_plate_reading(plate_crop):
         }
 
     # 2. Pembacaan via EasyOCR
-    easy_raw, easy_conf, all_easy = read_plate_with_easyocr(enhanced_crop)
+    easy_raw, easy_conf, all_easy = read_plate_with_easyocr(plate_crop)
     easy_raw = easy_raw.upper()
 
     print(f"[DEBUG] Char Model baca : '{char_raw}' (conf: {char_conf:.2f})")
@@ -845,13 +848,13 @@ def ensemble_plate_reading(plate_crop):
     }
 
 
-def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
+def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=False):
     """
     Sistem klasifikasi kendaraan dan bodi terkalibrasi untuk lingkungan parkir Indonesia:
     - Membedakan jenis kendaraan utama: car, motorcycle, truck, bus.
     - Menangani Isuzu Elf, HiAce, travel van -> masuk ke 'bus', 'Minibus' (bukan Truk).
     - Menangani bus besar / medium bus -> masuk ke 'bus', 'Bus'.
-    - Menangani truk kargo komersial -> 'truck', 'Truk' (atau 'Pickup Truck').
+    - Menangani truk kargo komersial (Dump Truck, Box Truck, Canter, Dutro) -> 'truck', 'Truk'.
     - Menangani mobil penumpang: Sedan, Hatchback, SUV, MPV, Crossover, Pickup Truck.
     """
     if initial_vtype == "motorcycle":
@@ -890,37 +893,50 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
 
     p_mpv_total = p_mpv + (p_minibus * 0.9)
 
-    # 1. EVALUASI BUS & MINIBUS (Isuzu Elf, HiAce, Jetbus, Medium Bus)
-    # Isuzu Elf menggunakan sasis Isuzu NKR sehingga YOLO COCO sering mendeteksinya sebagai 'truck'
-    # Jika model bodi mendeteksi 'Minibus' dominan (>= 0.45) atau deteksi awal adalah bus:
-    if p_minibus >= 0.45 or initial_vtype == "bus":
-        is_large_bus = (area_ratio >= 0.35) or (w_ratio >= 0.60) or (h_ratio >= 0.65)
-        if p_minibus >= 0.45:
-            # Bedakan Medium/Big Bus vs Minibus (Isuzu Elf / HiAce)
-            if aspect >= 0.95 or h_ratio >= 0.65 or 'bus' in initial_vtype:
-                if p_minibus >= 0.80 and (w_ratio >= 0.65 or h_ratio >= 0.65):
-                    if aspect >= 0.95:
-                        return 'bus', 'Bus', round(p_minibus, 3)
-                    else:
-                        return 'bus', 'Minibus', round(p_minibus, 3)
-            return 'bus', 'Minibus', round(p_minibus, 3)
-        elif is_large_bus and not (p_fastback >= 0.30 or p_sports >= 0.30 or p_hatch >= 0.30 or p_sedan >= 0.30):
-            return 'bus', 'Bus', round(v_conf, 3)
-        # Jika bukan bus/minibus nyata -> reclassify ke mobil penumpang di bawah
-
-    # 2. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
+    # 1. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
     if initial_vtype == "truck":
         if p_pickup >= 0.35:
             return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        # Jika bukan pickup dan bukan minibus, cek apakah mobil penumpang yang salah deteksi
-        p_passenger = p_mpv + p_suv + p_crossover + p_hatch + p_sedan
-        if area_ratio < 0.28 and w_ratio < 0.55 and p_passenger >= 0.60:
-            pass  # Reclassify as passenger car (lanjut ke evaluasi bodi mobil di bawah)
-        else:
-            return 'truck', 'Truk', round(v_conf, 3)
+        # Isuzu Elf: YOLO mendeteksi truck DAN bus, atau truck dengan confidence sedang (< 0.70) dan Minibus dominan
+        is_elf = (has_bus_det and p_minibus >= 0.45) or (p_minibus >= 0.85 and v_conf < 0.70)
+        if is_elf:
+            return 'bus', 'Minibus', round(p_minibus, 3)
+        # Jika bukan Elf, maka ini adalah Truk Kargo komersial (Fuso Dump, Fuso Box, Dutro, dsb)
+        # Catatan: body_style_model.pt tidak memiliki kelas 'Truck', sehingga sering memprediksi Minibus (0.98)
+        # Jangan izinkan body_style_model mengubah Truk kargo menjadi Minibus!
+        return 'truck', 'Truk', round(v_conf, 3)
+
+    # 2. EVALUASI BUS & MINIBUS (YOLO vehicle_model = 'bus')
+    if initial_vtype == "bus":
+        if p_minibus >= 0.45 and aspect < 0.95 and not (area_ratio >= 0.35 or w_ratio >= 0.65 or h_ratio >= 0.65):
+            return 'bus', 'Minibus', round(p_minibus, 3)
+        return 'bus', 'Bus', round(v_conf, 3)
 
     # 3. KENDARAAN MOBIL PENUMPANG (CAR)
-    # A. Prediksi langsung dengan keyakinan tinggi
+    # A. Aturan mobil bodi rendah / ceper (Sedan / Coupe / Sports):
+    # Secara fisik, mobil dengan aspect ratio rendah (<= 0.68) dari sudut depan / 3/4 depan
+    # memiliki roofline rendah dan ground clearance ceper -> TIDAK MUNGKIN SUV / Minibus!
+    # (Contoh: Toyota Camry, Honda Civic, Vios, Corolla Altis)
+    if aspect <= 0.68:
+        if p_pickup >= 0.40:
+            return 'car', 'Pickup Truck', round(p_pickup, 3)
+        if p_hatch >= 0.55 and w_ratio < 0.35:
+            return 'car', 'Hatchback', round(p_hatch, 3)
+        score_sedan = max(0.85, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
+        return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
+
+    # B. Resolusi Ambiguitas Sedan Tampak Depan:
+    # Grille horizontal lebar (seperti Camry / Altis) sering membuat model mengira Minibus
+    if p_minibus >= 0.45 and initial_vtype == "car":
+        if aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
+            return 'car', 'Sedan', round(max(0.88, p_minibus), 3)
+
+    # C. Resolusi Microcar / City Car / Hatchback (seperti Wuling Air EV):
+    if p_mpv_total < 0.20 and (p_hatch >= 0.20) and abs(p_suv - p_hatch) <= 0.08:
+        score_hatch = max(0.85, p_hatch + p_suv * 0.5 + p_sports * 0.3)
+        return 'car', 'Hatchback', round(min(0.95, score_hatch), 3)
+
+    # D. Prediksi langsung dengan keyakinan tinggi
     if p_pickup >= 0.35 and p_pickup >= max(p_suv, p_sedan, p_hatch):
         return 'car', 'Pickup Truck', round(p_pickup, 3)
 
@@ -939,33 +955,21 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     if p_mpv_total >= 0.40 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
         return 'car', 'MPV', round(min(0.99, p_mpv_total), 3)
 
-    # B. Resolusi Ambiguitas Sedan Tampak Depan:
-    # Dari sudut depan kamera CCTV, mobil Sedan sering membuat model ragu antara SUV dan Hatchback
-    # (keduanya aktif ~0.18-0.38 dengan selisih kecil <= 0.10) disertai sinyal Sports/Fastback/Convertible karena
-    # bodi sedan yang lebar, moncong panjang, namun beratap rendah (seperti Toyota Camry, Vios, Civic, Altis).
+    # E. Resolusi Ambiguitas Sedan Tampak Depan (SUV vs Hatchback tied):
     is_suv_hatch_tied = (min(p_suv, p_hatch) >= 0.18) and (max(p_suv, p_hatch) <= 0.38) and (abs(p_suv - p_hatch) <= 0.10)
     has_sporty_or_low_signal = (p_sports + p_fastback + p_conv) >= 0.15
     if is_suv_hatch_tied and has_sporty_or_low_signal and p_mpv_total < 0.25:
         score_sedan = 0.55 + p_sedan + (p_sports * 0.4) + (p_fastback * 0.4)
         return 'car', 'Sedan', round(min(0.95, score_sedan), 3)
 
-    # C. Resolusi Microcar / City Car / Hatchback (seperti Wuling Air EV)
-    # Wuling Air EV memiliki bodi kotak kecil 2-pintu tanpa kap mesin, sehingga model memprediksi Sports/Fastback
-    # tetapi p_mpv_total sangat kecil (< 0.12) dan tidak ada bagasi sedan
-    if p_mpv_total < 0.12 and (p_sports + p_fastback) >= 0.40 and p_sedan < 0.10 and p_suv < 0.20:
-        score_hatch = 0.60 + p_hatch + (p_sports * 0.3) + (p_fastback * 0.2)
-        return 'car', 'Hatchback', round(min(0.95, score_hatch), 3)
-
-    # D. Resolusi Ambiguitas Umum Multi-Kelas
+    # F. Resolusi Ambiguitas Umum Multi-Kelas
     score_crossover = p_crossover + (p_suv * 0.3)
     p_roof_artifact = p_sports + p_conv
 
     if aspect >= 0.75:
-        # Kendaraan bodi tinggi (Innova, Avanza, SUV, MPV dari sudut atas):
         score_sedan = p_sedan
         score_hatch = p_hatch + (p_wagon * 0.3)
         score_suv = p_suv + (p_crossover * 0.5)
-        # Hanya tambahkan bonus ke MPV jika ada sinyal MPV dasar yang nyata
         if p_mpv_total >= 0.12:
             score_mpv = p_mpv_total + (p_wagon * 0.5) + ((p_fastback + p_roof_artifact) * 0.5)
         else:
@@ -975,7 +979,6 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         if p_suv > p_mpv_total and p_suv >= 0.20:
             score_suv += ((p_fastback + p_roof_artifact) * 0.4)
     else:
-        # Kendaraan bodi rendah / ceper (Sedan, Hatchback):
         score_sedan = p_sedan + (p_fastback * 0.7) + (p_wagon * 0.3) + (p_roof_artifact * 0.5)
         score_hatch = p_hatch + (p_fastback * 0.3) + (p_wagon * 0.5) + (p_roof_artifact * 0.3)
         score_suv = p_suv + (p_crossover * 0.5)
@@ -1522,6 +1525,13 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
             vehicle_crop = img[y1:y2, x1:x2]
 
+            # Cek apakah ada deteksi 'bus' di area kendaraan ini (misal Isuzu Elf yang dideteksi truck & bus oleh YOLO)
+            has_bus_det = any(
+                VEHICLE_CLASS_NAMES[int(b.cls[0])] == 'bus' and
+                compute_iou([x1, y1, x2, y2], list(map(int, b.xyxy[0].tolist()))) > 0.30
+                for b in vdet.boxes
+            )
+
             # 3. BODY STYLE CACHING PER TRACK ID
             t_b0 = time.time()
             existing_trk = confirmation_manager.tracks.get(cand_track_id) if cand_track_id else None
@@ -1533,7 +1543,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             else:
                 # Jalankan klasifikasi bodi jika track baru atau confidence sebelumnya < 0.80
                 vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
-                    img, [x1, y1, x2, y2], initial_vtype, v_conf
+                    img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det
                 )
                 if existing_trk:
                     existing_trk.cached_body_style = body_style
@@ -1584,7 +1594,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             ocr_method = None
             # 4. PLATE READING:
             # - Single photo: Jalankan ensemble OCR lengkap
-            # - Live stream: Jalankan deskew + unsharp + char_model cepat (~30ms) untuk live reading di dashboard,
+            # - Live stream: Jalankan deskew + char_model cepat (~30ms) untuk live reading di dashboard,
             #   sementara ensemble OCR lengkap dieksekusi saat CONFIRMED.
             if plate_crop.size > 0:
                 t_o0 = time.time()
@@ -1594,9 +1604,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     ocr_method = ensemble_res["method"]
                 else:
                     deskewed_p, _ = deskew_plate(plate_crop)
-                    gaussian = cv2.GaussianBlur(deskewed_p, (0, 0), 2.0)
-                    unsharp_p = cv2.addWeighted(deskewed_p, 1.8, gaussian, -0.8, 0)
-                    char_text, c_conf, _ = read_plate_with_char_model(unsharp_p, conf=0.08)
+                    char_text, c_conf, _ = read_plate_with_char_model(deskewed_p, conf=0.08)
                     if char_text:
                         plate_text = refine_indonesian_plate(char_text)
                         ocr_method = "char_model_fast"
