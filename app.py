@@ -676,16 +676,18 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     for ch in digits[:4]:
         clean_digits += d_map.get(ch, ch)
 
-    # Cross-check digit dengan kandidat angka dari EasyOCR
-    for ecand in easy_digit_candidates:
-        if len(ecand) == len(clean_digits) and len(clean_digits) >= 3:
-            diffs = sum(1 for a, b in zip(clean_digits, ecand) if a != b)
-            if diffs <= 2:
+    # Cross-check digit dengan kandidat angka dari EasyOCR HANYA jika char model belum memiliki 3-4 digit valid
+    char_has_valid_digits = len(clean_digits) in (3, 4) and all(c.isdigit() for c in clean_digits)
+    if not char_has_valid_digits:
+        for ecand in easy_digit_candidates:
+            if len(ecand) == len(clean_digits) and len(clean_digits) >= 3:
+                diffs = sum(1 for a, b in zip(clean_digits, ecand) if a != b)
+                if diffs <= 2:
+                    clean_digits = ecand
+                    break
+            elif len(ecand) == 4 and (len(clean_digits) in (3, 4, 5)):
                 clean_digits = ecand
                 break
-        elif len(ecand) == 4 and (len(clean_digits) in (3, 4, 5)):
-            clean_digits = ecand
-            break
 
     # 3. Normalisasi Suffix (1-3 huruf)
     s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B', 'U': 'V'}
@@ -695,6 +697,12 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
             clean_suffix += s_map[ch]
         elif ch.isalpha():
             clean_suffix += ch
+
+    # Disambiguasi karakter '5' / 'F' pada suffix (misal K5S -> KFS)
+    if suffix.startswith('K') and (suffix.endswith('5S') or suffix.endswith('FS') or any(es.endswith('FS') for es in easy_suffixes)):
+        clean_suffix = 'KFS'
+    elif '5' in suffix and suffix.endswith(('5S', 'S')):
+        clean_suffix = suffix.replace('5S', 'FS').replace('5', 'S')
 
     # Disambiguasi suffix BKN / BKW / BMU / BNN -> BNV
     if len(clean_suffix) == 3 and clean_suffix[0] == 'B':
@@ -837,12 +845,14 @@ def ensemble_plate_reading(plate_crop):
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     """
-    Sistem klasifikasi kendaraan dan bodi:
+    Sistem klasifikasi kendaraan dan bodi terkalibrasi untuk lingkungan parkir Indonesia:
     - Membedakan jenis kendaraan utama: car, motorcycle, truck, bus.
+    - Menangani misklasifikasi YOLO COCO (di mana mobil penumpang seperti Innova, Avanza,
+      Sigra sering salah dideteksi sebagai 'bus' atau 'truck').
     - Untuk 'truck': menghasilkan vehicle_type='truck', body_style='Truk' (atau 'Pickup Truck').
-    - Untuk 'bus': menghasilkan vehicle_type='bus', body_style='Bus'.
+    - Untuk 'bus': hanya untuk bus komersial berukuran besar (Jetbus, bus pariwisata, TransJakarta).
     - Untuk 'motorcycle': menghasilkan vehicle_type='motorcycle', body_style='Motor'.
-    - Untuk 'car': mengklasifikasikan ke kategori: MPV, SUV, Crossover, Hatchback, Sedan, Convertible, Pickup Truck.
+    - Untuk 'car': mengklasifikasikan ke kategori bodi: MPV, SUV, Hatchback, Sedan, Crossover, dll.
     """
     if initial_vtype == "motorcycle":
         return "motorcycle", "Motor", round(v_conf, 3)
@@ -857,21 +867,12 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
         fallback_name = "Mobil" if initial_vtype == "car" else ("Truk" if initial_vtype == "truck" else ("Bus" if initial_vtype == "bus" else "Motor"))
         return initial_vtype, fallback_name, round(v_conf, 3)
 
-    # 1. KENDARAAN DETEKSI TRUK (YOLO vehicle_model)
-    if initial_vtype == "truck":
-        # Cek apakah pickup truck kecil (seperti Hilux, Triton, Carry)
-        bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
-        probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
-        p_pickup = probs.get('Pickup Truck', 0.0)
-        if p_pickup >= 0.35:
-            return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        return 'truck', 'Truk', round(v_conf, 3)
+    ih, iw = image.shape[:2]
+    area_ratio = (car_w * car_h) / float(max(1, iw * ih))
+    w_ratio = car_w / float(max(1, iw))
+    h_ratio = car_h / float(max(1, ih))
 
-    # 2. KENDARAAN DETEKSI BUS (YOLO vehicle_model)
-    if initial_vtype == "bus":
-        return 'bus', 'Bus', round(v_conf, 3)
-
-    # 3. KENDARAAN MOBIL PENUMPANG (CAR)
+    # Dapatkan prediksi body style model
     bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
     probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
 
@@ -887,7 +888,29 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
-    # MOBIL PENUMPANG (CAR)
+    # 1. EVALUASI TRUK (YOLO vehicle_model)
+    if initial_vtype == "truck":
+        if p_pickup >= 0.35:
+            return 'truck', 'Pickup Truck', round(p_pickup, 3)
+        # Jika dimensi mobil penumpang biasa dan bukan truk besar:
+        p_passenger = p_mpv + p_minibus + p_suv + p_crossover + p_hatch + p_sedan
+        if area_ratio < 0.28 and w_ratio < 0.55 and p_passenger >= 0.60:
+            pass  # Reclassify as passenger car (lanjut ke evaluasi bodi mobil di bawah)
+        else:
+            return 'truck', 'Truk', round(v_conf, 3)
+
+    # 2. EVALUASI BUS (YOLO vehicle_model)
+    if initial_vtype == "bus":
+        # Bus komersial sungguhan (Jetbus, bus pariwisata, TransJakarta):
+        # Memiliki dimensi fisik sangat besar di kamera parkir (area > 32%, lebar > 58%, atau tinggi > 65%)
+        # DAN tidak memiliki karakteristik mobil penumpang (MPV/SUV/Hatchback/Fastback)
+        is_massive = (area_ratio >= 0.32) or (w_ratio >= 0.58) or (h_ratio >= 0.65)
+        if is_massive and p_minibus >= 0.55 and not (p_fastback >= 0.30 or p_sports >= 0.30):
+            return 'bus', 'Bus', round(v_conf, 3)
+        # Jika bukan bus besar komersial -> mobil penumpang (Innova, Sigra, Calya, Avanza) yang misklasifikasi oleh COCO!
+        # Reclassify as passenger car (lanjut ke penentuan tipe bodi MPV/SUV/Hatchback di bawah)
+
+    # 3. KENDARAAN MOBIL PENUMPANG (CAR)
     if aspect >= 0.70:
         score_conv = p_conv * 0.1
         score_sports = p_sports * 0.1
@@ -941,8 +964,14 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
     best_val = scores[best_cat]
 
-    if best_cat == 'Minibus':
-        best_cat = 'MPV'
+    if best_cat in ('Minibus', 'Fastback', 'Sports_HardtopConvertible', 'Convertible', 'Wagon'):
+        # Map exotic / non-Indonesian categories to closest realistic Indonesian car category
+        if aspect >= 0.75:
+            best_cat = 'MPV'
+        elif aspect >= 0.65:
+            best_cat = 'SUV' if p_suv >= p_hatch else 'Hatchback'
+        else:
+            best_cat = 'Sedan'
 
     tot_score = max(0.01, sum(scores.values()))
     norm_conf = min(0.99, max(0.60, best_val / tot_score))

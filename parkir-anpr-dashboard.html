@@ -50,8 +50,24 @@
     grid-template-columns:1.55fr 1fr;
     gap:20px;
   }
-  @media (max-width:960px){
-    .layout{grid-template-columns:1fr;}
+  @media (max-width:1150px){
+    body{
+      padding:14px 18px;
+    }
+    header{
+      padding-bottom:14px;
+      margin-bottom:14px;
+    }
+    .layout{
+      grid-template-columns:1fr;
+      gap:16px;
+    }
+    .feed-head{
+      padding:10px 14px;
+    }
+    .feed-body{
+      aspect-ratio:16/9;
+    }
   }
 
   .card{
