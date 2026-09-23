@@ -908,9 +908,15 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
 
     # 2. EVALUASI BUS & MINIBUS (YOLO vehicle_model = 'bus')
     if initial_vtype == "bus":
-        if p_minibus >= 0.45 and aspect < 0.95 and not (area_ratio >= 0.35 or w_ratio >= 0.65 or h_ratio >= 0.65):
-            return 'bus', 'Minibus', round(p_minibus, 3)
-        return 'bus', 'Bus', round(v_conf, 3)
+        # Jika model bodi mendeteksi sinyal mobil penumpang kuat (Fastback, Sports, Sedan, MPV murni) dan p_minibus rendah:
+        # maka ini adalah mobil penumpang (MPV / Sedan) yang salah deteksi oleh YOLO COCO
+        is_passenger_car = ((p_fastback >= 0.25 or p_sports >= 0.45 or p_sedan >= 0.30 or p_mpv >= 0.15) and p_minibus < 0.45)
+        if not is_passenger_car:
+            if p_minibus >= 0.45 and aspect < 0.95 and not (area_ratio >= 0.35 or w_ratio >= 0.65 or h_ratio >= 0.65):
+                return 'bus', 'Minibus', round(p_minibus, 3)
+            return 'bus', 'Bus', round(v_conf, 3)
+        # Reclassify ke mobil penumpang
+        initial_vtype = "car"
 
     # 3. KENDARAAN MOBIL PENUMPANG (CAR)
     # Sistem klasifikasi 4 kelas standar: SUV, Sedan, Hatchback, MPV
@@ -925,48 +931,59 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         score_sedan = max(0.85, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
-    # B. Resolusi Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
-    if p_mpv_total < 0.20 and (p_hatch >= 0.20) and abs(p_suv - p_hatch) <= 0.08:
-        score_hatch = max(0.85, p_hatch + p_suv * 0.5 + p_sports * 0.3)
-        return 'car', 'Hatchback', round(min(0.95, score_hatch), 3)
+    # B. Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
+    # Ciri: 2-pintu kompak, tanpa bagasi sedan (p_sedan < 0.08, p_pickup < 0.15, p_mpv_total < 0.18, p_sports >= 0.15)
+    is_micro_hatch = (p_sports >= 0.15 and p_mpv_total < 0.18 and p_sedan < 0.08 and p_pickup < 0.15 and
+                      ((p_sports + p_fastback) >= 0.40 or p_hatch >= 0.20))
+    if is_micro_hatch:
+        score_hatch = max(0.88, p_hatch + p_sports * 0.5 + p_fastback * 0.3)
+        return 'car', 'Hatchback', round(min(0.99, score_hatch), 3)
 
     # C. Ladder-frame SUV / Tall SUV (Toyota Fortuner, Mitsubishi Pajero Sport, Triton Double Cab, Daihatsu Rocky, dsb):
-    # Model bodi sering memprediksi Pickup Truck (karena platform moncong mirip Hilux/Triton) atau SUV
-    # Ketika bodi tinggi (aspect >= 0.70) dan terdapat sinyal pickup / suv / crossover:
-    if aspect >= 0.70 and (p_pickup + p_suv + p_crossover) >= 0.25:
-        if p_hatch < 0.40 and p_mpv < 0.35:
-            score_suv = max(0.85, p_suv + p_crossover + p_pickup)
-            return 'car', 'SUV', round(min(0.99, score_suv), 3)
+    is_tall_suv = aspect >= 0.70 and ((p_pickup >= 0.20) or (p_suv >= 0.35) or (p_suv + p_crossover + p_pickup >= 0.30 and p_hatch < 0.15))
+    if is_tall_suv:
+        score_suv = max(0.85, p_suv + p_crossover + p_pickup)
+        return 'car', 'SUV', round(min(0.99, score_suv), 3)
 
-    # D. Resolusi Ambiguitas Sedan Tampak Depan:
-    # Grille horizontal lebar (seperti Camry / Altis) sering membuat model mengira Minibus
+    # D. Sedan / Fastback (seperti Wuling Starlight, Honda Civic Fastback, Hyundai Ioniq):
+    # Fastback adalah karakteristik sedan, BUKAN hatchback!
+    if p_fastback >= 0.40 and p_fastback > p_minibus and p_mpv < 0.15:
+        score_sedan = max(0.85, p_sedan + p_fastback)
+        return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
+
+    # E. MPV murni (seperti Toyota Innova, Avanza, Xenia, Ertiga):
+    if p_mpv >= 0.20:
+        score_mpv = max(0.85, p_mpv + (p_wagon * 0.5) + (p_fastback * 0.3))
+        return 'car', 'MPV', round(min(0.99, score_mpv), 3)
+
+    # F. Sedan tampak depan (grille horizontal lebar sering dikira minibus):
     if p_minibus >= 0.45 and aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
         if (p_pickup + p_suv) < 0.20 and p_mpv < 0.20:
             return 'car', 'Sedan', round(max(0.88, p_minibus), 3)
 
-    # E. Sistem Skor Terkalibrasi (HANYA 4 KELAS MOBIL: SUV, MPV, Sedan, Hatchback)
+    # G. Sistem Skor Terkalibrasi (HANYA 4 KELAS MOBIL: SUV, MPV, Sedan, Hatchback)
     p_roof = p_sports + p_conv
 
-    # SUV: mencakup SUV murni, Crossover, dan Pickup Truck pada kategori mobil penumpang
+    # SUV:
     score_suv = p_suv + p_crossover + p_pickup
     if aspect >= 0.75 and (p_suv + p_crossover + p_pickup) >= 0.15:
         score_suv += (p_roof * 0.35)
 
-    # MPV: mencakup MPV, Wagon, dan Minibus pada mobil penumpang
+    # MPV:
     score_mpv = p_mpv + (p_wagon * 0.6) + (p_minibus * 0.7)
-    if aspect >= 0.75 and p_mpv >= 0.10:
-        score_mpv += (p_roof * 0.25)
+    if aspect >= 0.75 and p_mpv_total >= 0.15:
+        score_mpv += (p_fastback * 0.3) + (p_roof * 0.25)
 
-    # Sedan: fastback dan bodi rendah mencerminkan sedan
+    # Sedan:
     if aspect <= 0.82:
         score_sedan = p_sedan + (p_fastback * 0.85) + (p_sports * 0.4) + (p_conv * 0.4)
     else:
-        score_sedan = p_sedan + (p_fastback * 0.5)
+        score_sedan = p_sedan + (p_fastback * 0.4)
 
     # Hatchback:
     score_hatch = p_hatch + (p_wagon * 0.3)
     if aspect <= 0.82:
-        score_hatch += (p_fastback * 0.2) + (p_sports * 0.3)
+        score_hatch += (p_sports * 0.3)
 
     scores = {
         'SUV': score_suv,
