@@ -660,6 +660,8 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
     if clean_prefix in ('', 'I', '1') and ('B' in easy_prefixes or any(t.startswith('8') or t.startswith('B') for t in all_easy_texts)):
         clean_prefix = 'B'
+    elif clean_prefix == "GA":
+        clean_prefix = "BA"
     elif clean_prefix.startswith('8'):
         clean_prefix = 'B' + clean_prefix[1:]
     elif (clean_prefix.startswith('E') or clean_prefix.startswith('8')) and any(t.startswith('8') or t.startswith('B') for t in all_easy_texts):
@@ -928,11 +930,22 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf):
     if p_crossover >= 0.35 and p_crossover >= max(p_sedan, p_mpv + p_minibus):
         return 'car', 'Crossover', round(p_crossover, 3)
 
+    # Strong MPV prediction
     p_mpv_total = p_mpv + (p_minibus * 0.9)
-    if p_mpv_total >= 0.35 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
+    if p_mpv_total >= 0.40 and p_mpv_total >= max(p_suv, p_sedan, p_hatch):
         return 'car', 'MPV', round(min(0.99, p_mpv_total), 3)
 
-    # B. Resolusi ambiguitas untuk kelas non-standar (Fastback, Sports Convertible, Wagon)
+    # B. Resolusi Ambiguitas Sedan Tampak Depan:
+    # Dari sudut depan kamera CCTV, mobil Sedan sering membuat model ragu antara SUV dan Hatchback
+    # (keduanya aktif ~0.18-0.38 dengan selisih kecil <= 0.10) disertai sinyal Sports/Fastback/Convertible karena
+    # bodi sedan yang lebar, moncong panjang, namun beratap rendah (seperti Toyota Camry, Vios, Civic, Altis).
+    is_suv_hatch_tied = (min(p_suv, p_hatch) >= 0.18) and (max(p_suv, p_hatch) <= 0.38) and (abs(p_suv - p_hatch) <= 0.10)
+    has_sporty_or_low_signal = (p_sports + p_fastback + p_conv) >= 0.15
+    if is_suv_hatch_tied and has_sporty_or_low_signal and p_mpv_total < 0.25:
+        score_sedan = 0.55 + p_sedan + (p_sports * 0.4) + (p_fastback * 0.4)
+        return 'car', 'Sedan', round(min(0.95, score_sedan), 3)
+
+    # C. Resolusi ambiguitas umum untuk kelas non-standar (Fastback, Sports Convertible, Wagon)
     score_crossover = p_crossover + (p_suv * 0.3)
     p_roof_artifact = p_sports + p_conv
 
