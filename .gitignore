@@ -16,3 +16,13 @@ captures/*
 
 # Temporary upload files
 temp_upload.jpg
+
+# Local Scratch, Datasets, and raw weights
+scratch/
+dataset/
+* (1).pt
+* (2).pt
+best.pt
+last.pt
+vehicle_model_indo.pt
+plate_detector_best.pt

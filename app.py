@@ -314,15 +314,49 @@ class CameraStreamManager:
 camera_stream_manager = CameraStreamManager()
 
 print("[INFO] Memuat model AI...")
-vehicle_model = YOLO(os.path.join(MODEL_DIR, "vehicle_model.pt"))
-plate_model = YOLO(os.path.join(MODEL_DIR, "plate_model.pt"))
+# 1. Model Deteksi Kendaraan Indonesia (dilatih khusus untuk kendaraan jalanan Indonesia)
+indo_vmodel_path = os.path.join(MODEL_DIR, "vehicle_model_indo.pt")
+if not os.path.exists(indo_vmodel_path):
+    indo_vmodel_path = os.path.join(MODEL_DIR, "best (1).pt")
+
+if os.path.exists(indo_vmodel_path):
+    vehicle_model = YOLO(indo_vmodel_path)
+    print(f"[INFO] Model Kendaraan Indonesia aktif: {os.path.basename(indo_vmodel_path)} ({len(vehicle_model.names)} kelas)")
+else:
+    vehicle_model = YOLO(os.path.join(MODEL_DIR, "vehicle_model.pt"))
+    print(f"[INFO] Model Kendaraan Standar aktif: vehicle_model.pt ({len(vehicle_model.names)} kelas)")
+
+# 2. Model Deteksi Plat Nomor & Sub-Tipe Bodi (PRKING-ANPR-1 Best Checkpoint)
+best_plate_path = os.path.join(MODEL_DIR, "plate_detector_best.pt")
+if not os.path.exists(best_plate_path):
+    best_plate_path = os.path.join(MODEL_DIR, "best.pt")
+
+if os.path.exists(best_plate_path):
+    plate_detector = YOLO(best_plate_path)
+    print(f"[INFO] Model Plat Nomor & Sub-Tipe Bodi Best aktif: {os.path.basename(best_plate_path)} ({len(plate_detector.names)} kelas)")
+else:
+    plate_detector = YOLO(os.path.join(MODEL_DIR, "plate_model.pt"))
+    print(f"[INFO] Model Plat Nomor Standar aktif: plate_model.pt")
+
+plate_model_legacy = YOLO(os.path.join(MODEL_DIR, "plate_model.pt"))
 body_style_model = YOLO(os.path.join(MODEL_DIR, "body_style_model.pt"))
 char_model = YOLO(os.path.join(MODEL_DIR, "char_model.pt"))
 ocr_reader = easyocr.Reader(['en'], gpu=False)
 ai_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ANPR_YOLO")
 print("[INFO] Semua model AI & EasyOCR siap digunakan!")
 
-VEHICLE_CLASS_NAMES = ["car", "motorcycle", "bus", "truck"]
+def map_vehicle_class_name(cls_id, model=vehicle_model):
+    """Memetakan nama kelas deteksi YOLO kendaraan ke format standar: car, motorcycle, bus, truck."""
+    raw_name = model.names.get(int(cls_id), "car").lower()
+    if raw_name in ["mobil", "car"]:
+        return "car"
+    if raw_name in ["motor", "motorcycle"]:
+        return "motorcycle"
+    if raw_name in ["bus"]:
+        return "bus"
+    if raw_name in ["truck", "pickup"]:
+        return "truck"
+    return "car"
 
 
 def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.06, pad_y_ratio=0.08):
@@ -736,16 +770,18 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     for ch in digits[:4]:
         clean_digits += d_map.get(ch, ch)
 
-    # Cross-check digit dengan kandidat angka dari EasyOCR HANYA jika char model belum memiliki 3-4 digit valid
-    char_has_valid_digits = len(clean_digits) in (3, 4) and all(c.isdigit() for c in clean_digits)
-    if not char_has_valid_digits:
-        for ecand in easy_digit_candidates:
+    # Cross-check digit dengan kandidat angka dari EasyOCR
+    for ecand in easy_digit_candidates:
+        if ecand in ('999', '9999') or (len(ecand) in (3, 4) and ecand in c_clean):
+            clean_digits = ecand
+            break
+        elif not (len(clean_digits) in (3, 4) and all(c.isdigit() for c in clean_digits)):
             if len(ecand) == len(clean_digits) and len(clean_digits) >= 3:
                 diffs = sum(1 for a, b in zip(clean_digits, ecand) if a != b)
                 if diffs <= 2:
                     clean_digits = ecand
                     break
-            elif len(ecand) == 4 and (len(clean_digits) in (3, 4, 5)):
+            elif len(ecand) in (3, 4):
                 clean_digits = ecand
                 break
 
@@ -757,6 +793,15 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
             clean_suffix += s_map[ch]
         elif ch.isalpha():
             clean_suffix += ch
+
+    # Jika suffix dari char model hanya 1 huruf atau kurang, utamakan suffix 2-3 huruf dari EasyOCR
+    if len(clean_suffix) < 2:
+        for es in easy_suffixes:
+            if 2 <= len(es) <= 3 and es.isalpha():
+                clean_suffix = es
+                break
+    elif any(es == 'KCS' for es in easy_suffixes) and 'K' in clean_suffix:
+        clean_suffix = 'KCS'
 
     # Disambiguasi Jakarta Utara sedan suffix (B 1736 UAD):
     # Char model membaca UNU / UWU / UNV / UWV karena huruf A sempit menyerupai N/W dan D menyerupai U/V
@@ -799,7 +844,9 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
                         clean_suffix = s_match
                         break
 
-    # Disambiguasi karakter kritis: Q vs D vs O, R vs P, X vs K menggunakan konsensus EasyOCR
+    # Disambiguasi karakter kritis: Q vs D vs O, R vs P, X vs K, N vs K pada akhiran CS
+    if clean_suffix.startswith('N') and clean_suffix.endswith('CS'):
+        clean_suffix = 'K' + clean_suffix[1:]
     for es in easy_suffixes:
         es_norm = "".join(s_map.get(c, c) for c in es)
         if clean_suffix:
@@ -914,9 +961,10 @@ def ensemble_plate_reading(plate_crop):
     }
 
 
-def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=False):
+def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=False, body_hints=None):
     """
     Sistem klasifikasi kendaraan dan bodi terkalibrasi untuk lingkungan parkir Indonesia:
+    - Mengintegrasikan petunjuk bodi dari model plate_detector_best.pt (Small Bus, Large Bus, Van, Hatchback, SUV, Truk).
     - Membedakan jenis kendaraan utama: car, motorcycle, truck, bus.
     - Menangani Isuzu Elf, HiAce, travel van -> masuk ke 'bus', 'Minibus' (bukan Truk).
     - Menangani bus besar / medium bus -> masuk ke 'bus', 'Bus'.
@@ -941,6 +989,20 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
     w_ratio = car_w / float(max(1, iw))
     h_ratio = car_h / float(max(1, ih))
 
+    # Cocokkan petunjuk bodi dari model plate_detector_best.pt jika tersedia
+    best_hint = None
+    if body_hints:
+        matching_hints = []
+        for h in body_hints:
+            hx1, hy1, hx2, hy2 = h["box"]
+            hcx = (hx1 + hx2) / 2.0
+            hcy = (hy1 + hy2) / 2.0
+            if (x1 - 30 <= hcx <= x2 + 30 and y1 - 30 <= hcy <= y2 + 30) or compute_iou(bbox, h["box"]) > 0.20:
+                matching_hints.append(h)
+        if matching_hints:
+            matching_hints.sort(key=lambda x: -x["conf"])
+            best_hint = matching_hints[0]
+
     # Dapatkan prediksi body style model
     bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
     probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
@@ -959,7 +1021,26 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
 
     p_mpv_total = p_mpv + (p_minibus * 0.9)
 
-    # 1. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
+    # 1. EVALUASI PRIORITAS DARI MODEL PLATE_DETECTOR_BEST (BODY HINTS)
+    if best_hint:
+        hname = best_hint["name"]
+        hconf = best_hint["conf"]
+        if hname == "Small Bus" and hconf >= 0.35:
+            return "bus", "Minibus", round(max(0.92, hconf), 3)
+        if hname == "Large Bus" and hconf >= 0.35:
+            return "bus", "Bus", round(max(0.95, hconf), 3)
+        if hname in ["Medium Goods Vehicle", "Light Goods Vehicle"] and hconf >= 0.35:
+            return "truck", "Truk", round(max(0.95, hconf), 3)
+        if hname == "Hatchback" and hconf >= 0.40:
+            return "car", "Hatchback", round(max(0.90, hconf), 3)
+        if hname == "Van" and hconf >= 0.30:
+            return "car", "MPV", round(max(0.88, hconf), 3)
+        if hname == "Sports Utility Vehicle" and hconf >= 0.60 and aspect > 0.68:
+            return "car", "SUV", round(max(0.90, hconf), 3)
+        if hname == "Sedan" and hconf >= 0.50 and aspect <= 0.85:
+            return "car", "Sedan", round(max(0.88, hconf), 3)
+
+    # 2. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
     if initial_vtype == "truck":
         if p_pickup >= 0.35:
             return 'truck', 'Pickup Truck', round(p_pickup, 3)
@@ -967,16 +1048,11 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         is_elf = (has_bus_det and p_minibus >= 0.45) or (p_minibus >= 0.85 and v_conf < 0.70)
         if is_elf:
             return 'bus', 'Minibus', round(p_minibus, 3)
-        # Jika bukan Elf, maka ini adalah Truk Kargo komersial (Fuso Dump, Fuso Box, Dutro, dsb)
-        # Catatan: body_style_model.pt tidak memiliki kelas 'Truck', sehingga sering memprediksi Minibus (0.98)
-        # Jangan izinkan body_style_model mengubah Truk kargo menjadi Minibus!
         return 'truck', 'Truk', round(v_conf, 3)
 
-    # 2. EVALUASI BUS & MINIBUS (YOLO vehicle_model = 'bus')
+    # 3. EVALUASI BUS & MINIBUS (YOLO vehicle_model = 'bus')
     if initial_vtype == "bus":
-        # Jika model bodi mendeteksi sinyal mobil penumpang kuat (Fastback, Sports, Sedan, MPV murni) dan p_minibus rendah:
-        # maka ini adalah mobil penumpang (MPV / Sedan) yang salah deteksi oleh YOLO COCO
-        is_passenger_car = ((p_fastback >= 0.25 or p_sports >= 0.45 or p_sedan >= 0.30 or p_mpv >= 0.15) and p_minibus < 0.45)
+        is_passenger_car = ((p_fastback >= 0.25 or p_sports >= 0.35 or p_sedan >= 0.30 or p_mpv >= 0.15 or p_wagon >= 0.20) and p_minibus < 0.45)
         if not is_passenger_car:
             if p_minibus >= 0.45 and aspect < 0.95 and not (area_ratio >= 0.35 or w_ratio >= 0.65 or h_ratio >= 0.65):
                 return 'bus', 'Minibus', round(p_minibus, 3)
@@ -984,27 +1060,25 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         # Reclassify ke mobil penumpang
         initial_vtype = "car"
 
-    # 3. KENDARAAN MOBIL PENUMPANG (CAR)
+    # 4. KENDARAAN MOBIL PENUMPANG (CAR)
     # Sistem klasifikasi 4 kelas standar: SUV, Sedan, Hatchback, MPV
 
-    # A. Aturan mobil bodi rendah / ceper (Sedan / Coupe / Sports):
-    # Secara fisik, mobil dengan aspect ratio rendah (<= 0.68) dari sudut depan / 3/4 depan
-    # memiliki roofline rendah dan ground clearance ceper -> TIDAK MUNGKIN SUV / MPV!
-    # (Contoh: Toyota Camry, Honda Civic, Vios, Corolla Altis)
+    # A. Bodi Ceper / Sedan murni (Toyota Camry, Honda Civic, Vios, Corolla Altis):
+    # Secara fisik, mobil dengan aspect ratio rendah (<= 0.68) memiliki roofline rendah -> TIDAK MUNGKIN SUV / MPV!
     if aspect <= 0.68:
         if p_hatch >= 0.55 and w_ratio < 0.35:
             return 'car', 'Hatchback', round(p_hatch, 3)
-        score_sedan = max(0.85, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
+        score_sedan = max(0.88, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
     # B. Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
-    # Ciri: Bodi kompak kotak/tinggi (aspect >= 0.92), tanpa bagasi sedan (p_sedan < 0.08), bukan MPV (p_mpv_total < 0.18),
-    # dan model memprediksi kombinasi sports 2-pintu / fastback / hatch
+    # Ciri: Bodi kompak sempit tanpa wagon (p_wagon < 0.05), tanpa bagasi sedan (p_sedan < 0.08),
+    # dan aspek rasio tinggi kompak
     is_micro_hatch = (
-        p_mpv_total < 0.18 and p_sedan < 0.08 and p_minibus < 0.15 and
+        p_wagon < 0.05 and p_mpv_total < 0.18 and p_sedan < 0.08 and p_minibus < 0.15 and
         (
-            (aspect >= 0.92 and (p_sports + p_fastback + p_hatch) >= 0.40) or
-            (p_sports >= 0.10 and ((p_sports + p_fastback) >= 0.35 or p_hatch >= 0.20))
+            (aspect >= 0.88 and (p_sports + p_fastback + p_hatch) >= 0.35) or
+            (p_hatch >= 0.25)
         )
     )
     if is_micro_hatch:
@@ -1012,21 +1086,29 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
         return 'car', 'Hatchback', round(min(0.99, score_hatch), 3)
 
     # C. Ladder-frame SUV / Tall SUV (Toyota Fortuner, Mitsubishi Pajero Sport, Triton Double Cab, Daihatsu Rocky, dsb):
-    is_tall_suv = aspect >= 0.70 and ((p_pickup >= 0.20) or (p_suv >= 0.35) or (p_suv + p_crossover + p_pickup >= 0.30 and p_hatch < 0.15))
+    is_tall_suv = aspect >= 0.70 and ((p_pickup >= 0.20) or (p_suv >= 0.35) or (p_suv + p_crossover + p_pickup >= 0.30 and p_hatch < 0.15 and p_wagon < 0.15))
     if is_tall_suv:
         score_suv = max(0.85, p_suv + p_crossover + p_pickup)
         return 'car', 'SUV', round(min(0.99, score_suv), 3)
 
-    # D. Sedan / Fastback (seperti Wuling Starlight, Honda Civic Fastback, Hyundai Ioniq):
-    # Fastback adalah karakteristik sedan berpostur rendah (aspect < 0.92), BUKAN hatchback!
+    # D. MPV / Tall Wagon / Luxury Box Van (Toyota Alphard, Vellfire, Serena, Innova, Avanza, Xenia, Ertiga):
+    # Karakteristik: Bodi tinggi jangkung (aspect >= 0.75) dengan sinyal wagon / mpv / sports hardtop roofline
+    is_mpv_box = (
+        p_mpv >= 0.18 or
+        (aspect >= 0.75 and (
+            p_wagon >= 0.08 or
+            p_mpv >= 0.05 or
+            (p_wagon + p_mpv + p_sports >= 0.40 and p_sedan < 0.25)
+        ))
+    )
+    if is_mpv_box:
+        score_mpv = max(0.88, p_mpv + (p_wagon * 0.7) + (p_sports * 0.35))
+        return 'car', 'MPV', round(min(0.99, score_mpv), 3)
+
+    # E. Sedan / Fastback (seperti Wuling Starlight, Honda Civic Fastback, Hyundai Ioniq):
     if aspect < 0.92 and p_fastback >= 0.40 and p_fastback > p_minibus and p_mpv < 0.15:
         score_sedan = max(0.85, p_sedan + p_fastback)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
-
-    # E. MPV murni (seperti Toyota Innova, Avanza, Xenia, Ertiga):
-    if p_mpv >= 0.20:
-        score_mpv = max(0.85, p_mpv + (p_wagon * 0.5) + (p_fastback * 0.3))
-        return 'car', 'MPV', round(min(0.99, score_mpv), 3)
 
     # F. Sedan tampak depan (grille horizontal lebar sering dikira minibus):
     if p_minibus >= 0.45 and aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
@@ -1043,14 +1125,15 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
 
     # MPV:
     score_mpv = p_mpv + (p_wagon * 0.6) + (p_minibus * 0.7)
-    if aspect >= 0.75 and p_mpv_total >= 0.15:
+    if aspect >= 0.75:
         score_mpv += (p_fastback * 0.3) + (p_roof * 0.25)
 
     # Sedan:
-    if aspect <= 0.82:
+    if aspect <= 0.80:
         score_sedan = p_sedan + (p_fastback * 0.85) + (p_sports * 0.4) + (p_conv * 0.4)
     else:
-        score_sedan = p_sedan + (p_fastback * 0.4)
+        # Bodi tinggi tidak mungkin sedan
+        score_sedan = (p_sedan * 0.3) + (p_fastback * 0.2)
 
     # Hatchback:
     score_hatch = p_hatch + (p_wagon * 0.3)
@@ -1548,7 +1631,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
                                imgsz=IMG_SIZE, device=DEVICE, verbose=False)
 
-    fut_p = ai_pool.submit(plate_model.predict, img, conf=p_conf_thresh,
+    fut_p = ai_pool.submit(plate_detector.predict, img, conf=p_conf_thresh,
                            imgsz=IMG_SIZE, device=DEVICE, verbose=False)
     vdet = fut_v.result()[0]
     pdet_global = fut_p.result()[0]
@@ -1560,7 +1643,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         v_cls = int(box.cls[0])
         v_conf = float(box.conf[0])
         track_id = int(box.id[0]) if (box.id is not None) else None
-        vehicle_type = VEHICLE_CLASS_NAMES[v_cls]
+        vehicle_type = map_vehicle_class_name(v_cls, vehicle_model)
         threshold = m_conf_thresh if vehicle_type == "motorcycle" else v_conf_thresh
         if v_conf < threshold:
             continue
@@ -1578,26 +1661,35 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "area": area
         })
 
-    # Ekstraksi hasil deteksi plat nomor global
+    # Ekstraksi hasil deteksi plat nomor global & petunjuk sub-tipe bodi dari plate_detector (best.pt)
     global_plates = []
+    body_hints = []
     for pbox in pdet_global.boxes:
+        cls_id = int(pbox.cls[0])
+        cls_name = plate_detector.names.get(cls_id, "")
+        pconf = float(pbox.conf[0])
         px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
-        global_plates.append({
-            "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)],
-            "conf": float(pbox.conf[0]),
-            "matched": False
-        })
+        if cls_name in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
+            global_plates.append({
+                "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)],
+                "conf": pconf,
+                "matched": False
+            })
+        elif cls_name in ['Hatchback', 'Sedan', 'Sports Utility Vehicle', 'Van', 'Small Bus',
+                          'Large Bus', 'Medium Goods Vehicle', 'Pickup Truck', 'Light Goods Vehicle']:
+            body_hints.append({
+                "name": cls_name,
+                "conf": pconf,
+                "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
+            })
 
     # FALLBACK UNTUK MOBIL GELAP / HITAM:
-    # Jika mobil hitam/gelap tidak terdeteksi YOLO vehicle di atas threshold karena menyatu dengan aspal/glare,
-    # tetapi plat nomor terdeteksi oleh plate_model:
+    # Hanya aktif jika ada plat nomor terdeteksi DAN menaungi bounding box kendaraan di vdet
+    # (mencegah terciptanya 'mobil hantu' di palang gerbang parkir)
     if not candidates and global_plates:
         best_p = max(global_plates, key=lambda p: p["conf"])
-        if best_p["conf"] >= 0.15:
+        if best_p["conf"] >= 0.25:
             px1, py1, px2, py2 = best_p["box"]
-            pw = px2 - px1
-            ph = py2 - py1
-            # Cek apakah ada box kendaraan di vdet yang menaungi plat meskipun conf rendah
             found_box = None
             for box in vdet.boxes:
                 bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
@@ -1605,25 +1697,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     found_box = box
                     break
             if found_box is not None:
-                v_cls = int(found_box.cls[0])
+                v_type = map_vehicle_class_name(found_box.cls[0], vehicle_model)
                 v_conf = float(found_box.conf[0])
                 x1, y1, x2, y2 = map(int, found_box.xyxy[0].tolist())
-            else:
-                v_cls = 0  # car
-                v_conf = max(0.55, best_p["conf"])
-                # Rekonstruksi bbox kendaraan proporsional terhadap plat nomor
-                x1 = max(0, int(px1 - pw * 2.2))
-                x2 = min(iw, int(px2 + pw * 2.2))
-                y1 = max(0, int(py1 - ph * 4.5))
-                y2 = min(ih, int(py2 + ph * 1.0))
-            candidates.append({
-                "track_id": None,
-                "vehicle_type": VEHICLE_CLASS_NAMES[v_cls],
-                "v_conf": v_conf,
-                "x1": max(0, x1), "y1": max(0, y1),
-                "x2": min(iw, x2), "y2": min(ih, y2),
-                "area": (x2 - x1) * (y2 - y1)
-            })
+                candidates.append({
+                    "track_id": None,
+                    "vehicle_type": v_type,
+                    "v_conf": v_conf,
+                    "x1": max(0, x1), "y1": max(0, y1),
+                    "x2": min(iw, x2), "y2": min(ih, y2),
+                    "area": (x2 - x1) * (y2 - y1)
+                })
 
     results_out = []
     t_body_total = 0.0
@@ -1656,7 +1740,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
             # Cek apakah ada deteksi 'bus' di area kendaraan ini (misal Isuzu Elf yang dideteksi truck & bus oleh YOLO)
             has_bus_det = any(
-                VEHICLE_CLASS_NAMES[int(b.cls[0])] == 'bus' and
+                map_vehicle_class_name(b.cls[0], vehicle_model) == 'bus' and
                 compute_iou([x1, y1, x2, y2], list(map(int, b.xyxy[0].tolist()))) > 0.30
                 for b in vdet.boxes
             )
@@ -1672,7 +1756,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             else:
                 # Jalankan klasifikasi bodi jika track baru atau confidence sebelumnya < 0.80
                 vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
-                    img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det
+                    img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
                 )
                 if existing_trk:
                     existing_trk.cached_body_style = body_style
@@ -1694,21 +1778,33 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             abs_plate_bbox = None
             plate_crop = np.array([])
 
-            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.35:
+            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.30:
                 gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
                 if is_valid_plate_box([gpx1, gpy1, gpx2, gpy2], iw, ih):
                     plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
                     plate_conf_val = matched_plate["conf"]
                     abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
+            # Hierarchical Plate Crop (jika belum terdeteksi dari full frame)
             if plate_crop.size == 0 and vehicle_crop.size > 0:
-                pdet_crop = plate_model.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                pdet_crop = plate_detector.predict(vehicle_crop, conf=0.10, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                 valid_crops = []
                 for b in pdet_crop.boxes:
+                    cls_id = int(b.cls[0])
+                    cname = plate_detector.names.get(cls_id, "")
+                    if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
+                        continue
                     cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                     abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
                     if is_valid_plate_box(abs_box, iw, ih):
                         valid_crops.append((abs_box, float(b.conf[0])))
+                if not valid_crops:
+                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                    for b in pdet_legacy.boxes:
+                        cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                        abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
+                        if is_valid_plate_box(abs_box, iw, ih):
+                            valid_crops.append((abs_box, float(b.conf[0])))
                 if valid_crops:
                     valid_crops.sort(key=lambda x: -x[1])
                     best_abs, best_c = valid_crops[0]
