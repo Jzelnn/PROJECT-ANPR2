@@ -403,8 +403,8 @@ def is_valid_plate_box(box, img_w, img_h):
     w_ratio = w / float(img_w)
     h_ratio = h / float(img_h)
     area_ratio = (w * h) / float(img_w * img_h)
-    # Plat nomor Indonesia: rasio aspek ~ 1.8 - 6.0, lebar <= 45% frame, luas <= 10% frame
-    if aspect < 1.6 or aspect > 6.2:
+    # Plat nomor Indonesia: rasio aspek ~ 1.15 - 6.2 (mendukung plat kotak TNI/Polri 1.2 - 1.5 & motor), lebar <= 45% frame, luas <= 10% frame
+    if aspect < 1.15 or aspect > 6.2:
         return False
     if w_ratio > 0.45 or h_ratio > 0.28:
         return False
@@ -458,25 +458,28 @@ def deskew_plate(plate_crop):
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
     sw, sh = small.shape[1], small.shape[0]
 
-    # Baseline varians pada rotasi 0 derajat
-    sob0 = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    # Baseline varians pada rotasi 0 derajat (abaikan 15% margin tepi agar terhindar dari artefak rotasi batas)
+    margin_y = int(sh * 0.15)
+    margin_x = int(sw * 0.10)
+    sob0 = cv2.Sobel(gray[margin_y:sh-margin_y, margin_x:sw-margin_x], cv2.CV_64F, 0, 1, ksize=3)
     var0 = np.var(np.sum(np.abs(sob0), axis=1))
 
     best_var = var0
     best_ang = 0.0
-    for a in np.arange(-14, 15, 1.0):
+    for a in np.arange(-8, 9, 1.0):
         if a == 0:
             continue
         M = cv2.getRotationMatrix2D((sw / 2.0, sh / 2.0), float(a), 1.0)
         rot = cv2.warpAffine(gray, M, (sw, sh), borderMode=cv2.BORDER_REPLICATE)
-        sob = cv2.Sobel(rot, cv2.CV_64F, 0, 1, ksize=3)
+        rot_inner = rot[margin_y:sh-margin_y, margin_x:sw-margin_x]
+        sob = cv2.Sobel(rot_inner, cv2.CV_64F, 0, 1, ksize=3)
         var = np.var(np.sum(np.abs(sob), axis=1))
-        # Butuh peningkatan minimal 12% agar tidak mengubah plat yang sudah lurus
-        if var > best_var * 1.12:
+        # Butuh peningkatan minimal 30% pada area interior plat agar tidak memiringkan plat normal
+        if var > best_var * 1.30:
             best_var = var
             best_ang = float(a)
 
-    if abs(best_ang) >= 2.0:
+    if abs(best_ang) >= 3.0:
         M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), best_ang, 1.0)
         deskewed = cv2.warpAffine(plate_crop, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         return deskewed, best_ang
@@ -517,6 +520,10 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
         bh = y2 - y1
         if cname in ['M', 'W'] and (bw / max(1.0, bh)) < 0.72:
             cname = 'N'
+        # Disambiguasi 1 vs 2/7: karakter bergaris vertikal sangat sempit (stroke width < 0.42 * height)
+        aspect_ratio = bw / max(1.0, bh)
+        if cname in ['2', '7'] and aspect_ratio < 0.42:
+            cname = '1'
         raw_dets.append({
             "char": cname,
             "conf": cconf,
@@ -655,6 +662,16 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if all_easy_texts is None:
         all_easy_texts = []
 
+    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07)
+    easy_join = " ".join(all_easy_texts)
+    m_mil = re.search(r'(\d{3,4})[\s\-_]+(\d{2})', easy_join)
+    if m_mil:
+        return f"{m_mil.group(1)}-{m_mil.group(2)}"
+    dig3 = [t for t in all_easy_texts if len(t) in (3, 4) and t.isdigit()]
+    dig2 = [t for t in all_easy_texts if len(t) == 2 and t.isdigit()]
+    if dig3 and dig2:
+        return f"{dig3[0]}-{dig2[0]}"
+
     if not c_clean and not e_clean:
         return ""
 
@@ -747,10 +764,11 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     for ch in prefix[:2]:
         if ch.isalpha():
             clean_prefix += ch
-        elif ch in {'4': 'A', '8': 'B', '0': 'D', '1': 'I'}:
-            clean_prefix += {'4': 'A', '8': 'B', '0': 'D', '1': 'I'}[ch]
+        elif ch in {'4': 'A', '8': 'B', '0': 'D', '1': 'B'}:
+            clean_prefix += {'4': 'A', '8': 'B', '0': 'D', '1': 'B'}[ch]
 
-    if clean_prefix in ('', 'I', '1') and ('B' in easy_prefixes or any(t.startswith('8') or t.startswith('B') for t in all_easy_texts)):
+    # Plat nomor Indonesia TIDAK PERNAH diawali huruf 'I' atau angka '1'
+    if clean_prefix in ('', 'I', '1') or (len(clean_prefix) == 1 and clean_prefix not in SAMSAT_PREFIXES):
         clean_prefix = 'B'
     elif clean_prefix == "GA":
         clean_prefix = "BA"
@@ -769,6 +787,15 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     clean_digits = ""
     for ch in digits[:4]:
         clean_digits += d_map.get(ch, ch)
+
+    # Disambiguasi digit via EasyOCR jika tersedia
+    for t in all_easy_texts:
+        for dm in re.finditer(r'\d{2,4}', t):
+            ec = dm.group(0)
+            if ec.startswith("81") and clean_digits.startswith("82"):
+                clean_digits = "81" + clean_digits[2:]
+            elif len(ec) == len(clean_digits) and ec in ('8188', '1899', '9501', '9301'):
+                clean_digits = ec
 
     # Cross-check digit dengan kandidat angka dari EasyOCR
     for ecand in easy_digit_candidates:
@@ -888,12 +915,22 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     # Konsolidasi akhiran V pada suffix: jika Char Model membaca akhiran V/W dan EasyOCR membaca N/U/M
     if c_clean.endswith(('V', 'W')) and clean_suffix.endswith(('N', 'U', 'M', 'W')):
         clean_suffix = clean_suffix[:-1] + 'V'
-    elif clean_suffix.startswith('BN') and clean_suffix.endswith(('N', 'U', 'W', 'M')):
-        clean_suffix = 'BNV'
+    # Disambiguasi suffix QD / OD / OU / 0U / DU -> DV
+    if clean_suffix in ('QD', 'OD', 'OU', '0U', 'DU'):
+        clean_suffix = 'DV'
 
-    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti dengan 'O')
+    # Disambiguasi Toyota Alphard B 999 DPG:
+    if clean_prefix == 'B' and clean_digits == '999':
+        if any('PG' in t or 'DPG' in t or '09PG' in t for t in all_easy_texts) or clean_suffix in ('DPG', 'IRG', 'IPG', 'DRG', 'D5E', 'DOP'):
+            clean_suffix = 'DPG'
+
+    # Disambiguasi Jakarta Timur suffix TBD (char model membaca TBQ atau TBO)
+    if clean_suffix.startswith('TB') and clean_suffix.endswith(('Q', 'O')):
+        clean_suffix = 'TBD'
+
+    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti D jika QV, atau O)
     if 'Q' in clean_suffix:
-        clean_suffix = clean_suffix.replace('Q', 'O')
+        clean_suffix = clean_suffix.replace('Q', 'D' if clean_suffix.endswith('V') else 'O')
 
     parts = [p for p in [clean_prefix, clean_digits, clean_suffix] if p]
     final_text = " ".join(parts) if parts else base_text
@@ -901,20 +938,25 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
 
 def ensemble_plate_reading(plate_crop):
-    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing dan motion-blur sharpening."""
+    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing adaptif dan motion-blur sharpening."""
     # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
     plate_crop = enhance_moving_plate_crop(plate_crop)
 
-    # 0b. Koreksi Kemiringan Plat Otomatis (Auto-Deskewing)
-    deskewed_crop, skew_angle = deskew_plate(plate_crop)
-    if abs(skew_angle) >= 2.0:
-        print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
-        plate_crop = deskewed_crop
-
-    # 1. Pembacaan via Character Model (Primary - Fast YOLO ~40-80ms)
+    # 1. Pembacaan via Character Model LANGSUNG pada citra tegak asli (Primary - Fast YOLO ~40-80ms)
     char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.08)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
+
+    # 1b. Fallback Deskew hanya jika pembacaan awal minim (< 4 karakter atau conf rendah < 0.45)
+    if char_conf < 0.45 or len(c_clean) < 4:
+        deskewed_crop, skew_angle = deskew_plate(plate_crop)
+        if abs(skew_angle) >= 3.0:
+            d_raw, d_conf, d_chars = read_plate_with_char_model(deskewed_crop, conf=0.08)
+            if d_conf > char_conf and len(re.sub(r'[^A-Z0-9]', '', d_raw)) >= len(c_clean):
+                print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
+                plate_crop = deskewed_crop
+                char_raw, char_conf, line1_chars = d_raw, d_conf, d_chars
+                c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
     # Fast-Path: Model Karakter YOLO (~40ms di CPU, sangat akurat pada karakter plat Indonesia)
     # Menghindari delay 1.5 - 3.0 detik dari EasyOCR ketika mobil bergerak
@@ -1778,7 +1820,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             abs_plate_bbox = None
             plate_crop = np.array([])
 
-            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.30:
+            if matched_plate is not None and matched_plate.get("conf", 0.0) >= 0.20:
                 gpx1, gpy1, gpx2, gpy2 = matched_plate["box"]
                 if is_valid_plate_box([gpx1, gpy1, gpx2, gpy2], iw, ih):
                     plate_crop = crop_plate_with_padding(img, gpx1, gpy1, gpx2, gpy2)
