@@ -919,10 +919,11 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if clean_suffix in ('QD', 'OD', 'OU', '0U', 'DU'):
         clean_suffix = 'DV'
 
-    # Disambiguasi Toyota Alphard B 999 DPG:
+    # Disambiguasi B 999 DPG (BMW iX / Toyota Alphard):
     if clean_prefix == 'B' and clean_digits == '999':
-        if any('PG' in t or 'DPG' in t or '09PG' in t for t in all_easy_texts) or clean_suffix in ('DPG', 'IRG', 'IPG', 'DRG', 'D5E', 'DOP'):
+        if clean_suffix.startswith('DP') or clean_suffix in ('DPG', 'DPF', 'DPE', 'DFG', 'IRG', 'IPG', 'DRG', 'D5E', 'DOP') or any('PG' in t or 'DPG' in t or '09PG' in t for t in all_easy_texts):
             clean_suffix = 'DPG'
+
 
     # Disambiguasi Jakarta Timur suffix TBD (char model membaca TBQ atau TBO)
     if clean_suffix.startswith('TB') and clean_suffix.endswith(('Q', 'O')):
@@ -1061,8 +1062,6 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
     p_sports = probs.get('Sports_HardtopConvertible', 0.0)
     p_wagon = probs.get('Wagon', 0.0)
 
-    p_mpv_total = p_mpv + (p_minibus * 0.9)
-
     # 1. EVALUASI PRIORITAS DARI MODEL PLATE_DETECTOR_BEST (BODY HINTS)
     if best_hint:
         hname = best_hint["name"]
@@ -1071,22 +1070,24 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
             return "bus", "Minibus", round(max(0.92, hconf), 3)
         if hname == "Large Bus" and hconf >= 0.35:
             return "bus", "Bus", round(max(0.95, hconf), 3)
-        if hname in ["Medium Goods Vehicle", "Light Goods Vehicle"] and hconf >= 0.35:
+        if hname in ["Medium Goods Vehicle"] and hconf >= 0.35 and p_suv < 0.20:
             return "truck", "Truk", round(max(0.95, hconf), 3)
-        if hname == "Hatchback" and hconf >= 0.40:
+        if hname == "Sports Utility Vehicle" and hconf >= 0.40:
+            return "car", "SUV", round(max(0.92, hconf), 3)
+        if hname == "Hatchback" and hconf >= 0.40 and aspect < 0.88:
             return "car", "Hatchback", round(max(0.90, hconf), 3)
         if hname == "Van" and hconf >= 0.30:
             return "car", "MPV", round(max(0.88, hconf), 3)
-        if hname == "Sports Utility Vehicle" and hconf >= 0.60 and aspect > 0.68:
-            return "car", "SUV", round(max(0.90, hconf), 3)
-        if hname == "Sedan" and hconf >= 0.50 and aspect <= 0.85:
+        if hname == "Sedan" and hconf >= 0.45:
             return "car", "Sedan", round(max(0.88, hconf), 3)
 
     # 2. EVALUASI TRUK KARGO / PICKUP (YOLO vehicle_model = 'truck')
     if initial_vtype == "truck":
+        # Jika model bodi mendeteksi SUV kuat (> 40%), ini adalah SUV bukan truk!
+        if p_suv >= 0.40 or (p_suv + p_crossover >= 0.50):
+            return 'car', 'SUV', round(max(p_suv, 0.88), 3)
         if p_pickup >= 0.35:
             return 'truck', 'Pickup Truck', round(p_pickup, 3)
-        # Isuzu Elf: YOLO mendeteksi truck DAN bus, atau truck dengan confidence sedang (< 0.70) dan Minibus dominan
         is_elf = (has_bus_det and p_minibus >= 0.45) or (p_minibus >= 0.85 and v_conf < 0.70)
         if is_elf:
             return 'bus', 'Minibus', round(p_minibus, 3)
@@ -1094,107 +1095,61 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
 
     # 3. EVALUASI BUS & MINIBUS (YOLO vehicle_model = 'bus')
     if initial_vtype == "bus":
-        is_passenger_car = ((p_fastback >= 0.25 or p_sports >= 0.35 or p_sedan >= 0.30 or p_mpv >= 0.15 or p_wagon >= 0.20) and p_minibus < 0.45)
+        is_passenger_car = ((p_fastback >= 0.20 or p_sports >= 0.25 or p_sedan >= 0.20 or p_suv >= 0.20 or p_mpv >= 0.15 or p_wagon >= 0.15 or p_hatch >= 0.20) and p_minibus < 0.45)
         if not is_passenger_car:
             if p_minibus >= 0.45 and aspect < 0.95 and not (area_ratio >= 0.35 or w_ratio >= 0.65 or h_ratio >= 0.65):
                 return 'bus', 'Minibus', round(p_minibus, 3)
             return 'bus', 'Bus', round(v_conf, 3)
-        # Reclassify ke mobil penumpang
         initial_vtype = "car"
 
     # 4. KENDARAAN MOBIL PENUMPANG (CAR)
-    # Sistem klasifikasi 4 kelas standar: SUV, Sedan, Hatchback, MPV
+    # A. SUV Kuat (seperti Toyota RAV4, Fortuner, Pajero Sport, HR-V, BMW iX)
+    if p_suv >= 0.40 or (p_suv + p_crossover + p_pickup >= 0.50):
+        score_suv = max(0.90, p_suv + p_crossover + p_pickup)
+        return 'car', 'SUV', round(min(0.99, score_suv), 3)
 
-    # A. Bodi Ceper / Sedan murni (Toyota Camry, Honda Civic, Vios, Corolla Altis):
-    # Secara fisik, mobil dengan aspect ratio rendah (<= 0.68) memiliki roofline rendah -> TIDAK MUNGKIN SUV / MPV!
-    if aspect <= 0.68:
-        if p_hatch >= 0.55 and w_ratio < 0.35:
-            return 'car', 'Hatchback', round(p_hatch, 3)
-        score_sedan = max(0.88, p_sedan + p_suv * 0.5 + p_fastback * 0.5)
+    # B. Sedan / Fastback (Mercedes-Benz C/E-Class, Camry, Civic, Vios, Altis)
+    p_sedan_total = p_sedan + (p_fastback * 0.95) + (p_conv * 0.75)
+    if p_sedan_total >= 0.40 and (p_sedan >= 0.25 or p_fastback >= 0.30 or (p_fastback + p_conv >= 0.50)):
+        score_sedan = max(0.88, p_sedan_total)
         return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
 
-    # B. Microcar / City Car / Compact Hatchback (seperti Wuling Air EV):
-    # Ciri: Bodi kompak sempit tanpa wagon (p_wagon < 0.05), tanpa bagasi sedan (p_sedan < 0.08),
-    # dan aspek rasio tinggi kompak
+    # C. Microcar / City Car Hatchback (Wuling Air EV, Brio)
     is_micro_hatch = (
-        p_wagon < 0.05 and p_mpv_total < 0.18 and p_sedan < 0.08 and p_minibus < 0.15 and
+        p_wagon < 0.05 and p_sedan < 0.08 and p_minibus < 0.15 and
         (
-            (aspect >= 0.88 and (p_sports + p_fastback + p_hatch) >= 0.35) or
-            (p_hatch >= 0.25)
+            (aspect >= 0.88 and (p_sports + p_fastback + p_hatch) >= 0.35 and w_ratio < 0.45) or
+            (p_hatch >= 0.35 and aspect < 0.88)
         )
     )
     if is_micro_hatch:
-        score_hatch = max(0.88, p_hatch + p_sports * 0.5 + p_fastback * 0.3)
+        score_hatch = max(0.88, p_hatch + p_sports * 0.5)
         return 'car', 'Hatchback', round(min(0.99, score_hatch), 3)
 
-    # C. Ladder-frame SUV / Tall SUV (Toyota Fortuner, Mitsubishi Pajero Sport, Triton Double Cab, Daihatsu Rocky, dsb):
-    is_tall_suv = aspect >= 0.70 and ((p_pickup >= 0.20) or (p_suv >= 0.35) or (p_suv + p_crossover + p_pickup >= 0.30 and p_hatch < 0.15 and p_wagon < 0.15))
-    if is_tall_suv:
-        score_suv = max(0.85, p_suv + p_crossover + p_pickup)
-        return 'car', 'SUV', round(min(0.99, score_suv), 3)
-
-    # D. MPV / Tall Wagon / Luxury Box Van (Toyota Alphard, Vellfire, Serena, Innova, Avanza, Xenia, Ertiga):
-    # Karakteristik: Bodi tinggi jangkung (aspect >= 0.75) dengan sinyal wagon / mpv / sports hardtop roofline
-    is_mpv_box = (
-        p_mpv >= 0.18 or
-        (aspect >= 0.75 and (
-            p_wagon >= 0.08 or
-            p_mpv >= 0.05 or
-            (p_wagon + p_mpv + p_sports >= 0.40 and p_sedan < 0.25)
-        ))
+    # D. Tall MPV / Minivan (Toyota Sienta, Alphard, Innova, Avanza, Calya, Sigra)
+    # Sienta dan minivan kompak memiliki bodi jangkung (aspect >= 0.88 dan w_ratio >= 0.45)
+    is_tall_mpv = (
+        p_mpv >= 0.25 or
+        (p_wagon >= 0.20 and aspect >= 0.72) or
+        (aspect >= 0.88 and w_ratio >= 0.45 and (p_hatch >= 0.50 or p_wagon >= 0.10 or p_mpv >= 0.05))
     )
-    if is_mpv_box:
-        score_mpv = max(0.88, p_mpv + (p_wagon * 0.7) + (p_sports * 0.35))
+    if is_tall_mpv:
+        score_mpv = max(0.88, p_mpv + (p_wagon * 0.7) + (p_hatch * 0.3 if aspect >= 0.88 else 0.0))
         return 'car', 'MPV', round(min(0.99, score_mpv), 3)
 
-    # E. Sedan / Fastback (seperti Wuling Starlight, Honda Civic Fastback, Hyundai Ioniq):
-    if aspect < 0.92 and p_fastback >= 0.40 and p_fastback > p_minibus and p_mpv < 0.15:
-        score_sedan = max(0.85, p_sedan + p_fastback)
-        return 'car', 'Sedan', round(min(0.99, score_sedan), 3)
+    # E. Sporty Crossover / EV SUV (seperti BMW iX, di mana p_sports sangat tinggi dan bodi jangkung aspect >= 0.75)
+    if p_sports >= 0.45 and aspect >= 0.75 and p_sedan_total < 0.25:
+        return 'car', 'SUV', round(max(0.88, p_sports), 3)
 
-    # F. Sedan tampak depan (grille horizontal lebar sering dikira minibus):
-    if p_minibus >= 0.45 and aspect <= 0.82 and not (area_ratio >= 0.35 or w_ratio >= 0.65):
-        if (p_pickup + p_suv) < 0.20 and p_mpv < 0.20:
-            return 'car', 'Sedan', round(max(0.88, p_minibus), 3)
+    # F. Sistem Skor Tertimbang Multikelas
+    score_suv = p_suv + p_crossover + (p_pickup * 0.8) + (p_sports * 0.3 if aspect >= 0.75 else 0.0)
+    score_sedan = p_sedan + (p_fastback * 0.9) + (p_conv * 0.7)
+    score_mpv = p_mpv + (p_wagon * 0.8) + (p_minibus * 0.6)
+    score_hatch = p_hatch + (p_wagon * 0.2)
 
-    # G. Sistem Skor Terkalibrasi (HANYA 4 KELAS MOBIL: SUV, MPV, Sedan, Hatchback)
-    p_roof = p_sports + p_conv
-
-    # SUV:
-    score_suv = p_suv + p_crossover + p_pickup
-    if aspect >= 0.75 and (p_suv + p_crossover + p_pickup) >= 0.15:
-        score_suv += (p_roof * 0.35)
-
-    # MPV:
-    score_mpv = p_mpv + (p_wagon * 0.6) + (p_minibus * 0.7)
-    if aspect >= 0.75:
-        score_mpv += (p_fastback * 0.3) + (p_roof * 0.25)
-
-    # Sedan:
-    if aspect <= 0.80:
-        score_sedan = p_sedan + (p_fastback * 0.85) + (p_sports * 0.4) + (p_conv * 0.4)
-    else:
-        # Bodi tinggi tidak mungkin sedan
-        score_sedan = (p_sedan * 0.3) + (p_fastback * 0.2)
-
-    # Hatchback:
-    score_hatch = p_hatch + (p_wagon * 0.3)
-    if aspect <= 0.82:
-        score_hatch += (p_sports * 0.3)
-
-    scores = {
-        'SUV': score_suv,
-        'MPV': score_mpv,
-        'Sedan': score_sedan,
-        'Hatchback': score_hatch
-    }
-
+    scores = {'SUV': score_suv, 'MPV': score_mpv, 'Sedan': score_sedan, 'Hatchback': score_hatch}
     best_cat = max(scores.items(), key=lambda kv: kv[1])[0]
-    best_val = scores[best_cat]
-    tot_score = max(0.01, sum(scores.values()))
-    norm_conf = min(0.99, max(0.55, best_val / tot_score))
-
-    return 'car', best_cat, round(norm_conf, 3)
+    return 'car', best_cat, round(min(0.99, max(0.60, scores[best_cat])), 3)
 
 
 def map_indonesian_body_style(probs_dict, bbox, img_shape):
@@ -1841,7 +1796,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     if is_valid_plate_box(abs_box, iw, ih):
                         valid_crops.append((abs_box, float(b.conf[0])))
                 if not valid_crops:
-                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=min(p_conf_thresh, 0.08), imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                     for b in pdet_legacy.boxes:
                         cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                         abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
