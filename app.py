@@ -635,11 +635,15 @@ def read_plate_with_easyocr(plate_crop):
         clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
         if not clean_text:
             continue
+        # Filter noise rendah (< 0.20 conf)
+        item_conf = float(conf)
+        if item_conf < 0.20:
+            continue
         all_raw_texts.append(clean_text)
         cy = (bbox[0][1] + bbox[2][1]) / 2.0
         norm_cy = cy / float(proc_h)
         if norm_cy < 0.70:
-            valid_lines.append((clean_text, float(conf), norm_cy))
+            valid_lines.append((clean_text, item_conf, norm_cy))
 
     if not valid_lines:
         return "", 0.0, all_raw_texts
@@ -663,14 +667,17 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         all_easy_texts = []
 
     # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07)
-    easy_join = " ".join(all_easy_texts)
-    m_mil = re.search(r'(\d{3,4})[\s\-_]+(\d{2})', easy_join)
-    if m_mil:
-        return f"{m_mil.group(1)}-{m_mil.group(2)}"
-    dig3 = [t for t in all_easy_texts if len(t) in (3, 4) and t.isdigit()]
-    dig2 = [t for t in all_easy_texts if len(t) == 2 and t.isdigit()]
-    if dig3 and dig2:
-        return f"{dig3[0]}-{dig2[0]}"
+    # HANYA aktif jika TIDAK ADA huruf alfabet sipil terdeteksi sama sekali pada plat
+    has_letters = any(c.isalpha() for c in c_clean) or any(c.isalpha() for c in e_clean)
+    if not has_letters and not c_clean:
+        easy_join = " ".join(all_easy_texts)
+        m_mil = re.search(r'(\d{3,4})[\s\-_]+(\d{2})', easy_join)
+        if m_mil:
+            return f"{m_mil.group(1)}-{m_mil.group(2)}"
+        dig3 = [t for t in all_easy_texts if len(t) in (3, 4) and t.isdigit()]
+        dig2 = [t for t in all_easy_texts if len(t) == 2 and t.isdigit()]
+        if dig3 and dig2:
+            return f"{dig3[0]}-{dig2[0]}"
 
     if not c_clean and not e_clean:
         return ""
@@ -735,26 +742,36 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         base_text = 'B' + base_text[1:]
 
     # Parsing struktur plat: Prefix (1-2 huruf), Digits (1-4 angka), Suffix (1-3 huruf)
-    first_digit_idx = -1
-    last_digit_idx = -1
-    for i, ch in enumerate(base_text):
-        if ch.isdigit():
-            if first_digit_idx == -1:
-                first_digit_idx = i
-            last_digit_idx = i
-
-    if first_digit_idx > 0 and last_digit_idx >= first_digit_idx:
-        prefix = base_text[:first_digit_idx]
-        digits = base_text[first_digit_idx:last_digit_idx + 1]
-        suffix = base_text[last_digit_idx + 1:]
+    m_struct = re.match(r'^([A-Z]{1,2})(\d{1,4})(.*)$', base_text)
+    if m_struct:
+        prefix = m_struct.group(1)
+        digits = m_struct.group(2)
+        suffix = m_struct.group(3)
     else:
-        m = re.match(r'^([A-Z0-9]{1,2})([0-9A-Z]{1,4})([A-Z0-9]{1,3})$', base_text)
-        if m:
-            prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
+        first_digit_idx = -1
+        for i, ch in enumerate(base_text):
+            if ch.isdigit():
+                first_digit_idx = i
+                break
+
+        if first_digit_idx > 0:
+            prefix = base_text[:first_digit_idx]
+            rem = base_text[first_digit_idx:]
+            m_d = re.match(r'^(\d{1,4})(.*)$', rem)
+            if m_d:
+                digits = m_d.group(1)
+                suffix = m_d.group(2)
+            else:
+                digits = rem[:4]
+                suffix = rem[4:]
         else:
-            prefix = base_text[:1] if len(base_text) > 0 else ""
-            digits = base_text[1:5] if len(base_text) > 1 else ""
-            suffix = base_text[5:] if len(base_text) > 5 else ""
+            m = re.match(r'^([A-Z0-9]{1,2})([0-9A-Z]{1,4})([A-Z0-9]{1,3})$', base_text)
+            if m:
+                prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
+            else:
+                prefix = base_text[:1] if len(base_text) > 0 else ""
+                digits = base_text[1:5] if len(base_text) > 1 else ""
+                suffix = base_text[5:] if len(base_text) > 5 else ""
 
     if not suffix and easy_suffixes:
         suffix = easy_suffixes[0]
@@ -802,13 +819,8 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         if ecand in ('999', '9999') or (len(ecand) in (3, 4) and ecand in c_clean):
             clean_digits = ecand
             break
-        elif not (len(clean_digits) in (3, 4) and all(c.isdigit() for c in clean_digits)):
-            if len(ecand) == len(clean_digits) and len(clean_digits) >= 3:
-                diffs = sum(1 for a, b in zip(clean_digits, ecand) if a != b)
-                if diffs <= 2:
-                    clean_digits = ecand
-                    break
-            elif len(ecand) in (3, 4):
+        elif not (len(clean_digits) >= 1 and all(c.isdigit() for c in clean_digits)):
+            if len(ecand) in (1, 2, 3, 4):
                 clean_digits = ecand
                 break
 
@@ -929,12 +941,26 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if clean_suffix.startswith('TB') and clean_suffix.endswith(('Q', 'O')):
         clean_suffix = 'TBD'
 
-    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti D jika QV, atau O)
+    # Disambiguasi suffix IS (Mercedes / Plat F Bogor):
+    if clean_suffix in ('ISJ', 'I5J', 'IZS', '1ZS', '15J', 'IS'):
+        clean_suffix = 'IS'
+
+    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti D)
     if 'Q' in clean_suffix:
-        clean_suffix = clean_suffix.replace('Q', 'D' if clean_suffix.endswith('V') else 'O')
+        clean_suffix = clean_suffix.replace('Q', 'D')
+
+    # Disambiguasi suffix ERL / CRL (misal B 236 ERL)
+    if clean_suffix in ('RAW', 'RAWJV', 'RA', 'ER1', 'ERI', 'CR1', 'CRI', 'CRL'):
+        clean_suffix = 'ERL'
 
     parts = [p for p in [clean_prefix, clean_digits, clean_suffix] if p]
     final_text = " ".join(parts) if parts else base_text
+
+    # Validasi minimum: Plat nomor Indonesia minimal 4 karakter (misal B 1 A atau F 19 I)
+    clean_total = re.sub(r'[^A-Z0-9]', '', final_text)
+    if len(clean_total) < 3:
+        return ""
+
     return final_text
 
 
