@@ -1228,8 +1228,14 @@ async function performDetectCycle(silent=true){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+        // Cap resolusi maksimum ke 1280px agar transfer JPEG kilat (<20ms) dengan detail plat tetap tajam
+        const maxDim = 1280;
+        let scale = 1.0;
+        if (video.videoWidth > maxDim) {
+          scale = maxDim / video.videoWidth;
+        }
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
@@ -1252,7 +1258,7 @@ async function performDetectCycle(silent=true){
             } finally {
               resolve();
             }
-          }, 'image/jpeg', 0.85);
+          }, 'image/jpeg', 0.80);
         });
       }
     }
