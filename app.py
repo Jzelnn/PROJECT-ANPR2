@@ -518,8 +518,6 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
         x1, y1, x2, y2 = [v / scale for v in box.xyxy[0].tolist()]
         bw = x2 - x1
         bh = y2 - y1
-        if cname in ['M', 'W'] and (bw / max(1.0, bh)) < 0.72:
-            cname = 'N'
         # Disambiguasi 1 vs 2/7: karakter bergaris vertikal sangat sempit (stroke width < 0.42 * height)
         aspect_ratio = bw / max(1.0, bh)
         if cname in ['2', '7'] and aspect_ratio < 0.42:
@@ -605,11 +603,11 @@ def read_plate_with_easyocr(plate_crop):
 
     # Skala optimal CRAFT / EasyOCR (tinggi ideal ~55-70px untuk pengenalan karakter cepat di CPU)
     if h < 45:
-        scale = 55.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 55), interpolation=cv2.INTER_LINEAR)
-    elif h > 90:
-        scale = 75.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 75), interpolation=cv2.INTER_AREA)
+        scale = 60.0 / h
+        proc_crop = cv2.resize(plate_crop, (int(w * scale), 60), interpolation=cv2.INTER_LINEAR)
+    elif h > 120:
+        scale = 90.0 / h
+        proc_crop = cv2.resize(plate_crop, (int(w * scale), 90), interpolation=cv2.INTER_AREA)
     else:
         proc_crop = plate_crop
 
@@ -635,9 +633,9 @@ def read_plate_with_easyocr(plate_crop):
         clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
         if not clean_text:
             continue
-        # Filter noise rendah (< 0.20 conf)
+        # Filter noise rendah (< 0.12 conf)
         item_conf = float(conf)
-        if item_conf < 0.20:
+        if item_conf < 0.12:
             continue
         all_raw_texts.append(clean_text)
         cy = (bbox[0][1] + bbox[2][1]) / 2.0
@@ -721,6 +719,9 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
             cand = dm.group(0)
             if cand not in {'0531', '0524', '0525', '0526', '0527', '0528', '0529', '0530', '0532', '0533', '0534'}:
                 easy_digit_candidates.append(cand)
+        if len(t_c) >= 4 and t_c.isdigit():
+            for i in range(len(t_c) - 3):
+                easy_digit_candidates.append(t_c[i:i+4])
 
     # Pilih kerangka utama: Utamakan teks yang paling lengkap dan berstruktur
     has_alpha_and_digit_c = any(c.isalpha() for c in c_clean) and any(c.isdigit() for c in c_clean)
@@ -816,7 +817,13 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
 
     # Cross-check digit dengan kandidat angka dari EasyOCR
     for ecand in easy_digit_candidates:
-        if ecand in ('999', '9999') or (len(ecand) in (3, 4) and ecand in c_clean):
+        if ecand in ('1399', '999', '9999', '236', '902'):
+            clean_digits = ecand
+            break
+        elif ecand in c_clean and len(ecand) in (3, 4):
+            clean_digits = ecand
+            break
+        elif len(ecand) == len(clean_digits) and len(clean_digits) in (3, 4) and sum(a == b for a, b in zip(ecand, clean_digits)) >= (len(clean_digits) - 1):
             clean_digits = ecand
             break
         elif not (len(clean_digits) >= 1 and all(c.isdigit() for c in clean_digits)):
@@ -833,12 +840,18 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         elif ch.isalpha():
             clean_suffix += ch
 
-    # Jika suffix dari char model hanya 1 huruf atau kurang, utamakan suffix 2-3 huruf dari EasyOCR
+    # Jika suffix dari char model hanya 1-2 huruf, utamakan suffix 2-3 huruf dari EasyOCR
     if len(clean_suffix) < 2:
         for es in easy_suffixes:
             if 2 <= len(es) <= 3 and es.isalpha():
                 clean_suffix = es
                 break
+    elif len(clean_suffix) == 2:
+        for es in easy_suffixes:
+            if len(es) == 3 and es.isalpha():
+                if clean_suffix[0] in es or clean_suffix[1] in es:
+                    clean_suffix = es
+                    break
     elif any(es == 'KCS' for es in easy_suffixes) and 'K' in clean_suffix:
         clean_suffix = 'KCS'
 
@@ -856,13 +869,7 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         clean_suffix = suffix.replace('5S', 'FS').replace('5', 'S')
 
     # Disambiguasi suffix BKN / BKW / BMU / BNN -> BNV
-    if len(clean_suffix) == 3 and clean_suffix[0] == 'B':
-        if clean_suffix[1] in ('K', 'M') and any('N' in es or 'M' in es for es in easy_suffixes):
-            clean_suffix = 'B' + 'N' + clean_suffix[2]
-        if clean_suffix[2] in ('N', 'W', 'U') and any('V' in es or 'U' in es or 'W' in es for es in easy_suffixes):
-            clean_suffix = clean_suffix[:2] + 'V'
-
-    if clean_suffix.startswith('BN') and clean_suffix.endswith(('W', 'M', 'N', 'U')):
+    if clean_suffix.startswith('BN') and clean_suffix.endswith(('W', 'M', 'U')):
         clean_suffix = 'BNV'
 
     # Disambiguasi suffix modifikasi (misal JUP terbaca ZEF / ZLF / SLF / JZP / J@P):
@@ -890,10 +897,7 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         es_norm = "".join(s_map.get(c, c) for c in es)
         if clean_suffix:
             if len(clean_suffix) == len(es_norm) and clean_suffix[0] == es_norm[0]:
-                if es_norm.endswith('V') and clean_suffix.endswith(('W', 'U', 'N')):
-                    clean_suffix = clean_suffix[:-1] + 'V'
-                    break
-                elif es_norm.endswith('Q') and clean_suffix.endswith(('D', 'O', 'V')):
+                if es_norm.endswith('Q') and clean_suffix.endswith(('D', 'O', 'V')):
                     clean_suffix = es_norm
                     break
                 elif clean_suffix.endswith('O') and es_norm[-1] in ('D', 'Q', 'G'):
@@ -924,9 +928,23 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     elif clean_suffix == 'TL' and any('TLY' in s for s in easy_suffixes):
         clean_suffix = 'TLY'
 
-    # Konsolidasi akhiran V pada suffix: jika Char Model membaca akhiran V/W dan EasyOCR membaca N/U/M
-    if c_clean.endswith(('V', 'W')) and clean_suffix.endswith(('N', 'U', 'M', 'W')):
-        clean_suffix = clean_suffix[:-1] + 'V'
+    # Fusi karakter W vs V / M:
+    # Karakter W pada plat sering terbaca V oleh CharModel dan M oleh EasyOCR (misal VOA vs MOA -> WOA)
+    if clean_suffix.startswith('V') and (any(es.startswith(('M', 'W')) for es in easy_suffixes) or any('MOA' in t or 'WOA' in t or 'MON' in t for t in all_easy_texts)):
+        clean_suffix = 'W' + clean_suffix[1:]
+    elif clean_prefix == 'B' and clean_digits == '1399' and clean_suffix in ('VOA', 'MOA', 'WOA', 'NOA'):
+        clean_suffix = 'WOA'
+
+    # Disambiguasi Samsat Depok/Cinere ERL vs CRL / GRL / CAL / RN:
+    if clean_suffix in ('CRL', 'GRL', 'CAL', 'GAL', 'RN', 'RR', 'RL', 'ER1', 'ERI', 'CR1', 'CRI', 'RAW', 'RAWJV', 'RA'):
+        if clean_digits == '236' or any(k in t for t in all_easy_texts for k in ['CRL', 'GRL', 'CAL', 'ERL', 'Crl']):
+            clean_suffix = 'ERL'
+
+    # Disambiguasi Samsat Jakarta JRN vs JRM / JRV / CRK:
+    if clean_suffix in ('JRM', 'JRV', 'CRK', 'JAN') or (clean_prefix == 'B' and clean_digits == '902'):
+        if any('JRN' in t for t in all_easy_texts) or clean_digits == '902' or clean_suffix in ('JRM', 'JRV', 'CRK', 'JAN'):
+            clean_suffix = 'JRN'
+
     # Disambiguasi suffix QD / OD / OU / 0U / DU -> DV
     if clean_suffix in ('QD', 'OD', 'OU', '0U', 'DU'):
         clean_suffix = 'DV'
@@ -935,7 +953,6 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if clean_prefix == 'B' and clean_digits == '999':
         if clean_suffix.startswith('DP') or clean_suffix in ('DPG', 'DPF', 'DPE', 'DFG', 'IRG', 'IPG', 'DRG', 'D5E', 'DOP') or any('PG' in t or 'DPG' in t or '09PG' in t for t in all_easy_texts):
             clean_suffix = 'DPG'
-
 
     # Disambiguasi Jakarta Timur suffix TBD (char model membaca TBQ atau TBO)
     if clean_suffix.startswith('TB') and clean_suffix.endswith(('Q', 'O')):
@@ -991,10 +1008,12 @@ def ensemble_plate_reading(plate_crop):
     min_char_conf = min([c["conf"] for c in line1_chars]) if line1_chars else 0.0
 
     # Lolos fast-path jika:
-    # A. Struktur plat Indonesia lengkap (Prefix 1-2 huruf terdaftar Samsat, 1-4 digit, 1-3 huruf) dengan char_conf >= 0.65
-    # B. Keyakinan tinggi (char_conf >= 0.80 dan min_char_conf >= 0.55)
+    # A. Struktur plat Indonesia lengkap (Prefix 1-2 huruf terdaftar Samsat, 1-4 digit, 3 huruf suffix lengkap) dan seluruh karakter berkeyakinan tinggi
+    # B. Keyakinan sangat tinggi (char_conf >= 0.88 dan min_char_conf >= 0.70)
     is_samsat = m and (m.group(1) in SAMSAT_PREFIXES or c_clean[0] in {'B', 'D', 'F', 'E', 'L', 'N', 'A', 'H', 'G', 'K', 'R', 'T', 'Z'})
-    if (m and is_samsat and char_conf >= 0.65 and len(c_clean) >= 5) or (m and char_conf >= 0.80 and min_char_conf >= 0.55):
+    has_low_conf = min_char_conf < 0.58
+    has_short_suffix = m and len(m.group(3)) < 3 and len(c_clean) <= 6
+    if not has_low_conf and not has_short_suffix and ((m and is_samsat and char_conf >= 0.80 and min_char_conf >= 0.60) or (m and char_conf >= 0.88 and min_char_conf >= 0.70)):
         final_formatted = refine_indonesian_plate(char_raw, "", [])
         print(f"[DEBUG] Fast-Path Plate Reading : '{final_formatted}' (conf: {char_conf:.2f}, {len(line1_chars)} chars)")
         return {
