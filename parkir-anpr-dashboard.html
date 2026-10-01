@@ -1301,7 +1301,7 @@ function handleDetectionResult(data, silent=false){
       showToast(`Entry Confirmed: ${trackText}${plateShow}${timeMs}`);
     } else if (!silent){
       const trackText = det.track_id ? `[#${det.track_id}] ` : '';
-      const maxF = det.analyzing_max_frames || 2;
+      const maxF = det.analyzing_max_frames || 3;
       const statusText = det.status === 'ANALYZING' ? `Analyzing (${det.analyzing_frame_count || 1}/${maxF})...` : 'Tracked';
       showToast(`${trackText}${plateShow} - ${statusText}${timeMs}`);
     }
@@ -1377,8 +1377,12 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     lastDetectionData = det;
     drawBoxes(det);
     updateResultCard(det, detMs);
-    addLogRow(det);
-    showToast("Photo processed & recorded successfully!");
+    if (det.is_newly_confirmed) {
+      addLogRow(det);
+      showToast("Photo processed & recorded to Entry History!");
+    } else {
+      showToast("Photo processed: plate confidence too low (<80%) to record in Entry History.");
+    }
 
   } catch (err) {
     alert("Failed to connect to backend app.py.\n\n" + err.message);
@@ -1507,7 +1511,7 @@ function drawBoxes(det){
 
       const isConfirmed = det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
       const trackPrefix = det.track_id ? `[#${det.track_id}] ` : '';
-      const maxF = det.analyzing_max_frames || 2;
+      const maxF = det.analyzing_max_frames || 3;
       const statusBadge = isConfirmed ? 'CONFIRMED' : `ANALYZING (${det.analyzing_frame_count || 1}/${maxF})`;
       const baseLabel = det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type;
       const consistencyTxt = det.consistency ? ` • ${Math.round(det.consistency * 100)}%` : '';
@@ -1595,7 +1599,7 @@ function updateResultCard(det, detMs){
       tagStatus.style.background = '#eff6ff';
       tagStatus.style.color = '#1d4ed8';
       tagStatus.style.borderColor = '#bfdbfe';
-      const maxF = det.analyzing_max_frames || 2;
+      const maxF = det.analyzing_max_frames || 3;
       tagStatus.textContent = `ANALYZING (${det.analyzing_frame_count || 1}/${maxF})`;
     }
   }
@@ -1631,10 +1635,15 @@ function updateResultCard(det, detMs){
 // PERSISTENT ENTRY HISTORY (LOAD & SAVE)
 // ============================================================
 function addLogRow(det, isInit=false){
+  if (!isInit && det.track_id) {
+    const existing = document.querySelector(`.log-row[data-track-id="${det.track_id}"]`);
+    if (existing) return;
+  }
   const now = new Date();
   const timeStr = det.timestamp ? det.timestamp.slice(11, 16) : now.toTimeString().slice(0,5);
   const row = document.createElement('div');
   row.className = 'log-row';
+  if (det.track_id) row.setAttribute('data-track-id', det.track_id);
   const ms = det.latency_ms;
   const latText = ms ? ` <span style="font-size:11px; color:#10b981; font-weight:600;">(${ms}ms)</span>` : '';
   const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';

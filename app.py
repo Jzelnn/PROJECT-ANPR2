@@ -9,7 +9,7 @@ import csv
 import base64
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from collections import deque, Counter
 import requests
 from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 from urllib.parse import urlparse
@@ -54,11 +54,11 @@ DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = False  # Keep false on CPU to prevent warnings
 
 # Fast Temporal Confirmation Configuration
-MIN_OBSERVATIONS = 2
-MAX_OBSERVATIONS = 3
-TEMPORAL_WINDOW_SEC = 0.25  # 150-250 ms max window
-CONSISTENCY_THRESH = 0.70   # 70%
-CONFIRM_CONF_THRESH = 0.80  # 80-85% for early confirmation at Frame 2
+MIN_OBSERVATIONS = 3
+MAX_OBSERVATIONS = 5
+TEMPORAL_WINDOW_SEC = 0.50
+CONSISTENCY_THRESH = 0.70
+CONFIRM_CONF_THRESH = 0.80
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -66,26 +66,42 @@ CONFIRM_CONF_THRESH = 0.80  # 80-85% for early confirmation at Frame 2
 # ============================================================
 LATEST_RECORDS = deque(maxlen=300)
 LAST_RECORDED_PLATES = {}  # {safe_plate: {"time": float, "rec": dict}}
-GATE_COOLDOWN_SEC = 3.0
+GATE_COOLDOWN_SEC = 15.0
 
 
 def save_parking_record(det, source_img=None, source_img_path=None):
-    """Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms) dengan Anti-Passback Cooldown (3s)."""
+    """
+    Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms).
+    Persyaratan ketat Entry History:
+    - Plat harus valid (format nomor polisi Indonesia atau militer)
+    - Confidence plat minimal 80% (>= 0.80)
+    - Anti-Passback Gate Cooldown (15 detik) untuk mencegah duplikasi catatan.
+    """
     global LATEST_RECORDS, LAST_RECORDED_PLATES
+
+    plate_text = det.get("license_plate")
+    if not plate_text or plate_text in ["TIDAK_TERBACA", "UNKNOWN", ""]:
+        return None
+
+    if not isinstance(plate_text, str):
+        plate_text = str(plate_text)
+    safe_plate = re.sub(r'[^A-Za-z0-9]', '', plate_text)
+    if len(safe_plate) < 4 and '-' not in plate_text:
+        return None
+
+    plate_conf = det.get("plate_confidence", 0.0) or 0.0
+    if plate_conf < 0.80:
+        return None
+
     now = datetime.datetime.now()
     now_epoch = time.time()
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     file_ts = now.strftime("%Y%m%d_%H%M%S_%f")[:19]
 
-    plate_text = det.get("license_plate") or "TIDAK_TERBACA"
-    if not isinstance(plate_text, str):
-        plate_text = str(plate_text)
-    safe_plate = re.sub(r'[^A-Za-z0-9]', '', plate_text) or "UNKNOWN"
-
     track_id = det.get("track_id")
 
-    # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 3 detik lalu, gunakan record yang ada
-    if safe_plate != "UNKNOWN" and safe_plate in LAST_RECORDED_PLATES:
+    # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 15 detik lalu, gunakan record yang ada
+    if safe_plate in LAST_RECORDED_PLATES:
         last_entry = LAST_RECORDED_PLATES[safe_plate]
         if (now_epoch - last_entry["time"]) < GATE_COOLDOWN_SEC:
             return last_entry["rec"]
@@ -101,16 +117,14 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     except Exception:
         snapshot_filename = None
 
-    conf_val = det.get("plate_confidence") or det.get("body_style_confidence") or det.get("vehicle_confidence") or 0.0
-
     rec = {
         "id": int(now_epoch * 1000) % 1000000,
         "track_id": track_id,
         "timestamp": timestamp_str,
-        "license_plate": det.get("license_plate"),
+        "license_plate": plate_text,
         "vehicle_type": det.get("vehicle_type"),
         "body_style": det.get("body_style"),
-        "confidence": round(conf_val, 3) if conf_val else None,
+        "confidence": round(plate_conf, 3),
         "consistency": det.get("consistency", 1.0),
         "status": "CONFIRMED",
         "latency_ms": det.get("latency_ms"),
@@ -119,8 +133,7 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
     # Simpan langsung ke RAM (0 milidetik, tanpa overhead disk I/O)
     LATEST_RECORDS.appendleft(rec)
-    if safe_plate != "UNKNOWN":
-        LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": rec}
+    LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": rec}
     return rec
 
 
@@ -1314,24 +1327,29 @@ def get_front_of_camera_score(cand, plates, img_w, img_h):
 
 
 # ============================================================
+# ============================================================
 # FAST TEMPORAL CONFIRMATION & VEHICLE TRACKING (OPTIMIZED)
-# 2-3 frame buffer (150-250ms) with early confirmation & deferred OCR.
-# Guarantees exactly ONE confirmed record per vehicle in Entry History.
+# Syarat konfirmasi Entry History:
+# - Minimal 3 observasi plat yang cocok dengan confidence >= 80% dalam 5 observasi valid terakhir.
+# - Memprioritaskan kecocokan berurutan (consecutive matches) ketika tersedia.
+# - Mentolerir short gaps dari frame terlewat/low-confidence.
+# - Mengunci data plat setelah terkonfirmasi (1x record, bebas duplikasi).
 # ============================================================
 class VehicleTrack:
     """
-    Melacak dan mengonfirmasi kendaraan secara temporal cepat (2-3 frame / 150-250ms).
-    State Machine: DETECTED -> ANALYZING -> CONFIRMED -> HISTORY_SAVED
+    Melacak dan mengonfirmasi kendaraan secara temporal stabil.
+    State Machine: ANALYZING -> CONFIRMED -> HISTORY_SAVED
     """
     def __init__(self, track_id, initial_det=None):
         self.track_id = track_id
         self.created_at = time.time()
         self.last_seen = time.time()
-        self.frames = deque(maxlen=MAX_OBSERVATIONS)
-        self.status = "DETECTED"  # DETECTED, ANALYZING, CONFIRMED, HISTORY_SAVED
+        self.frames = deque(maxlen=15)
+        self.status = "ANALYZING"  # Awalnya selalu ANALYZING (temporary detection)
         self.confirmed_data = None
         self.confirmation_score = 0.0
         self.history_saved = False
+        self.is_locked = False
         self.last_bbox = None
         # Cache body style to avoid re-classifying every frame
         self.cached_body_style = None
@@ -1341,6 +1359,12 @@ class VehicleTrack:
         self.best_crop_quality = -1.0
         self.best_plate_conf = 0.0
         self.plate_readings = []
+
+        # Stability tracking (3 matching out of latest 5 valid observations, preferring consecutive)
+        self.consecutive_plate = ""
+        self.consecutive_count = 0
+        self.valid_plate_observations = deque(maxlen=10)
+
         if initial_det:
             self.add_frame(initial_det)
 
@@ -1351,7 +1375,7 @@ class VehicleTrack:
         p_conf = det.get("plate_confidence", 0.0) or 0.0
         p_text = det.get("license_plate")
 
-        # 1. Update best_plate_crop menggunakan metrik Crop Quality (Sharpness & Resolusi saat mobil mendekat)
+        # 1. Update best_plate_crop menggunakan metrik Crop Quality
         if p_crop is not None and getattr(p_crop, 'size', 0) > 0:
             quality = compute_crop_quality(p_crop, p_conf)
             if quality > self.best_crop_quality:
@@ -1359,17 +1383,37 @@ class VehicleTrack:
                 self.best_crop_quality = quality
                 self.best_plate_conf = p_conf
 
-        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan untuk Temporal Consensus
+        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan
+        p_clean = ""
+        is_valid_high_conf = False
         if p_text and p_text != "TIDAK_TERBACA":
             p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper())
-            if len(p_clean) >= 4:
-                self.plate_readings.append({
-                    "text": p_text,
-                    "clean": p_clean,
-                    "conf": p_conf or 0.75,
-                    "quality": getattr(self, 'best_crop_quality', 1.0),
-                    "time": self.last_seen
-                })
+            # Format Indonesia (>= 4 karakter atau format dinas/militer dengan '-')
+            if (len(p_clean) >= 4 or '-' in p_text) and p_conf >= 0.80:
+                is_valid_high_conf = True
+
+        if is_valid_high_conf:
+            obs = {
+                "text": p_text,
+                "clean": p_clean,
+                "conf": p_conf,
+                "time": self.last_seen
+            }
+            self.valid_plate_observations.append(obs)
+            self.plate_readings.append(obs)
+
+            # Prefer consecutive matches:
+            if p_clean == self.consecutive_plate:
+                self.consecutive_count += 1
+            else:
+                self.consecutive_plate = p_clean
+                self.consecutive_count = 1
+        else:
+            # Low-confidence (<80%) atau frame terlewat/buram:
+            # Reset streak berurutan, namun valid_plate_observations tetap tersimpan
+            # agar mentolerir short gaps.
+            self.consecutive_plate = ""
+            self.consecutive_count = 0
 
         self.frames.append({
             "time": self.last_seen,
@@ -1377,7 +1421,7 @@ class VehicleTrack:
             "v_conf": det.get("vehicle_confidence", 0.0) or 0.0,
             "body_style": det.get("body_style"),
             "body_conf": det.get("body_style_confidence", 0.0) or 0.0,
-            "license_plate": det.get("license_plate"),
+            "license_plate": p_text,
             "plate_conf": p_conf,
             "plate_crop": p_crop,
             "bbox": det.get("bbox"),
@@ -1385,49 +1429,49 @@ class VehicleTrack:
             "ocr_method": det.get("ocr_method")
         })
 
-        if self.status in ["CONFIRMED", "HISTORY_SAVED"]:
+        # Jika sudah terkonfirmasi dan tersimpan di Entry History, kunci!
+        if self.status in ["CONFIRMED", "HISTORY_SAVED"] or self.history_saved or self.is_locked:
             return
 
-        if len(self.frames) >= 1:
-            self.status = "ANALYZING"
-
+        self.status = "ANALYZING"
         self._evaluate_confirmation()
 
     def _evaluate_confirmation(self):
-        n = len(self.frames)
-
-        # 1. INSTANT PLATE-ASSISTED FAST CONFIRMATION (< 0.6s):
-        # Jika plat nomor sudah terdeteksi dan terbaca valid (>= 4 karakter atau format dinas/militer), langsung konfirmasi instan!
-        valid_plates = [r for r in self.plate_readings if len(r["clean"]) >= 4 or '-' in r.get("text", "")]
-        if valid_plates:
-            self._finalize_confirmation(reason="instant_plate_assisted_confirmation")
+        # Membutuhkan minimal 3 observasi valid
+        if len(self.valid_plate_observations) < 3:
             return
 
-        if n < MIN_OBSERVATIONS:
-            return
+        stable_plate = None
+        stable_conf = 0.0
+        matching_count = 0
 
-        # 2. EARLY CONFIRMATION UNTUK KENDARAAN DI DEPAN KAMERA (GATE ZONE):
-        # Jika mobil belum terbaca platnya tapi sudah berada di area dekat kamera (bawah frame / ukuran besar):
-        last_box = self.last_bbox or [0, 0, 0, 0]
-        bw = max(1, last_box[2] - last_box[0])
-        bh = max(1, last_box[3] - last_box[1])
-        is_in_gate_zone = (last_box[3] >= 480) or (bw * bh >= 35000)
+        # JALUR 1: PREFER CONSECUTIVE MATCHES (Kecocokan berurutan >= 3 frame langsung konfirmasi tercepat)
+        if self.consecutive_count >= 3 and self.consecutive_plate:
+            matching = [r for r in self.valid_plate_observations if r["clean"] == self.consecutive_plate]
+            if matching:
+                best_r = max(matching, key=lambda x: x["conf"])
+                stable_plate = best_r["text"]
+                stable_conf = best_r["conf"]
+                matching_count = self.consecutive_count
 
-        f1, f2 = self.frames[0], self.frames[1]
-        same_vtype = (f1["vehicle_type"] == f2["vehicle_type"]) and (f1["v_conf"] >= CONFIRM_CONF_THRESH) and (f2["v_conf"] >= CONFIRM_CONF_THRESH)
-        same_bstyle = bool(f1["body_style"] and f2["body_style"] and (f1["body_style"] == f2["body_style"]) and (f1["body_conf"] >= CONFIRM_CONF_THRESH) and (f2["body_conf"] >= CONFIRM_CONF_THRESH))
+        # JALUR 2: 3 MATCHING OBSERVATIONS DALAM 5 OBSERVASI VALID TERAKHIR (Toleransi short gaps)
+        if not stable_plate and len(self.valid_plate_observations) >= 3:
+            latest_5_valid = list(self.valid_plate_observations)[-5:]
+            counts = Counter(r["clean"] for r in latest_5_valid)
+            for p_cln, c in counts.items():
+                if c >= 3:
+                    # Ambil teks terbaik dengan confidence tertinggi untuk plat ini
+                    matching = [r for r in latest_5_valid if r["clean"] == p_cln]
+                    best_r = max(matching, key=lambda x: x["conf"])
+                    stable_plate = best_r["text"]
+                    stable_conf = best_r["conf"]
+                    matching_count = c
+                    break
 
-        # Hanya konfirmasi jika sudah di gate zone ATAU observasi sudah mencapai buffer 3-4 frame
-        if (same_vtype or same_bstyle) and (is_in_gate_zone or n >= 3):
-            self._finalize_confirmation(reason="early_consistency_gate_zone")
-            return
+        if stable_plate and stable_conf >= 0.80 and matching_count >= 3:
+            self._finalize_confirmation(stable_plate, stable_conf, matching_count)
 
-        # 3. Maximum observations reached (atau time window tercapai)
-        time_span = self.frames[-1]["time"] - self.frames[0]["time"]
-        if n >= MAX_OBSERVATIONS or time_span >= TEMPORAL_WINDOW_SEC:
-            self._finalize_confirmation(reason="buffer_max_frames")
-
-    def _finalize_confirmation(self, reason="buffer_voting"):
+    def _finalize_confirmation(self, stable_plate, stable_conf, matching_count=3):
         # A. Voting Body Style (Weighted Confidence)
         style_weights = {}
         total_style_weight = 0.0
@@ -1459,43 +1503,6 @@ class VehicleTrack:
             type_weights[vt] = type_weights.get(vt, 0.0) + w
         best_type = max(type_weights, key=type_weights.get) if type_weights else self.frames[-1]["vehicle_type"]
 
-        # C. KONSENSUS PLAT NOMOR MULTI-FRAME (TEMPORAL OCR FUSION)
-        best_plate = None
-        best_plate_conf = None
-        ocr_method = None
-
-        # 1. Gunakan hasil pembacaan plat terbanyak/terbaik dari frame yang sudah diproses (0ms)
-        if self.plate_readings:
-            plate_counts = {}
-            for r in self.plate_readings:
-                p_text = r["text"]
-                plate_counts[p_text] = plate_counts.get(p_text, 0) + 1
-            most_common, count = max(plate_counts.items(), key=lambda kv: kv[1])
-            best_plate = most_common
-            best_plate_conf = max([r.get("conf", 0.88) for r in self.plate_readings if r["text"] == most_common], default=0.88)
-            ocr_method = "temporal_consensus"
-
-        # 2. Jalankan ensemble OCR pada best_plate_crop hanya jika belum ada plat yang terbaca
-        if not best_plate:
-            target_crop = self.best_plate_crop
-            if target_crop is None or getattr(target_crop, 'size', 0) == 0:
-                for f in reversed(self.frames):
-                    if f.get("plate_crop") is not None and getattr(f["plate_crop"], 'size', 0) > 0:
-                        target_crop = f["plate_crop"]
-                        break
-
-            if target_crop is not None and getattr(target_crop, 'size', 0) > 0:
-                try:
-                    t_ocr_0 = time.time()
-                    ensemble_res = ensemble_plate_reading(target_crop)
-                    if ensemble_res.get("final"):
-                        best_plate = ensemble_res["final"]
-                        ocr_method = ensemble_res["method"]
-                        best_plate_conf = ensemble_res["confidence"]
-                        print(f"[PERF] Best-Crop OCR for Track #{self.track_id}: '{best_plate}' in {round((time.time() - t_ocr_0)*1000, 1)}ms")
-                except Exception as ocr_err:
-                    print(f"[WARN] Best-Crop OCR error: {ocr_err}")
-
         # Frame terbaik untuk snapshot / bounding box
         best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
 
@@ -1504,15 +1511,27 @@ class VehicleTrack:
             "vehicle_type": best_type,
             "body_style": best_style,
             "body_style_confidence": round(avg_style_conf, 3) if avg_style_conf else None,
-            "license_plate": best_plate,
-            "plate_confidence": round(best_plate_conf, 3) if best_plate_conf else None,
+            "license_plate": stable_plate,
+            "plate_confidence": round(stable_conf, 3),
             "consistency": round(consistency_score, 2),
             "bbox": best_f["bbox"],
             "plate_bbox": best_f["plate_bbox"],
-            "ocr_method": ocr_method
+            "ocr_method": best_f.get("ocr_method") or "temporal_consensus"
         }
         self.confirmation_score = round(consistency_score, 2)
         self.status = "CONFIRMED"
+        self.is_locked = True
+
+    def get_current_stability_count(self):
+        """Mengembalikan jumlah observasi plat yang cocok saat ini (untuk progress UI 1/3, 2/3, dst)."""
+        if self.consecutive_count > 0:
+            return min(self.consecutive_count, 3)
+        if self.valid_plate_observations:
+            latest_5 = list(self.valid_plate_observations)[-5:]
+            counts = Counter(r["clean"] for r in latest_5)
+            if counts:
+                return min(max(counts.values()), 3)
+        return 1 if self.frames else 0
 
     def get_current_consistency(self):
         if not self.frames:
@@ -1587,8 +1606,8 @@ class VehicleConfirmationManager:
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            # Bersihkan track yang tidak terlihat > 8.0 detik
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 8.0]
+            # Bersihkan track yang tidak terlihat > 5.0 detik
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 5.0]
             for tid in stale_ids:
                 del self.tracks[tid]
 
@@ -1598,10 +1617,22 @@ class VehicleConfirmationManager:
             # Jika single photo upload manual (bukan live stream)
             if not is_stream:
                 for det in detections:
+                    p_text = det.get("license_plate")
+                    p_conf = det.get("plate_confidence", 0.0) or 0.0
+                    p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper()) if p_text else ""
+                    is_valid = p_text and p_text != "TIDAK_TERBACA" and (len(p_clean) >= 4 or '-' in p_text)
+
                     det["track_id"] = 1
-                    det["status"] = "CONFIRMED"
-                    det["consistency"] = 1.0
-                    det["is_newly_confirmed"] = True
+                    if is_valid and p_conf >= 0.80:
+                        det["status"] = "CONFIRMED"
+                        det["consistency"] = 1.0
+                        det["is_newly_confirmed"] = True
+                    else:
+                        det["status"] = "ANALYZING"
+                        det["consistency"] = 0.5
+                        det["is_newly_confirmed"] = False
+                        det["analyzing_frame_count"] = 1
+                        det["analyzing_max_frames"] = 3
                     det.pop("plate_crop", None)
                 return detections
 
@@ -1636,68 +1667,40 @@ class VehicleConfirmationManager:
 
                 # Pasang status temporal konfirmasi ke detection object
                 if track.history_saved:
-                    curr_plate = det.get("license_plate")
-                    curr_clean = re.sub(r'[^A-Z0-9]', '', curr_plate.upper()) if curr_plate else ""
-                    old_plate = track.confirmed_data.get("license_plate") if track.confirmed_data else None
-                    old_clean = re.sub(r'[^A-Z0-9]', '', old_plate.upper()) if old_plate else ""
-
-                    # Deteksi Pergantian Kendaraan di Gate (ID Switch Prevention):
-                    # Jika plat yang baru terbaca berbeda total dari plat kendaraan lama yang sudah tersimpan:
-                    if (len(curr_clean) >= 5 and len(old_clean) >= 5 and curr_clean != old_clean) or ('-' in (curr_plate or '') and curr_plate != old_plate):
-                        tid = self.next_fallback_id
-                        self.next_fallback_id += 1
-                        det["track_id"] = tid
-                        self.tracks[tid] = VehicleTrack(tid, det)
-                        track = self.tracks[tid]
-
-                if track.history_saved:
+                    # KENDARAAN SUDAH TERKONFIRMASI SEBELUMNYA -> KUNCI DATA PLAT!
+                    # Frame bising/glare berikutnya saat mobil lewat TIDAK boleh mengubah plat atau membuat entri baru!
                     det["status"] = "HISTORY_SAVED"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.confirmation_score
 
-                    # Active Plate Upgrading saat mobil terus bergerak mendekat:
-                    curr_plate = det.get("license_plate")
-                    curr_conf = det.get("plate_confidence", 0.0) or 0.0
-                    if curr_plate and curr_plate != "TIDAK_TERBACA":
-                        curr_clean = re.sub(r'[^A-Z0-9]', '', curr_plate.upper())
-                        old_plate = track.confirmed_data.get("license_plate") if track.confirmed_data else None
-                        old_clean = re.sub(r'[^A-Z0-9]', '', old_plate.upper()) if old_plate else ""
-                        if (not old_plate) or (len(old_clean) < 4 and len(curr_clean) >= 4) or (len(curr_clean) > len(old_clean) and len(curr_clean) >= 5):
-                            if track.confirmed_data:
-                                track.confirmed_data["license_plate"] = curr_plate
-                                track.confirmed_data["plate_confidence"] = curr_conf or 0.88
-                            for rec in LATEST_RECORDS:
-                                if rec.get("track_id") == tid:
-                                    rec["license_plate"] = curr_plate
-                                    rec["confidence"] = curr_conf or 0.88
-                                    break
+                    if track.confirmed_data:
+                        det["body_style"] = track.confirmed_data["body_style"]
+                        det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
+                        det["license_plate"] = track.confirmed_data["license_plate"]
+                        det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                elif track.status == "CONFIRMED":
+                    # TRANSISI KE CONFIRMED: HANYA PADA FRAME INI DISET is_newly_confirmed = True (1x per kendaraan)
+                    det["status"] = "CONFIRMED"
+                    det["is_newly_confirmed"] = True
+                    track.status = "HISTORY_SAVED"
+                    track.history_saved = True
+                    track.is_locked = True
+                    det["consistency"] = track.confirmation_score
 
                     if track.confirmed_data:
                         det["body_style"] = track.confirmed_data["body_style"]
                         det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
-                        if track.confirmed_data.get("license_plate"):
-                            det["license_plate"] = track.confirmed_data["license_plate"]
-                            det["plate_confidence"] = track.confirmed_data["plate_confidence"]
-                        det["vehicle_type"] = track.confirmed_data["vehicle_type"]
-                elif track.status == "CONFIRMED":
-                    det["status"] = "CONFIRMED"
-                    det["is_newly_confirmed"] = True  # Sinyal untuk simpan ke Entry History!
-                    track.status = "HISTORY_SAVED"
-                    track.history_saved = True
-                    det["consistency"] = track.confirmation_score
-                    if track.confirmed_data:
-                        det["body_style"] = track.confirmed_data["body_style"]
-                        det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
-                        if track.confirmed_data.get("license_plate"):
-                            det["license_plate"] = track.confirmed_data["license_plate"]
-                            det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["license_plate"] = track.confirmed_data["license_plate"]
+                        det["plate_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
                 else:
+                    # KENDARAAN MASIH DALAM PROSES ANALISIS SEMENTARA
                     det["status"] = "ANALYZING"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.get_current_consistency()
-                    det["analyzing_frame_count"] = len(track.frames)
-                    det["analyzing_max_frames"] = MAX_OBSERVATIONS
+                    det["analyzing_frame_count"] = max(1, track.get_current_stability_count())
+                    det["analyzing_max_frames"] = 3
 
                 # PENTING: Jangan kirim plate_crop (ndarray) ke client / JSON response
                 det.pop("plate_crop", None)
@@ -1948,15 +1951,20 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
             plate_text = None
             ocr_method = None
+            ocr_conf = 0.0
             # 4. PLATE READING:
             # - Gunakan cache plat jika track sudah terkonfirmasi dengan plat valid (>= 6 karakter) -> 0ms!
             # - Jika belum: Jalankan ensemble OCR adaptif (Fast-path char_model ~40ms, fallback EasyOCR ~250ms)
             if plate_crop.size > 0:
                 t_o0 = time.time()
                 ensemble_res = ensemble_plate_reading(plate_crop)
-                plate_text = ensemble_res["final"]
-                ocr_method = ensemble_res["method"]
+                plate_text = ensemble_res.get("final")
+                ocr_method = ensemble_res.get("method")
+                ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
                 t_ocr_total += (time.time() - t_o0)
+
+            # Prioritaskan ocr_conf saat plat terbaca agar evaluasi konfirmasi (>=80%) mengukur akurasi OCR
+            effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
 
             results_out.append({
                 "track_id": cand_track_id,
@@ -1966,7 +1974,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 "license_plate": plate_text,
                 "ocr_method": ocr_method,
                 "vehicle_confidence": round(v_conf, 3),
-                "plate_confidence": round(plate_conf_val, 3) if plate_conf_val else None,
+                "plate_confidence": round(effective_plate_conf, 3) if effective_plate_conf else None,
+                "plate_bbox_confidence": round(plate_conf_val, 3) if plate_conf_val else None,
+                "ocr_confidence": round(ocr_conf, 3) if ocr_conf else None,
                 "bbox": [x1, y1, x2, y2],
                 "plate_bbox": abs_plate_bbox,
                 "plate_crop": plate_crop if is_stream else None,
