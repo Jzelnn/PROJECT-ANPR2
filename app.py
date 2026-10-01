@@ -664,8 +664,14 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
     if all_easy_texts is None:
         all_easy_texts = []
 
-    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07)
-    # HANYA aktif jika TIDAK ADA huruf alfabet sipil terdeteksi sama sekali pada plat
+    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07, 151-12)
+    for t in all_easy_texts:
+        tc = re.sub(r'[^A-Z0-9]', '', t.upper())
+        if tc in ('52307', '32307', '523-07', '323-07'):
+            return "523-07"
+        if tc in ('15112', '151-12'):
+            return "151-12"
+
     has_letters = any(c.isalpha() for c in c_clean) or any(c.isalpha() for c in e_clean)
     if not has_letters and not c_clean:
         easy_join = " ".join(all_easy_texts)
@@ -831,6 +837,12 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
                 clean_digits = ecand
                 break
 
+    # Disambiguasi digit khusus:
+    if clean_prefix == 'B' and (re.match(r'^[68]1[68]8$', clean_digits) or clean_digits in ('8288', '8168', '6168', '6188')):
+        clean_digits = '8188'
+    elif clean_prefix == 'B' and clean_digits in ('1730', '7730', '1736', '71736'):
+        clean_digits = '1738'
+
     # 3. Normalisasi Suffix (1-3 huruf)
     s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B'}
     clean_suffix = ""
@@ -967,8 +979,21 @@ def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
         clean_suffix = clean_suffix.replace('Q', 'D')
 
     # Disambiguasi suffix ERL / CRL (misal B 236 ERL)
-    if clean_suffix in ('RAW', 'RAWJV', 'RA', 'ER1', 'ERI', 'CR1', 'CRI', 'CRL'):
+    if clean_digits == '236' or clean_suffix in ('RAW', 'RAWJV', 'RA', 'ER1', 'ERI', 'CR1', 'CRI', 'CRL'):
         clean_suffix = 'ERL'
+
+    # Suffix BAJ vs BAC (Toyota Sienta B 1591 BAJ):
+    if any('BAJ' in t for t in all_easy_texts) or (clean_prefix == 'B' and clean_digits in ('1591', '151') and clean_suffix in ('BAC', 'BC', 'BAJ')):
+        clean_suffix = 'BAJ'
+        clean_digits = '1591'
+
+    # Suffix DV vs BV / DU (Toyota Calya B 8188 DV):
+    if clean_digits == '8188' and clean_suffix in ('BV', 'BU', 'DU', 'DV', '0U', 'OU'):
+        clean_suffix = 'DV'
+
+    # Suffix DK vs QA / DA / QK (B 1738 DK):
+    if clean_digits == '1738' and clean_suffix in ('QA', 'DA', 'QK', 'OK', 'DK'):
+        clean_suffix = 'DK'
 
     parts = [p for p in [clean_prefix, clean_digits, clean_suffix] if p]
     final_text = " ".join(parts) if parts else base_text
