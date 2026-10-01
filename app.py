@@ -44,14 +44,17 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 # PERFORMANCE & DETECTION CONFIGURATION
 # Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
-IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for reliable small plate detection
+VEHICLE_IMG_SIZE = int(os.environ.get("ANPR_VEHICLE_IMG_SIZE", 416))  # 416 for fast vehicle detection (2x faster than 640)
+PLATE_IMG_SIZE = int(os.environ.get("ANPR_PLATE_IMG_SIZE", 640))      # 640 for accurate plate detection
+IMG_SIZE = PLATE_IMG_SIZE                                             # Alias for backward compatibility
+OCR_THROTTLE_SEC = float(os.environ.get("ANPR_OCR_THROTTLE_SEC", 0.12))# 120ms throttle between OCR cycles per track
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.20))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
-USE_FP16 = False  # Keep false on CPU to prevent warnings
+USE_FP16 = bool(HAS_CUDA)  # True on CUDA GPU, False on CPU to prevent warnings
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3
@@ -90,7 +93,7 @@ def save_parking_record(det, source_img=None, source_img_path=None):
         return None
 
     plate_conf = det.get("plate_confidence", 0.0) or 0.0
-    if plate_conf < 0.80:
+    if plate_conf < 0.70:
         return None
 
     now = datetime.datetime.now()
@@ -1338,9 +1341,10 @@ def get_front_of_camera_score(cand, plates, img_w, img_h):
 class VehicleTrack:
     """
     Melacak dan mengonfirmasi kendaraan secara temporal adaptif untuk CCTV parkir.
-    Dua tingkat konfirmasi (Adaptive Confidence):
-    - TIER 1 (HIGH CONFIDENCE >= 90%): Cukup 2 observasi cocok dalam jendela observasi valid (respons cepat ~1.0-1.4s).
+    Tiga tingkat konfirmasi (Adaptive Confidence):
+    - TIER 1 (HIGH CONFIDENCE >= 90%): Cukup 2 observasi cocok dalam jendela observasi valid (respons kilat ~100-200ms).
     - TIER 2 (NORMAL CONFIDENCE >= 80%): Membutuhkan 3 observasi cocok dalam jendela observasi valid.
+    - TIER 3 (MODERATE CONFIDENCE 70-79%): Membutuhkan minimal 3 observasi cocok TANPA ADA kandidat saingan kuat (<= 1 conflicting obs).
     - Mentolerir short gaps / missed frames di antara observasi.
     - Mengunci plat terkonfirmasi sehingga variasi OCR berikutnya tidak menimpa atau membuat duplikat.
     State Machine: ANALYZING -> CONFIRMED -> HISTORY_SAVED
@@ -1365,10 +1369,21 @@ class VehicleTrack:
         self.best_plate_conf = 0.0
         self.plate_readings = []
 
-        # Riwayat observasi plat valid (conf >= 0.80)
+        # OCR Throttling & Caching per track
+        self.last_ocr_time = 0.0
+        self.last_ocr_text = None
+        self.last_ocr_conf = 0.0
+        self.last_ocr_method = None
+
+        # Riwayat observasi plat valid (conf >= 0.70)
         self.valid_plate_observations = deque(maxlen=8)
 
         if initial_det:
+            if initial_det.get("license_plate"):
+                self.last_ocr_text = initial_det.get("license_plate")
+                self.last_ocr_conf = initial_det.get("plate_confidence", 0.0) or 0.0
+                self.last_ocr_method = initial_det.get("ocr_method")
+                self.last_ocr_time = time.time()
             self.add_frame(initial_det)
 
     def add_frame(self, det):
@@ -1377,6 +1392,7 @@ class VehicleTrack:
         p_crop = det.get("plate_crop")
         p_conf = det.get("plate_confidence", 0.0) or 0.0
         p_text = det.get("license_plate")
+        ocr_method = det.get("ocr_method")
 
         # 1. Update best_plate_crop menggunakan metrik Crop Quality
         if p_crop is not None and getattr(p_crop, 'size', 0) > 0:
@@ -1386,16 +1402,17 @@ class VehicleTrack:
                 self.best_crop_quality = quality
                 self.best_plate_conf = p_conf
 
-        # 2. Akumulasi pembacaan plat nomor valid (conf >= 0.80) sepanjang pergerakan kendaraan
+        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan
+        # PENTING: Hanya catat observasi jika pembacaan OCR riil (bukan tracking_cache)
         p_clean = ""
-        is_valid_high_conf = False
-        if p_text and p_text != "TIDAK_TERBACA":
+        is_valid_obs = False
+        if p_text and p_text != "TIDAK_TERBACA" and ocr_method != "tracking_cache":
             p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper())
-            # Format Indonesia (>= 4 karakter atau format dinas/militer dengan '-')
-            if (len(p_clean) >= 4 or '-' in p_text) and p_conf >= 0.80:
-                is_valid_high_conf = True
+            # Format Indonesia (>= 4 karakter atau format dinas/militer dengan '-') dan conf >= 0.70
+            if (len(p_clean) >= 4 or '-' in p_text) and p_conf >= 0.70:
+                is_valid_obs = True
 
-        if is_valid_high_conf:
+        if is_valid_obs:
             obs = {
                 "text": p_text,
                 "clean": p_clean,
@@ -1404,6 +1421,12 @@ class VehicleTrack:
             }
             self.valid_plate_observations.append(obs)
             self.plate_readings.append(obs)
+
+        if ocr_method and ocr_method != "tracking_cache":
+            self.last_ocr_time = self.last_seen
+            self.last_ocr_text = p_text
+            self.last_ocr_conf = p_conf
+            self.last_ocr_method = ocr_method
 
         self.frames.append({
             "time": self.last_seen,
@@ -1416,7 +1439,7 @@ class VehicleTrack:
             "plate_crop": p_crop,
             "bbox": det.get("bbox"),
             "plate_bbox": det.get("plate_bbox"),
-            "ocr_method": det.get("ocr_method")
+            "ocr_method": ocr_method
         })
 
         # Jika sudah terkonfirmasi dan tersimpan di Entry History, kunci!
@@ -1442,35 +1465,54 @@ class VehicleTrack:
                 candidates[clean] = []
             candidates[clean].append(r)
 
+        candidate_counts = {clean: len(obs_list) for clean, obs_list in candidates.items()}
+
         best_stable_plate = None
         best_stable_conf = 0.0
         best_tier = None
         best_matching_count = 0
 
         # Evaluasi setiap kandidat plat nomor:
-        # TIER 1 (HIGH CONFIDENCE): OCR confidence >= 90% pada minimal 2 observasi cocok
-        # TIER 2 (NORMAL HIGH CONFIDENCE): OCR confidence >= 80% pada minimal 3 observasi cocok
+        # TIER 1 (HIGH CONFIDENCE >= 90%): Minimal 2 observasi cocok
+        # TIER 2 (NORMAL HIGH CONFIDENCE >= 80%): Minimal 3 observasi cocok
+        # TIER 3 (MODERATE CONFIDENCE 70-79%): Minimal 3 observasi cocok TANPA ADA kandidat saingan kuat (<= 1 conflicting obs)
         for clean, obs_list in candidates.items():
             high_conf_obs = [r for r in obs_list if r["conf"] >= 0.90]
             normal_conf_obs = [r for r in obs_list if r["conf"] >= 0.80]
+            all_valid_obs = [r for r in obs_list if r["conf"] >= 0.70]
 
             # Cek Tier 1: Minimal 2 observasi ber-confidence >= 90%
             if len(high_conf_obs) >= 2:
                 best_r = max(high_conf_obs, key=lambda x: x["conf"])
-                if best_stable_plate is None or (best_tier != 1 and best_r["conf"] > best_stable_conf) or (best_tier == 1 and best_r["conf"] > best_stable_conf):
+                if best_tier is None or best_tier > 1 or (best_tier == 1 and best_r["conf"] > best_stable_conf):
                     best_stable_plate = best_r["text"]
                     best_stable_conf = best_r["conf"]
                     best_tier = 1
                     best_matching_count = len(high_conf_obs)
 
             # Cek Tier 2: Minimal 3 observasi ber-confidence >= 80% (hanya jika belum ada Tier 1)
-            elif len(normal_conf_obs) >= 3 and best_tier != 1:
+            elif len(normal_conf_obs) >= 3 and (best_tier is None or best_tier > 2):
                 best_r = max(normal_conf_obs, key=lambda x: x["conf"])
                 if best_stable_plate is None or best_r["conf"] > best_stable_conf:
                     best_stable_plate = best_r["text"]
                     best_stable_conf = best_r["conf"]
                     best_tier = 2
                     best_matching_count = len(normal_conf_obs)
+
+            # Cek Tier 3: Minimal 3 observasi ber-confidence >= 70%
+            # DENGAN PERLINDUNGAN KONFLIK KETAT:
+            # Tidak boleh ada kandidat berbeda yang memiliki >= 2 observasi di recent window!
+            elif len(all_valid_obs) >= 3 and best_tier is None:
+                has_strong_conflict = any(
+                    cnt >= 2 for oth_clean, cnt in candidate_counts.items() if oth_clean != clean
+                )
+                if not has_strong_conflict:
+                    best_r = max(all_valid_obs, key=lambda x: x["conf"])
+                    if best_stable_plate is None or best_r["conf"] > best_stable_conf:
+                        best_stable_plate = best_r["text"]
+                        best_stable_conf = best_r["conf"]
+                        best_tier = 3
+                        best_matching_count = len(all_valid_obs)
 
         if best_stable_plate is not None:
             self._finalize_confirmation(best_stable_plate, best_stable_conf, best_matching_count)
@@ -1579,6 +1621,20 @@ class VehicleConfirmationManager:
         with self.lock:
             self.tracks.clear()
             self.next_fallback_id = 1
+
+    def find_track(self, track_id=None, bbox=None, img_w=1920, img_h=1080):
+        """
+        Mencari track aktif yang sudah ada berdasarkan track_id atau spatial matching (bbox/centroid).
+        Digunakan sebelum OCR/Body classifier untuk instant caching (0 ms).
+        """
+        with self.lock:
+            if track_id is not None and track_id in self.tracks:
+                return self.tracks[track_id]
+            if bbox is not None:
+                matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h)
+                if matched_id is not None and matched_id in self.tracks:
+                    return self.tracks[matched_id]
+            return None
 
     def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.20, max_center_dist_ratio=0.18):
         """
@@ -1754,18 +1810,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         raise ValueError(f"Gagal membaca gambar dari: {image_input}")
 
     ih, iw = img.shape[:2]
+    yolo_extra = {"half": True} if USE_FP16 else {}
 
-    # 1. YOLO INFERENCE (Configurable imgsz=640, device)
+    # 1. YOLO INFERENCE (Decoupled: Vehicle at 416, Global Plate at 640)
     t_yolo_0 = time.time()
     if is_stream:
         fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml",
-                               conf=m_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)
+                               conf=m_conf_thresh, imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
     else:
         fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
-                               imgsz=IMG_SIZE, device=DEVICE, verbose=False)
+                               imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
 
     fut_p = ai_pool.submit(plate_detector.predict, img, conf=p_conf_thresh,
-                           imgsz=IMG_SIZE, device=DEVICE, verbose=False)
+                           imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
     vdet = fut_v.result()[0]
     pdet_global = fut_p.result()[0]
     t_yolo = time.time() - t_yolo_0
@@ -1820,7 +1877,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     # Jika plate_detector (best.pt) tidak mendeteksi plat atau confidence rendah (< 0.30),
     # jalankan plate_model_legacy pada full frame agar plat hitam dan plat dinas/militer terdeteksi
     if not global_plates or max([p["conf"] for p in global_plates], default=0.0) < 0.30:
-        pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, device=DEVICE, verbose=False)[0]
+        pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
         for pbox in pdet_legacy_full.boxes:
             px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
             pconf = float(pbox.conf[0])
@@ -1888,6 +1945,12 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
             vehicle_crop = img[y1:y2, x1:x2]
 
+            # 3. UPFRONT TRACK LOOKUP & BODY STYLE CACHING (0 ms if cached)
+            existing_trk = confirmation_manager.find_track(track_id=cand_track_id, bbox=[x1, y1, x2, y2], img_w=iw, img_h=ih)
+            if existing_trk and cand_track_id is None:
+                cand_track_id = existing_trk.track_id
+                cand["track_id"] = cand_track_id
+
             # Cek apakah ada deteksi 'bus' di area kendaraan ini (misal Isuzu Elf yang dideteksi truck & bus oleh YOLO)
             has_bus_det = any(
                 map_vehicle_class_name(b.cls[0], vehicle_model) == 'bus' and
@@ -1895,9 +1958,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 for b in vdet.boxes
             )
 
-            # 3. BODY STYLE CACHING PER TRACK ID
             t_b0 = time.time()
-            existing_trk = confirmation_manager.tracks.get(cand_track_id) if cand_track_id else None
             if existing_trk and existing_trk.cached_body_style and existing_trk.cached_body_conf >= 0.80:
                 # REUSE CACHED RESULT (0 ms!)
                 vehicle_type = existing_trk.cached_vtype or initial_vtype
@@ -1936,8 +1997,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
             # Hierarchical Plate Crop (jika belum terdeteksi dari full frame)
+            # Menggunakan imgsz=256 pada crop kendaraan (bukan 640) untuk kecepatan maksimal
             if plate_crop.size == 0 and vehicle_crop.size > 0:
-                pdet_crop = plate_detector.predict(vehicle_crop, conf=0.10, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                pdet_crop = plate_detector.predict(vehicle_crop, conf=0.10, imgsz=256, device=DEVICE, verbose=False, **yolo_extra)[0]
                 valid_crops = []
                 for b in pdet_crop.boxes:
                     cls_id = int(b.cls[0])
@@ -1949,7 +2011,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     if is_valid_plate_box(abs_box, iw, ih):
                         valid_crops.append((abs_box, float(b.conf[0])))
                 if not valid_crops or max([c[1] for c in valid_crops], default=0.0) < 0.30:
-                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=min(p_conf_thresh, 0.06), device=DEVICE, verbose=False)[0]
+                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=min(p_conf_thresh, 0.06), imgsz=256, device=DEVICE, verbose=False, **yolo_extra)[0]
                     for b in pdet_legacy.boxes:
                         cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                         abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
@@ -1978,16 +2040,67 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             plate_text = None
             ocr_method = None
             ocr_conf = 0.0
-            # 4. PLATE READING:
-            # - Gunakan cache plat jika track sudah terkonfirmasi dengan plat valid (>= 6 karakter) -> 0ms!
-            # - Jika belum: Jalankan ensemble OCR adaptif (Fast-path char_model ~40ms, fallback EasyOCR ~250ms)
-            if plate_crop.size > 0:
-                t_o0 = time.time()
-                ensemble_res = ensemble_plate_reading(plate_crop)
-                plate_text = ensemble_res.get("final")
-                ocr_method = ensemble_res.get("method")
-                ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
-                t_ocr_total += (time.time() - t_o0)
+
+            # 4. FAST ADAPTIVE OCR PIPELINE WITH BEST-FRAME ACCELERATOR & ZERO-MS CACHING
+            if existing_trk and existing_trk.history_saved:
+                # KENDARAAN SUDAH TERKONFIRMASI SEBELUMNYA -> SKIP OCR 100% (0 ms!)
+                if existing_trk.confirmed_data:
+                    plate_text = existing_trk.confirmed_data.get("license_plate")
+                    ocr_conf = existing_trk.confirmed_data.get("plate_confidence", 0.95)
+                    ocr_method = "tracking_cache"
+                else:
+                    plate_text = existing_trk.last_ocr_text
+                    ocr_conf = existing_trk.last_ocr_conf
+                    ocr_method = "tracking_cache"
+            elif plate_crop.size > 0:
+                ch, cw = plate_crop.shape[:2]
+                crop_q = compute_crop_quality(plate_crop, plate_conf_val or 0.5)
+                is_usable_crop = (cw >= 36 and ch >= 14 and (plate_conf_val is None or plate_conf_val >= 0.15))
+
+                if is_usable_crop:
+                    now = time.time()
+                    dt = (now - existing_trk.last_ocr_time) if existing_trk else 999.0
+
+                    # Adaptive Throttle: 80ms jika observasi masih < 2, 120ms jika sudah >= 2
+                    num_obs = len(existing_trk.valid_plate_observations) if existing_trk else 0
+                    current_throttle = (OCR_THROTTLE_SEC * 0.65) if num_obs < 2 else OCR_THROTTLE_SEC
+
+                    # Best-Frame Accelerator: jika kualitas citra saat ini melonjak (+15%) dari yang pernah dilihat
+                    best_q = existing_trk.best_crop_quality if existing_trk else -1.0
+                    is_sharpness_boost = (crop_q > best_q * 1.15) if best_q > 0 else False
+
+                    # Keputusan OCR: Jalankan jika throttle sudah lewat, atau kualitas melonjak, atau mode non-stream
+                    should_run_ocr = (dt >= current_throttle) or is_sharpness_boost or (not is_stream)
+
+                    if should_run_ocr:
+                        t_o0 = time.time()
+                        ensemble_res = ensemble_plate_reading(plate_crop)
+                        plate_text = ensemble_res.get("final")
+                        ocr_method = ensemble_res.get("method")
+                        ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
+                        t_ocr_total += (time.time() - t_o0)
+
+                        if existing_trk:
+                            existing_trk.last_ocr_time = now
+                            existing_trk.last_ocr_text = plate_text
+                            existing_trk.last_ocr_conf = ocr_conf
+                            existing_trk.last_ocr_method = ocr_method
+                    else:
+                        # Throttle aktif -> SKIP OCR (0 ms!)
+                        # Gunakan cache untuk real-time feedback di UI tanpa lag
+                        if existing_trk and existing_trk.last_ocr_text:
+                            plate_text = existing_trk.last_ocr_text
+                            ocr_conf = existing_trk.last_ocr_conf
+                            ocr_method = "tracking_cache"
+                else:
+                    if existing_trk and existing_trk.last_ocr_text:
+                        plate_text = existing_trk.last_ocr_text
+                        ocr_conf = existing_trk.last_ocr_conf
+                        ocr_method = "tracking_cache"
+            elif existing_trk and existing_trk.last_ocr_text:
+                plate_text = existing_trk.last_ocr_text
+                ocr_conf = existing_trk.last_ocr_conf
+                ocr_method = "tracking_cache"
 
             # Prioritaskan ocr_conf saat plat terbaca agar evaluasi konfirmasi (>=80%) mengukur akurasi OCR
             effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
