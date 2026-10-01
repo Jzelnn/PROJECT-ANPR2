@@ -457,6 +457,10 @@
           <span class="dot" id="latencyDot" style="background:#10b981;"></span>
           <span id="latencyText">0 ms</span>
         </div>
+        <div class="live-pill" id="frameAgePill" style="display:none; background:rgba(47,111,237,0.09); border-color:#b9d2fd; color:var(--blue); font-weight:600;" title="Real-time video freshness (Frame Age = Now - Frame Capture)">
+          <span class="dot" id="frameAgeDot" style="background:var(--blue);"></span>
+          <span id="frameAgeText">Age: 0 ms</span>
+        </div>
       </div>
     </div>
 
@@ -584,6 +588,9 @@ let lastLoggedPlate = "";
 let lastLoggedTime = 0;
 let consecutiveEmptyCycles = 0;
 let fpsPollTimer = null;
+let latestRenderedFrameId = -1;
+let latestRenderedCaptureTime = 0.0;
+let clientFrameCounter = 0;
 
 // ============================================================
 // SWITCH CAMERA SOURCE (RPi ALPR Kit vs RPi Stream vs Webcam)
@@ -1168,6 +1175,35 @@ function updateLatencyIndicator(latencyMs){
   }
 }
 
+function updateFrameAgeIndicator(frameAgeMs){
+  const pill = document.getElementById('frameAgePill');
+  const dot = document.getElementById('frameAgeDot');
+  const txt = document.getElementById('frameAgeText');
+  if (!pill) return;
+  if (frameAgeMs == null || frameAgeMs < 0){
+    pill.style.display = "none";
+    return;
+  }
+  pill.style.display = "inline-flex";
+  txt.textContent = `Age: ${Math.round(frameAgeMs)} ms`;
+  if (frameAgeMs <= 150) {
+    pill.style.background = "rgba(16,185,129,0.09)";
+    pill.style.borderColor = "#a7f3d0";
+    pill.style.color = "#059669";
+    if (dot) dot.style.background = "#10b981";
+  } else if (frameAgeMs <= 350) {
+    pill.style.background = "rgba(245,158,11,0.09)";
+    pill.style.borderColor = "#fde68a";
+    pill.style.color = "#d97706";
+    if (dot) dot.style.background = "#f59e0b";
+  } else {
+    pill.style.background = "rgba(239,68,68,0.09)";
+    pill.style.borderColor = "#fecaca";
+    pill.style.color = "#dc2626";
+    if (dot) dot.style.background = "#ef4444";
+  }
+}
+
 function clearBoxes(){
   const target = document.getElementById('liveVideo') || document.getElementById('liveStreamImg') || document.getElementById('feedImg');
   if (target && target.parentElement){
@@ -1192,6 +1228,9 @@ function stopContinuousAutoDetect(){
   if (chk) chk.checked = false;
   updateAiIndicator(false, "PAUSED");
   updateLatencyIndicator(0);
+  updateFrameAgeIndicator(null);
+  latestRenderedFrameId = -1;
+  latestRenderedCaptureTime = 0.0;
   clearBoxes();
 }
 
@@ -1242,9 +1281,13 @@ async function performDetectCycle(silent=true){
         await new Promise((resolve) => {
           canvas.toBlob(async (blob) => {
             if (!blob){ resolve(); return; }
+            clientFrameCounter++;
+            const clientCaptureTs = Date.now() / 1000.0;
             const formData = new FormData();
             formData.append("image", blob, src === 'video_file' ? "video_frame.jpg" : "webcam_frame.jpg");
             formData.append("is_stream", "true");
+            formData.append("client_frame_id", clientFrameCounter);
+            formData.append("client_timestamp", clientCaptureTs);
             try {
               const reqStart = performance.now();
               const resp = await fetch(API_URL, { method: "POST", body: formData });
@@ -1274,6 +1317,26 @@ async function performDetectCycle(silent=true){
 }
 
 function handleDetectionResult(data, silent=false){
+  // Check frame freshness / monotonic frame ordering to discard stale out-of-order results
+  if (data.frame_id != null && data.frame_id > 0) {
+    if (data.frame_id < latestRenderedFrameId) {
+      // Discard stale result that arrived after a newer frame was already processed
+      return;
+    }
+    latestRenderedFrameId = data.frame_id;
+  }
+  if (data.capture_timestamp != null && data.capture_timestamp > 0) {
+    if (data.capture_timestamp < latestRenderedCaptureTime) {
+      return;
+    }
+    latestRenderedCaptureTime = data.capture_timestamp;
+  }
+
+  // Update Frame Age UI indicator if available
+  if (data.frame_age_ms != null) {
+    updateFrameAgeIndicator(data.frame_age_ms);
+  }
+
   const detMs = (data.detection_time_sec != null && data.detection_time_sec > 0)
     ? Math.round(data.detection_time_sec * 1000)
     : (data.roundtrip_ms || 0);

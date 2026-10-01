@@ -44,10 +44,11 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 # PERFORMANCE & DETECTION CONFIGURATION
 # Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
-VEHICLE_IMG_SIZE = int(os.environ.get("ANPR_VEHICLE_IMG_SIZE", 416))  # 416 for fast vehicle detection (2x faster than 640)
-PLATE_IMG_SIZE = int(os.environ.get("ANPR_PLATE_IMG_SIZE", 640))      # 640 for accurate plate detection
+VEHICLE_IMG_SIZE = int(os.environ.get("ANPR_VEHICLE_IMG_SIZE", 320))  # 320 for ultra-fast vehicle detection/tracking (~35ms)
+PLATE_IMG_SIZE = int(os.environ.get("ANPR_PLATE_IMG_SIZE", 416))      # 416 for fast & accurate plate detection (~49ms)
 IMG_SIZE = PLATE_IMG_SIZE                                             # Alias for backward compatibility
 OCR_THROTTLE_SEC = float(os.environ.get("ANPR_OCR_THROTTLE_SEC", 0.12))# 120ms throttle between OCR cycles per track
+MIN_SHARPNESS_VAR = float(os.environ.get("ANPR_MIN_SHARPNESS", 25.0)) # Skip OCR on frames with motion blur < 25
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.20))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
@@ -141,6 +142,89 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
 
 # ============================================================
+# LATEST-FRAME-ONLY BUFFER (BOUNDED QUEUE MAX SIZE = 1)
+# Menjamin backend selalu memproses frame TERBARU.
+# Frame-frame lama yang tiba saat AI sedang sibuk otomatis dibuang.
+# Menghilangkan antrean usang (stale frame backlog) secara permanen.
+# ============================================================
+class LatestFrameBuffer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)
+        self.latest_frame = None
+        self.frame_id = 0
+        self.capture_timestamp = 0.0
+        self.source = ""
+        self.is_stream = True
+        self.discarded_frames = 0
+        self.total_received = 0
+
+    def put(self, frame, frame_id, capture_timestamp=None, source="stream", is_stream=True):
+        """Menaruh frame baru ke buffer. Jika ada frame sebelumnya yang belum sempat diproses, buang frame lama!"""
+        with self.condition:
+            if self.latest_frame is not None:
+                self.discarded_frames += 1
+            self.latest_frame = frame
+            self.frame_id = frame_id
+            self.capture_timestamp = capture_timestamp if capture_timestamp is not None else time.time()
+            self.source = source
+            self.is_stream = is_stream
+            self.total_received += 1
+            self.condition.notify()
+
+    def get_latest(self):
+        """Mengambil frame terbaru (consume) dan mengosongkan buffer."""
+        with self.lock:
+            if self.latest_frame is None:
+                return None, None, None, None, None
+            f = self.latest_frame
+            fid = self.frame_id
+            ts = self.capture_timestamp
+            src = self.source
+            st = self.is_stream
+            self.latest_frame = None
+            return f, fid, ts, src, st
+
+    def wait_next(self, timeout=0.1):
+        """Menunggu frame terbaru berikutnya jika buffer kosong."""
+        with self.condition:
+            if self.latest_frame is None:
+                self.condition.wait(timeout=timeout)
+            if self.latest_frame is None:
+                return None, None, None, None, None
+            f = self.latest_frame
+            fid = self.frame_id
+            ts = self.capture_timestamp
+            src = self.source
+            st = self.is_stream
+            self.latest_frame = None
+            return f, fid, ts, src, st
+
+    def clear(self):
+        with self.lock:
+            self.latest_frame = None
+            self.frame_id = 0
+            self.capture_timestamp = 0.0
+
+    @property
+    def queue_size(self):
+        with self.lock:
+            return 1 if self.latest_frame is not None else 0
+
+    def get_stats(self):
+        with self.lock:
+            return {
+                "queue_size": 1 if self.latest_frame is not None else 0,
+                "discarded_stale_frames": self.discarded_frames,
+                "total_frames_received": self.total_received,
+                "latest_frame_id": self.frame_id
+            }
+
+
+realtime_frame_buffer = LatestFrameBuffer()
+
+
+# ============================================================
 # PERSISTENT CAMERA STREAM MANAGER (BACKGROUND RTSP / MJPEG WORKER)
 # Menjaga koneksi RTSP tetap hidup di latar belakang agar:
 # 1. Live stream di monitor CCTV benar-benar bergerak mulus (25 FPS).
@@ -151,6 +235,7 @@ class CameraStreamManager:
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.frame_id = 0
+        self.latest_capture_ts = 0.0
         self.running = False
         self.thread = None
         self.stream_url = ""
@@ -176,6 +261,8 @@ class CameraStreamManager:
             self.error_msg = ""
             self.thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.thread.start()
+            if 'realtime_worker' in globals() and realtime_worker:
+                realtime_worker.start()
             return True, "Memulai koneksi kamera di latar belakang"
 
     def stop(self):
@@ -188,6 +275,11 @@ class CameraStreamManager:
         self.status = "disconnected"
         self.latest_frame = None
         self.latest_jpeg = None
+        if 'realtime_worker' in globals() and realtime_worker:
+            realtime_worker.stop()
+            realtime_worker.reset_stats()
+        if 'realtime_frame_buffer' in globals() and realtime_frame_buffer:
+            realtime_frame_buffer.clear()
         if 'confirmation_manager' in globals():
             confirmation_manager.reset()
         self.condition.notify_all()
@@ -195,6 +287,12 @@ class CameraStreamManager:
     def get_latest_frame(self):
         with self.lock:
             return self.latest_frame.copy() if self.latest_frame is not None else None
+
+    def get_latest_frame_with_meta(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, 0, 0.0
+            return self.latest_frame.copy(), self.frame_id, self.latest_capture_ts
 
     def get_latest_jpeg(self):
         with self.lock:
@@ -319,7 +417,9 @@ class CameraStreamManager:
                     self.latest_frame = frame
                     self.latest_jpeg = jpeg_buf.tobytes()
                     self.frame_id += 1
+                    self.latest_capture_ts = now
                     self.condition.notify_all()
+                realtime_frame_buffer.put(frame, self.frame_id, capture_timestamp=now, source="camera_stream", is_stream=True)
 
         cap.release()
         with self.lock:
@@ -446,6 +546,14 @@ def compute_crop_quality(crop, p_conf=0.5):
     aspect_factor = 1.0 if 2.0 <= aspect <= 5.0 else 0.6
     quality = res_factor * (sharpness ** 0.5) * (max(0.2, p_conf) ** 0.5) * aspect_factor
     return quality
+
+
+def compute_sharpness(crop):
+    """Menghitung nilai Laplacian variance untuk mengukur ketajaman citra / motion blur."""
+    if crop is None or getattr(crop, 'size', 0) == 0:
+        return 0.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def enhance_moving_plate_crop(crop):
@@ -1726,13 +1834,15 @@ class VehicleConfirmationManager:
                 ih = det.get("image_height", 1080)
                 curr_plate_pre = det.get("license_plate")
 
-                # Prioritaskan ByteTrack ID jika tersedia
-                if raw_tid is not None:
+                # Prioritaskan ByteTrack ID jika sudah dikenal, atau cocokkan secara spasial jika ID baru/jumping
+                if raw_tid is not None and raw_tid in self.tracks:
                     tid = raw_tid
                 else:
                     matched_id = self._match_track(bbox, curr_plate=curr_plate_pre, img_w=iw, img_h=ih)
                     if matched_id is not None:
                         tid = matched_id
+                    elif raw_tid is not None:
+                        tid = raw_tid
                     else:
                         tid = self.next_fallback_id
                         self.next_fallback_id += 1
@@ -1794,8 +1904,9 @@ class VehicleConfirmationManager:
 confirmation_manager = VehicleConfirmationManager()
 
 
-def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False):
+def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
     t_start = time.time()
+    capture_ts = capture_timestamp if capture_timestamp is not None else t_start
     v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
     m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
     p_conf_thresh = plate_conf if plate_conf is not None else PLATE_CONF_THRESH
@@ -1812,20 +1923,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     ih, iw = img.shape[:2]
     yolo_extra = {"half": True} if USE_FP16 else {}
 
-    # 1. YOLO INFERENCE (Decoupled: Vehicle at 416, Global Plate at 640)
-    t_yolo_0 = time.time()
+    # 1. VEHICLE DETECTION & TRACKING (Decoupled: 320px for ~35ms latency)
+    t_v0 = time.time()
     if is_stream:
-        fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml",
-                               conf=m_conf_thresh, imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
+        vdet = vehicle_model.track(img, persist=True, tracker="bytetrack.yaml",
+                                   conf=m_conf_thresh, imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
     else:
-        fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
-                               imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
-
-    fut_p = ai_pool.submit(plate_detector.predict, img, conf=p_conf_thresh,
-                           imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)
-    vdet = fut_v.result()[0]
-    pdet_global = fut_p.result()[0]
-    t_yolo = time.time() - t_yolo_0
+        vdet = vehicle_model.predict(img, conf=m_conf_thresh,
+                                     imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+    t_vdet = time.time() - t_v0
 
     # 2. EKSTRAKSI KANDIDAT KENDARAAN
     candidates = []
@@ -1851,44 +1957,61 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "area": area
         })
 
-    # Ekstraksi hasil deteksi plat nomor global & petunjuk sub-tipe bodi dari plate_detector (best.pt)
+    # Cek apakah semua kendaraan aktif sudah terkonfirmasi di confirmation_manager
+    # Jika sudah terkonfirmasi, lewati pendeteksian plat global 100% (0 ms!)
+    all_candidates_confirmed = False
+    if is_stream and candidates:
+        all_confirmed = True
+        for c in candidates:
+            trk = confirmation_manager.find_track(track_id=c.get("track_id"), bbox=[c["x1"], c["y1"], c["x2"], c["y2"]], img_w=iw, img_h=ih)
+            if not trk or not trk.history_saved:
+                all_confirmed = False
+                break
+        all_candidates_confirmed = all_confirmed
+
+    # 1b. PENDETEKSIAN PLAT NOMOR GLOBAL (416px, ~49ms - lewati jika sudah confirmed atau stream kosong)
+    skip_plate_det = all_candidates_confirmed or (is_stream and not candidates)
     global_plates = []
     body_hints = []
-    for pbox in pdet_global.boxes:
-        cls_id = int(pbox.cls[0])
-        cls_name = plate_detector.names.get(cls_id, "")
-        pconf = float(pbox.conf[0])
-        px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
-        if cls_name in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
-            global_plates.append({
-                "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)],
-                "conf": pconf,
-                "matched": False
-            })
-        elif cls_name in ['Hatchback', 'Sedan', 'Sports Utility Vehicle', 'Van', 'Small Bus',
-                          'Large Bus', 'Medium Goods Vehicle', 'Pickup Truck', 'Light Goods Vehicle']:
-            body_hints.append({
-                "name": cls_name,
-                "conf": pconf,
-                "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
-            })
+    t_p0 = time.time()
 
-    # Deteksi Fallback untuk Plat Hitam / Gelap / Plat Militer:
-    # Jika plate_detector (best.pt) tidak mendeteksi plat atau confidence rendah (< 0.30),
-    # jalankan plate_model_legacy pada full frame agar plat hitam dan plat dinas/militer terdeteksi
-    if not global_plates or max([p["conf"] for p in global_plates], default=0.0) < 0.30:
-        pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
-        for pbox in pdet_legacy_full.boxes:
-            px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
+    if not skip_plate_det:
+        pdet_global = plate_detector.predict(img, conf=p_conf_thresh,
+                                             imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+        for pbox in pdet_global.boxes:
+            cls_id = int(pbox.cls[0])
+            cls_name = plate_detector.names.get(cls_id, "")
             pconf = float(pbox.conf[0])
-            box = [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
-            if is_valid_plate_box(box, iw, ih):
-                if not any(compute_iou(box, ep["box"]) > 0.35 for ep in global_plates):
-                    global_plates.append({
-                        "box": box,
-                        "conf": pconf,
-                        "matched": False
-                    })
+            px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
+            if cls_name in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
+                global_plates.append({
+                    "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)],
+                    "conf": pconf,
+                    "matched": False
+                })
+            elif cls_name in ['Hatchback', 'Sedan', 'Sports Utility Vehicle', 'Van', 'Small Bus',
+                              'Large Bus', 'Medium Goods Vehicle', 'Pickup Truck', 'Light Goods Vehicle']:
+                body_hints.append({
+                    "name": cls_name,
+                    "conf": pconf,
+                    "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
+                })
+
+        # Deteksi Fallback untuk Plat Hitam / Gelap / Plat Militer
+        if not global_plates or max([p["conf"] for p in global_plates], default=0.0) < 0.30:
+            pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+            for pbox in pdet_legacy_full.boxes:
+                px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
+                pconf = float(pbox.conf[0])
+                box = [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
+                if is_valid_plate_box(box, iw, ih):
+                    if not any(compute_iou(box, ep["box"]) > 0.35 for ep in global_plates):
+                        global_plates.append({
+                            "box": box,
+                            "conf": pconf,
+                            "matched": False
+                        })
+    t_pdet = time.time() - t_p0
 
     # FALLBACK UNTUK MOBIL GELAP / HITAM:
     # Hanya aktif jika ada plat nomor terdeteksi DAN menaungi bounding box kendaraan di vdet
@@ -1947,7 +2070,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
             # 3. UPFRONT TRACK LOOKUP & BODY STYLE CACHING (0 ms if cached)
             existing_trk = confirmation_manager.find_track(track_id=cand_track_id, bbox=[x1, y1, x2, y2], img_w=iw, img_h=ih)
-            if existing_trk and cand_track_id is None:
+            if existing_trk and (cand_track_id is None or cand_track_id not in confirmation_manager.tracks):
                 cand_track_id = existing_trk.track_id
                 cand["track_id"] = cand_track_id
 
@@ -2055,7 +2178,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             elif plate_crop.size > 0:
                 ch, cw = plate_crop.shape[:2]
                 crop_q = compute_crop_quality(plate_crop, plate_conf_val or 0.5)
-                is_usable_crop = (cw >= 36 and ch >= 14 and (plate_conf_val is None or plate_conf_val >= 0.15))
+                sharpness = compute_sharpness(plate_crop)
+                is_blurry = (sharpness < MIN_SHARPNESS_VAR) and is_stream
+                is_usable_crop = (cw >= 36 and ch >= 14 and (plate_conf_val is None or plate_conf_val >= 0.15) and not is_blurry)
 
                 if is_usable_crop:
                     now = time.time()
@@ -2133,10 +2258,14 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         d.pop("plate_crop", None)
 
     t_total = time.time() - t_start
+    inference_start = t_start
+    inference_end = time.time()
+    frame_age_ms = round((inference_end - capture_ts) * 1000, 1)
     fps = 1.0 / max(1e-4, t_total)
+    q_size = realtime_frame_buffer.queue_size if 'realtime_frame_buffer' in globals() else 0
 
-    # 5. PERFORMANCE TELEMETRY LOGGING
-    print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+    # 5. PERFORMANCE TELEMETRY LOGGING (Matching User Specification)
+    print(f"[PERF_FRAME] frame_id={frame_id} capture_ts={capture_ts:.3f} inf_start={inference_start:.3f} inf_end={inference_end:.3f} v_det_ms={t_vdet*1000:.1f} p_det_ms={t_pdet*1000:.1f} ocr_ms={t_ocr_total*1000:.1f} total_ms={t_total*1000:.1f} q_size={q_size} frame_age_ms={frame_age_ms:.1f}")
 
     return {
         "detections": results_out,
@@ -2144,15 +2273,117 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "source": image_path,
         "image_width": iw,
         "image_height": ih,
+        "frame_id": frame_id,
+        "capture_timestamp": capture_ts,
+        "frame_age_ms": frame_age_ms,
+        "queue_size": q_size,
         "perf_breakdown": {
-            "yolo_ms": round(t_yolo * 1000, 1),
+            "vehicle_detection_ms": round(t_vdet * 1000, 1),
+            "plate_detection_ms": round(t_pdet * 1000, 1),
+            "yolo_ms": round((t_vdet + t_pdet) * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
             "body_ms": round(t_body_total * 1000, 1),
             "ocr_ms": round(t_ocr_total * 1000, 1),
             "total_ms": round(t_total * 1000, 1),
+            "frame_age_ms": frame_age_ms,
             "fps": round(fps, 1)
         }
     }
+
+
+# ============================================================
+# REAL-TIME ASYNCHRONOUS INFERENCE WORKER
+# Terus-menerus mengambil frame TERBARU dari LatestFrameBuffer
+# Menjalankan AI tanpa membuat antrean macet di memori atau browser.
+# ============================================================
+class RealtimeInferenceWorker:
+    def __init__(self, frame_buffer):
+        self.frame_buffer = frame_buffer
+        self.lock = threading.Lock()
+        self.running = False
+        self.thread = None
+        self.latest_result = None
+        self.latest_processed_frame_id = -1
+        self.latest_processed_ts = 0.0
+        self.first_candidate_time_ms = None
+        self.stats = {
+            "total_inferences": 0,
+            "avg_frame_age_ms": 0.0,
+            "max_frame_age_ms": 0.0,
+            "latest_frame_age_ms": 0.0
+        }
+
+    def start(self):
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+            self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def _worker_loop(self):
+        while self.running:
+            frame, frame_id, capture_ts, source, is_stream = self.frame_buffer.wait_next(timeout=0.1)
+            if frame is None or not self.running:
+                continue
+
+            try:
+                result = run_anpr(
+                    frame,
+                    is_stream=is_stream,
+                    frame_id=frame_id,
+                    capture_timestamp=capture_ts
+                )
+
+                if result.get("detections"):
+                    primary_det = result["detections"][0]
+                    # Track time to first candidate
+                    if self.first_candidate_time_ms is None and primary_det.get("license_plate"):
+                        self.first_candidate_time_ms = round((time.time() - capture_ts) * 1000, 1)
+
+                    if primary_det.get("is_newly_confirmed"):
+                        rec = save_parking_record(primary_det, source_img=frame)
+                        primary_det["record"] = rec
+                        if rec and rec.get("snapshot_url"):
+                            result["image_url"] = rec["snapshot_url"]
+
+                with self.lock:
+                    self.latest_result = result
+                    self.latest_processed_frame_id = frame_id
+                    self.latest_processed_ts = capture_ts
+                    self.stats["total_inferences"] += 1
+                    f_age = result.get("frame_age_ms", 0.0)
+                    self.stats["latest_frame_age_ms"] = f_age
+                    if f_age > self.stats["max_frame_age_ms"]:
+                        self.stats["max_frame_age_ms"] = f_age
+            except Exception as e:
+                print(f"[REALTIME_WORKER_ERROR] {e}")
+
+    def get_latest_result(self):
+        with self.lock:
+            if self.latest_result is None:
+                return None
+            return self.latest_result.copy()
+
+    def reset_stats(self):
+        with self.lock:
+            self.first_candidate_time_ms = None
+            self.latest_result = None
+            self.stats = {
+                "total_inferences": 0,
+                "avg_frame_age_ms": 0.0,
+                "max_frame_age_ms": 0.0,
+                "latest_frame_age_ms": 0.0
+            }
+
+
+realtime_worker = RealtimeInferenceWorker(realtime_frame_buffer)
 
 
 app = Flask(__name__)
@@ -2250,17 +2481,23 @@ def stream_status():
 def detect_current():
     """
     Deteksi instan langsung dari frame terkini di RAM (0 ms delay pengambilan frame).
-    Total waktu deteksi < 1 detik (jauh di bawah batas 3 detik).
+    Total waktu respon < 2ms menggunakan asynchronous RealtimeInferenceWorker.
     """
     if request.method == "OPTIONS":
         return "", 200
 
-    frame = camera_stream_manager.get_latest_frame()
+    # 1. Jalur super cepat: ambil hasil dari realtime_worker
+    cached_res = realtime_worker.get_latest_result() if 'realtime_worker' in globals() else None
+    if cached_res is not None:
+        return jsonify(cached_res)
+
+    # 2. Fallback jika worker belum memiliki hasil
+    frame, fid, cap_ts = camera_stream_manager.get_latest_frame_with_meta()
     if frame is None:
         return jsonify({"error": "Belum ada frame video di memory. Pastikan kamera CCTV sudah terhubung dan aktif."}), 400
 
     t0 = time.time()
-    result = run_anpr(frame, is_stream=True)
+    result = run_anpr(frame, is_stream=True, frame_id=fid, capture_timestamp=cap_ts)
     det_time = time.time() - t0
     result["detection_time_sec"] = round(det_time, 3)
 
@@ -2293,6 +2530,8 @@ def upload_video():
     file.save(dest_path)
 
     confirmation_manager.reset()
+    if 'realtime_worker' in globals() and realtime_worker:
+        realtime_worker.reset_stats()
     ok, msg = camera_stream_manager.start(dest_path)
     return jsonify({
         "status": "ok" if ok else "error",
@@ -2317,7 +2556,10 @@ def detect():
     try:
         t0 = time.time()
         is_stream = request.form.get("is_stream", "false").lower() in ["true", "1"]
-        result = run_anpr(img, is_stream=is_stream)
+        client_fid = request.form.get("client_frame_id", type=int)
+        client_ts = request.form.get("client_timestamp", type=float)
+
+        result = run_anpr(img, is_stream=is_stream, frame_id=client_fid, capture_timestamp=client_ts)
         det_time = time.time() - t0
         result["detection_time_sec"] = round(det_time, 3)
         # Simpan ke memory RAM jika kendaraan terkonfirmasi (atau single photo upload)
