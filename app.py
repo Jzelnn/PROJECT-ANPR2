@@ -1337,7 +1337,12 @@ def get_front_of_camera_score(cand, plates, img_w, img_h):
 # ============================================================
 class VehicleTrack:
     """
-    Melacak dan mengonfirmasi kendaraan secara temporal stabil.
+    Melacak dan mengonfirmasi kendaraan secara temporal adaptif untuk CCTV parkir.
+    Dua tingkat konfirmasi (Adaptive Confidence):
+    - TIER 1 (HIGH CONFIDENCE >= 90%): Cukup 2 observasi cocok dalam jendela observasi valid (respons cepat ~1.0-1.4s).
+    - TIER 2 (NORMAL CONFIDENCE >= 80%): Membutuhkan 3 observasi cocok dalam jendela observasi valid.
+    - Mentolerir short gaps / missed frames di antara observasi.
+    - Mengunci plat terkonfirmasi sehingga variasi OCR berikutnya tidak menimpa atau membuat duplikat.
     State Machine: ANALYZING -> CONFIRMED -> HISTORY_SAVED
     """
     def __init__(self, track_id, initial_det=None):
@@ -1360,10 +1365,8 @@ class VehicleTrack:
         self.best_plate_conf = 0.0
         self.plate_readings = []
 
-        # Stability tracking (3 matching out of latest 5 valid observations, preferring consecutive)
-        self.consecutive_plate = ""
-        self.consecutive_count = 0
-        self.valid_plate_observations = deque(maxlen=10)
+        # Riwayat observasi plat valid (conf >= 0.80)
+        self.valid_plate_observations = deque(maxlen=8)
 
         if initial_det:
             self.add_frame(initial_det)
@@ -1383,7 +1386,7 @@ class VehicleTrack:
                 self.best_crop_quality = quality
                 self.best_plate_conf = p_conf
 
-        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan
+        # 2. Akumulasi pembacaan plat nomor valid (conf >= 0.80) sepanjang pergerakan kendaraan
         p_clean = ""
         is_valid_high_conf = False
         if p_text and p_text != "TIDAK_TERBACA":
@@ -1401,19 +1404,6 @@ class VehicleTrack:
             }
             self.valid_plate_observations.append(obs)
             self.plate_readings.append(obs)
-
-            # Prefer consecutive matches:
-            if p_clean == self.consecutive_plate:
-                self.consecutive_count += 1
-            else:
-                self.consecutive_plate = p_clean
-                self.consecutive_count = 1
-        else:
-            # Low-confidence (<80%) atau frame terlewat/buram:
-            # Reset streak berurutan, namun valid_plate_observations tetap tersimpan
-            # agar mentolerir short gaps.
-            self.consecutive_plate = ""
-            self.consecutive_count = 0
 
         self.frames.append({
             "time": self.last_seen,
@@ -1437,41 +1427,55 @@ class VehicleTrack:
         self._evaluate_confirmation()
 
     def _evaluate_confirmation(self):
-        # Membutuhkan minimal 3 observasi valid
-        if len(self.valid_plate_observations) < 3:
+        # Membutuhkan minimal 2 observasi valid
+        if len(self.valid_plate_observations) < 2:
             return
 
-        stable_plate = None
-        stable_conf = 0.0
-        matching_count = 0
+        # Ambil maksimal 5 observasi valid terakhir
+        recent_obs = list(self.valid_plate_observations)[-5:]
 
-        # JALUR 1: PREFER CONSECUTIVE MATCHES (Kecocokan berurutan >= 3 frame langsung konfirmasi tercepat)
-        if self.consecutive_count >= 3 and self.consecutive_plate:
-            matching = [r for r in self.valid_plate_observations if r["clean"] == self.consecutive_plate]
-            if matching:
-                best_r = max(matching, key=lambda x: x["conf"])
-                stable_plate = best_r["text"]
-                stable_conf = best_r["conf"]
-                matching_count = self.consecutive_count
+        # Kelompokkan observasi berdasarkan plat bersih
+        candidates = {}
+        for r in recent_obs:
+            clean = r["clean"]
+            if clean not in candidates:
+                candidates[clean] = []
+            candidates[clean].append(r)
 
-        # JALUR 2: 3 MATCHING OBSERVATIONS DALAM 5 OBSERVASI VALID TERAKHIR (Toleransi short gaps)
-        if not stable_plate and len(self.valid_plate_observations) >= 3:
-            latest_5_valid = list(self.valid_plate_observations)[-5:]
-            counts = Counter(r["clean"] for r in latest_5_valid)
-            for p_cln, c in counts.items():
-                if c >= 3:
-                    # Ambil teks terbaik dengan confidence tertinggi untuk plat ini
-                    matching = [r for r in latest_5_valid if r["clean"] == p_cln]
-                    best_r = max(matching, key=lambda x: x["conf"])
-                    stable_plate = best_r["text"]
-                    stable_conf = best_r["conf"]
-                    matching_count = c
-                    break
+        best_stable_plate = None
+        best_stable_conf = 0.0
+        best_tier = None
+        best_matching_count = 0
 
-        if stable_plate and stable_conf >= 0.80 and matching_count >= 3:
-            self._finalize_confirmation(stable_plate, stable_conf, matching_count)
+        # Evaluasi setiap kandidat plat nomor:
+        # TIER 1 (HIGH CONFIDENCE): OCR confidence >= 90% pada minimal 2 observasi cocok
+        # TIER 2 (NORMAL HIGH CONFIDENCE): OCR confidence >= 80% pada minimal 3 observasi cocok
+        for clean, obs_list in candidates.items():
+            high_conf_obs = [r for r in obs_list if r["conf"] >= 0.90]
+            normal_conf_obs = [r for r in obs_list if r["conf"] >= 0.80]
 
-    def _finalize_confirmation(self, stable_plate, stable_conf, matching_count=3):
+            # Cek Tier 1: Minimal 2 observasi ber-confidence >= 90%
+            if len(high_conf_obs) >= 2:
+                best_r = max(high_conf_obs, key=lambda x: x["conf"])
+                if best_stable_plate is None or (best_tier != 1 and best_r["conf"] > best_stable_conf) or (best_tier == 1 and best_r["conf"] > best_stable_conf):
+                    best_stable_plate = best_r["text"]
+                    best_stable_conf = best_r["conf"]
+                    best_tier = 1
+                    best_matching_count = len(high_conf_obs)
+
+            # Cek Tier 2: Minimal 3 observasi ber-confidence >= 80% (hanya jika belum ada Tier 1)
+            elif len(normal_conf_obs) >= 3 and best_tier != 1:
+                best_r = max(normal_conf_obs, key=lambda x: x["conf"])
+                if best_stable_plate is None or best_r["conf"] > best_stable_conf:
+                    best_stable_plate = best_r["text"]
+                    best_stable_conf = best_r["conf"]
+                    best_tier = 2
+                    best_matching_count = len(normal_conf_obs)
+
+        if best_stable_plate is not None:
+            self._finalize_confirmation(best_stable_plate, best_stable_conf, best_matching_count)
+
+    def _finalize_confirmation(self, stable_plate, stable_conf, matching_count=2):
         # A. Voting Body Style (Weighted Confidence)
         style_weights = {}
         total_style_weight = 0.0
@@ -1523,15 +1527,32 @@ class VehicleTrack:
         self.is_locked = True
 
     def get_current_stability_count(self):
-        """Mengembalikan jumlah observasi plat yang cocok saat ini (untuk progress UI 1/3, 2/3, dst)."""
-        if self.consecutive_count > 0:
-            return min(self.consecutive_count, 3)
-        if self.valid_plate_observations:
-            latest_5 = list(self.valid_plate_observations)[-5:]
-            counts = Counter(r["clean"] for r in latest_5)
-            if counts:
-                return min(max(counts.values()), 3)
-        return 1 if self.frames else 0
+        """
+        Mengembalikan tuple (current_count, target_count) untuk progress UI (1/2 atau 2/3).
+        """
+        if not self.valid_plate_observations:
+            return 1, 3
+
+        recent_obs = list(self.valid_plate_observations)[-5:]
+        candidates = {}
+        for r in recent_obs:
+            clean = r["clean"]
+            if clean not in candidates:
+                candidates[clean] = []
+            candidates[clean].append(r)
+
+        max_matches = 0
+        target = 3
+
+        for clean, obs_list in candidates.items():
+            high_conf_obs = [r for r in obs_list if r["conf"] >= 0.90]
+            if len(high_conf_obs) >= 1:
+                target = 2
+                max_matches = max(max_matches, len(high_conf_obs))
+            else:
+                max_matches = max(max_matches, len(obs_list))
+
+        return max(1, min(max_matches, target)), target
 
     def get_current_consistency(self):
         if not self.frames:
@@ -1606,8 +1627,12 @@ class VehicleConfirmationManager:
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            # Bersihkan track yang tidak terlihat > 5.0 detik
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 5.0]
+            # Bersihkan track yang tidak terlihat > 4.0 detik atau track yang kadaluarsa dalam ANALYZING > 12 detik
+            # (Jika kendaraan keluar dari pandangan kamera sebelum konfirmasi, kandidat dibuang dan TIDAK disimpan)
+            stale_ids = [
+                tid for tid, trk in self.tracks.items()
+                if (now - trk.last_seen) > 4.0 or ((now - trk.created_at) > 12.0 and trk.status == "ANALYZING")
+            ]
             for tid in stale_ids:
                 del self.tracks[tid]
 
@@ -1632,7 +1657,7 @@ class VehicleConfirmationManager:
                         det["consistency"] = 0.5
                         det["is_newly_confirmed"] = False
                         det["analyzing_frame_count"] = 1
-                        det["analyzing_max_frames"] = 3
+                        det["analyzing_max_frames"] = 2 if p_conf >= 0.90 else 3
                     det.pop("plate_crop", None)
                 return detections
 
@@ -1699,8 +1724,9 @@ class VehicleConfirmationManager:
                     det["status"] = "ANALYZING"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.get_current_consistency()
-                    det["analyzing_frame_count"] = max(1, track.get_current_stability_count())
-                    det["analyzing_max_frames"] = 3
+                    curr_c, max_c = track.get_current_stability_count()
+                    det["analyzing_frame_count"] = curr_c
+                    det["analyzing_max_frames"] = max_c
 
                 # PENTING: Jangan kirim plate_crop (ndarray) ke client / JSON response
                 det.pop("plate_crop", None)
