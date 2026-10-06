@@ -1,7 +1,9 @@
-﻿flask
+flask
 flask-cors
+flask-sock
 ultralytics
 easyocr
 opencv-python
 requests
 numpy
+

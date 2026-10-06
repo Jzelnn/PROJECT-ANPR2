@@ -12,10 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import deque, Counter
 import requests
 from requests.auth import HTTPDigestAuth, HTTPBasicAuth
+import json
 from urllib.parse import urlparse
 import numpy as np
 import cv2
 from flask import Flask, request, jsonify, Response, send_from_directory
+from flask_sock import Sock
 
 # Kompatibilitas numpy 2.x jika diperlukan
 if not hasattr(np, 'sctypes'):
@@ -28,7 +30,10 @@ if not hasattr(np, 'sctypes'):
     }
 
 from ultralytics import YOLO
-import easyocr
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")  # lewati cek konektivitas model hoster (PaddleOCR 3.x)
+import paddleocr
+from paddleocr import PaddleOCR
 
 try:
     import torch
@@ -44,18 +49,15 @@ os.makedirs(CAPTURES_DIR, exist_ok=True)
 # PERFORMANCE & DETECTION CONFIGURATION
 # Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
-VEHICLE_IMG_SIZE = int(os.environ.get("ANPR_VEHICLE_IMG_SIZE", 320))  # 320 for ultra-fast vehicle detection/tracking (~35ms)
-PLATE_IMG_SIZE = int(os.environ.get("ANPR_PLATE_IMG_SIZE", 416))      # 416 for fast & accurate plate detection (~49ms)
-IMG_SIZE = PLATE_IMG_SIZE                                             # Alias for backward compatibility
-OCR_THROTTLE_SEC = float(os.environ.get("ANPR_OCR_THROTTLE_SEC", 0.12))# 120ms throttle between OCR cycles per track
-MIN_SHARPNESS_VAR = float(os.environ.get("ANPR_MIN_SHARPNESS", 25.0)) # Skip OCR on frames with motion blur < 25
+IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 512))           # 640 for reliable small plate detection
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.20))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.08))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
-FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
+FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))
+PLATE_DETECT_REFRESH_FRAMES = int(os.environ.get("ANPR_PLATE_REFRESH_FRAMES", 4))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
-USE_FP16 = bool(HAS_CUDA)  # True on CUDA GPU, False on CPU to prevent warnings
+USE_FP16 = False  # Keep false on CPU to prevent warnings
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3
@@ -63,6 +65,111 @@ MAX_OBSERVATIONS = 5
 TEMPORAL_WINDOW_SEC = 0.50
 CONSISTENCY_THRESH = 0.70
 CONFIRM_CONF_THRESH = 0.80
+
+# PaddleOCR & OCR Fusion Configuration
+PADDLE_DEVICE = os.environ.get("ANPR_PADDLE_DEVICE", "cpu")            # "cpu" atau "gpu:0"
+PADDLE_DET_MODEL = os.environ.get("ANPR_PADDLE_DET_MODEL") or None     # opsional (PaddleOCR 3.x)
+PADDLE_REC_MODEL = os.environ.get("ANPR_PADDLE_REC_MODEL") or None     # opsional (PaddleOCR 3.x)
+PADDLE_MIN_SHARPNESS = float(os.environ.get("ANPR_PADDLE_MIN_SHARPNESS", 4.0))  # var(Laplacian) minimum, BELUM dituning
+PADDLE_PRIMARY_MARGIN = float(os.environ.get("ANPR_PADDLE_MARGIN", 0.10))
+LOST_OCR_GRACE_SEC = float(os.environ.get("ANPR_LOST_OCR_GRACE", 1.5))  # tunggu job OCR berjalan saat LOST_INTEREST
+DEBUG_PLATE_CROPS = os.environ.get("ANPR_DEBUG_CROPS", "0").lower() in ("1", "true", "yes")
+DEBUG_CROPS_DIR = os.path.join(MODEL_DIR, "debug_plates")
+# Pembacaan yang BUKAN hasil OCR baru tidak boleh dihitung sebagai observasi kandidat (mencegah self-reinforcement)
+NON_EVIDENCE_OCR_METHODS = {"char_model_preview", "temporal_best_candidate", "locked_confirmed"}
+
+# ============================================================
+# DETECTION / INTEREST AREA CONFIGURATION (ROI)
+# Kendaraan hanya menjadi target aktif ALPR setelah memasuki area ini.
+# Bounding box normalisasi [x_min, y_min, x_max, y_max] (0.0 s/d 1.0).
+# ============================================================
+DEFAULT_INTEREST_AREA = {
+    "x_min": float(os.environ.get("ANPR_ROI_XMIN", 0.12)),
+    "y_min": float(os.environ.get("ANPR_ROI_YMIN", 0.20)),
+    "x_max": float(os.environ.get("ANPR_ROI_XMAX", 0.88)),
+    "y_max": float(os.environ.get("ANPR_ROI_YMAX", 0.95))
+}
+INTEREST_AREA = dict(DEFAULT_INTEREST_AREA)
+
+# Lost Interest parameters
+LOST_INTEREST_TIMEOUT_SEC = float(os.environ.get("ANPR_LOST_TIMEOUT", 2.0))
+LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 4))
+
+
+def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
+    """
+    Menentukan apakah kendaraan berada di dalam Detection / Interest Area (ROI).
+    Menggunakan titik tengah (cx, cy), titik bumper bawah (cx, y2), dan rasio overlap.
+    """
+    if roi is None:
+        roi = INTEREST_AREA
+
+    rx1 = roi["x_min"] * img_w
+    ry1 = roi["y_min"] * img_h
+    rx2 = roi["x_max"] * img_w
+    ry2 = roi["y_max"] * img_h
+
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    bx = cx
+    by = float(y2)
+
+    center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
+    bumper_in = (rx1 <= bx <= rx2) and (ry1 <= by <= ry2)
+    if center_in or bumper_in:
+        return True, 1.0
+
+    ix1 = max(float(x1), rx1)
+    iy1 = max(float(y1), ry1)
+    ix2 = min(float(x2), rx2)
+    iy2 = min(float(y2), ry2)
+
+    inter_w = max(0.0, ix2 - ix1)
+    inter_h = max(0.0, iy2 - iy1)
+    inter_area = inter_w * inter_h
+
+    veh_area = max(1.0, float((x2 - x1) * (y2 - y1)))
+    overlap_ratio = inter_area / veh_area
+
+    is_inside = overlap_ratio >= 0.35
+    return is_inside, overlap_ratio
+
+
+# ============================================================
+# WEBSOCKET BROADCASTER FOR REAL-TIME ANPR TELEMETRY
+# Mengirimkan pembaruan deteksi real-time & OCR ke seluruh frontend client yang terhubung.
+# ============================================================
+class WebSocketBroadcaster:
+    def __init__(self):
+        self.clients = set()
+        self.lock = threading.Lock()
+
+    def register(self, ws):
+        with self.lock:
+            self.clients.add(ws)
+            print(f"[WS] Client connected. Total active clients: {len(self.clients)}")
+
+    def unregister(self, ws):
+        with self.lock:
+            self.clients.discard(ws)
+            print(f"[WS] Client disconnected. Total active clients: {len(self.clients)}")
+
+    def broadcast(self, message_dict):
+        with self.lock:
+            if not self.clients:
+                return
+            msg_str = json.dumps(message_dict)
+            dead = []
+            for ws in list(self.clients):
+                try:
+                    ws.send(msg_str)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                self.clients.discard(ws)
+
+
+ws_broadcaster = WebSocketBroadcaster()
 
 # ============================================================
 # PURE IN-MEMORY STORAGE (RAM)
@@ -94,7 +201,9 @@ def save_parking_record(det, source_img=None, source_img_path=None):
         return None
 
     plate_conf = det.get("plate_confidence", 0.0) or 0.0
-    if plate_conf < 0.70:
+    is_confirmed = (det.get("status") in ["CONFIRMED", "HISTORY_SAVED"]) or det.get("is_newly_confirmed", False)
+    min_thresh = 0.65 if is_confirmed else 0.80
+    if plate_conf < min_thresh:
         return None
 
     now = datetime.datetime.now()
@@ -138,90 +247,23 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     # Simpan langsung ke RAM (0 milidetik, tanpa overhead disk I/O)
     LATEST_RECORDS.appendleft(rec)
     LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": rec}
+    
+    # Broadcast langsung ke WebSocket clients seketika
+    ws_broadcaster.broadcast({
+        "type": "entry_confirmed",
+        "record": rec
+    })
+
+    conf_time = det.get("confirmation_time")
+    dt_conf_to_hist = ((now_epoch - conf_time) * 1000.0) if conf_time else 0.0
+    print(f"""[ENTRY HISTORY]
+track={track_id}
+plate=\"{safe_plate}\"
+timestamp={now_epoch:.3f}
+time_from_confirmation_to_history_ms={dt_conf_to_hist:.1f}
+action=INSERTED""")
     return rec
 
-
-# ============================================================
-# LATEST-FRAME-ONLY BUFFER (BOUNDED QUEUE MAX SIZE = 1)
-# Menjamin backend selalu memproses frame TERBARU.
-# Frame-frame lama yang tiba saat AI sedang sibuk otomatis dibuang.
-# Menghilangkan antrean usang (stale frame backlog) secara permanen.
-# ============================================================
-class LatestFrameBuffer:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
-        self.latest_frame = None
-        self.frame_id = 0
-        self.capture_timestamp = 0.0
-        self.source = ""
-        self.is_stream = True
-        self.discarded_frames = 0
-        self.total_received = 0
-
-    def put(self, frame, frame_id, capture_timestamp=None, source="stream", is_stream=True):
-        """Menaruh frame baru ke buffer. Jika ada frame sebelumnya yang belum sempat diproses, buang frame lama!"""
-        with self.condition:
-            if self.latest_frame is not None:
-                self.discarded_frames += 1
-            self.latest_frame = frame
-            self.frame_id = frame_id
-            self.capture_timestamp = capture_timestamp if capture_timestamp is not None else time.time()
-            self.source = source
-            self.is_stream = is_stream
-            self.total_received += 1
-            self.condition.notify()
-
-    def get_latest(self):
-        """Mengambil frame terbaru (consume) dan mengosongkan buffer."""
-        with self.lock:
-            if self.latest_frame is None:
-                return None, None, None, None, None
-            f = self.latest_frame
-            fid = self.frame_id
-            ts = self.capture_timestamp
-            src = self.source
-            st = self.is_stream
-            self.latest_frame = None
-            return f, fid, ts, src, st
-
-    def wait_next(self, timeout=0.1):
-        """Menunggu frame terbaru berikutnya jika buffer kosong."""
-        with self.condition:
-            if self.latest_frame is None:
-                self.condition.wait(timeout=timeout)
-            if self.latest_frame is None:
-                return None, None, None, None, None
-            f = self.latest_frame
-            fid = self.frame_id
-            ts = self.capture_timestamp
-            src = self.source
-            st = self.is_stream
-            self.latest_frame = None
-            return f, fid, ts, src, st
-
-    def clear(self):
-        with self.lock:
-            self.latest_frame = None
-            self.frame_id = 0
-            self.capture_timestamp = 0.0
-
-    @property
-    def queue_size(self):
-        with self.lock:
-            return 1 if self.latest_frame is not None else 0
-
-    def get_stats(self):
-        with self.lock:
-            return {
-                "queue_size": 1 if self.latest_frame is not None else 0,
-                "discarded_stale_frames": self.discarded_frames,
-                "total_frames_received": self.total_received,
-                "latest_frame_id": self.frame_id
-            }
-
-
-realtime_frame_buffer = LatestFrameBuffer()
 
 
 # ============================================================
@@ -235,7 +277,6 @@ class CameraStreamManager:
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.frame_id = 0
-        self.latest_capture_ts = 0.0
         self.running = False
         self.thread = None
         self.stream_url = ""
@@ -243,6 +284,7 @@ class CameraStreamManager:
         self.password = ""
         self.latest_frame = None       # Full-res (1080p) numpy array untuk ANPR AI
         self.latest_jpeg = None        # Compressed JPEG untuk live stream ultra-smooth
+        self.latest_frame_time = None  # Timestamp when latest frame was captured
         self.fps = 0.0
         self.status = "disconnected"   # "disconnected", "connecting", "connected", "error"
         self.error_msg = ""
@@ -261,8 +303,8 @@ class CameraStreamManager:
             self.error_msg = ""
             self.thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.thread.start()
-            if 'realtime_worker' in globals() and realtime_worker:
-                realtime_worker.start()
+            if 'stream_inference_worker' in globals():
+                stream_inference_worker.start()
             return True, "Memulai koneksi kamera di latar belakang"
 
     def stop(self):
@@ -275,24 +317,17 @@ class CameraStreamManager:
         self.status = "disconnected"
         self.latest_frame = None
         self.latest_jpeg = None
-        if 'realtime_worker' in globals() and realtime_worker:
-            realtime_worker.stop()
-            realtime_worker.reset_stats()
-        if 'realtime_frame_buffer' in globals() and realtime_frame_buffer:
-            realtime_frame_buffer.clear()
+        self.latest_frame_time = None
+        if 'stream_inference_worker' in globals():
+            stream_inference_worker.stop()
         if 'confirmation_manager' in globals():
             confirmation_manager.reset()
         self.condition.notify_all()
 
+
     def get_latest_frame(self):
         with self.lock:
             return self.latest_frame.copy() if self.latest_frame is not None else None
-
-    def get_latest_frame_with_meta(self):
-        with self.lock:
-            if self.latest_frame is None:
-                return None, 0, 0.0
-            return self.latest_frame.copy(), self.frame_id, self.latest_capture_ts
 
     def get_latest_jpeg(self):
         with self.lock:
@@ -416,10 +451,9 @@ class CameraStreamManager:
                 with self.condition:
                     self.latest_frame = frame
                     self.latest_jpeg = jpeg_buf.tobytes()
+                    self.latest_frame_time = time.time()
                     self.frame_id += 1
-                    self.latest_capture_ts = now
                     self.condition.notify_all()
-                realtime_frame_buffer.put(frame, self.frame_id, capture_timestamp=now, source="camera_stream", is_stream=True)
 
         cap.release()
         with self.lock:
@@ -428,6 +462,102 @@ class CameraStreamManager:
 
 
 camera_stream_manager = CameraStreamManager()
+
+class PaddleEngine:
+    """
+    Wrapper PaddleOCR tunggal. Diinisialisasi SEKALI saat startup (bukan per frame / per request).
+    Mendukung PaddleOCR 3.x (.predict) dan 2.x (.ocr).
+    Panggilan diserialkan dengan lock karena predictor Paddle tidak dijamin thread-safe
+    (ocr_executor memakai 2 worker).
+    run() mengembalikan list of {"text", "conf", "box"}; box = [[x, y] * 4] atau None.
+    """
+    def __init__(self, device="cpu", det_model=None, rec_model=None):
+        self.lock = threading.Lock()
+        self.version = getattr(paddleocr, "__version__", "unknown")
+        self.api = "v3" if hasattr(PaddleOCR, "predict") else "v2"
+        t0 = time.time()
+        if self.api == "v3":
+            kw = dict(
+                lang="en",
+                device=device,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
+            )
+            if det_model:
+                kw["text_detection_model_name"] = det_model
+            if rec_model:
+                kw["text_recognition_model_name"] = rec_model
+            self.engine = PaddleOCR(**kw)
+        else:
+            self.engine = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=(device != "cpu"), show_log=False)
+        self.init_ms = (time.time() - t0) * 1000.0
+
+        # Warm-up agar inferensi pertama (yang biasanya lambat) tidak terjadi saat kendaraan pertama lewat
+        t1 = time.time()
+        try:
+            self.run(np.full((64, 224, 3), 255, dtype=np.uint8))
+        except Exception as e:
+            print(f"[PADDLE WARN] warm-up gagal: {e}")
+        self.warmup_ms = (time.time() - t1) * 1000.0
+        print(f"[PADDLE] siap | paddleocr={self.version} api={self.api} device={device} "
+              f"init={self.init_ms:.0f}ms warmup={self.warmup_ms:.0f}ms")
+
+    @staticmethod
+    def _to_box(poly):
+        try:
+            arr = np.asarray(poly, dtype=float)
+            if arr.ndim == 2 and arr.shape[1] == 2:
+                return arr.tolist()
+            if arr.ndim == 1 and arr.size == 4:
+                x1, y1, x2, y2 = arr.tolist()
+                return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _as_list(x):
+        return [] if x is None else list(x)
+
+    def _parse(self, out):
+        items = []
+        if self.api == "v3":
+            for res in (out or []):
+                d = res if isinstance(res, dict) else (getattr(res, "json", None) or {})
+                if isinstance(d.get("res"), dict):
+                    d = d["res"]
+                texts = self._as_list(d.get("rec_texts"))
+                scores = self._as_list(d.get("rec_scores"))
+                polys = d.get("rec_polys")
+                if polys is None:
+                    polys = d.get("dt_polys")
+                polys = self._as_list(polys)
+                for i, t in enumerate(texts):
+                    sc = float(scores[i]) if i < len(scores) else 0.0
+                    box = self._to_box(polys[i]) if i < len(polys) else None
+                    items.append({"text": str(t), "conf": sc, "box": box})
+        else:
+            page = out[0] if out else None
+            for line in (page or []):
+                try:
+                    box, (t, sc) = line
+                    items.append({"text": str(t), "conf": float(sc), "box": self._to_box(box)})
+                except Exception:
+                    continue
+        return items
+
+    def run(self, img_bgr):
+        with self.lock:
+            if self.api == "v3":
+                out = self.engine.predict(img_bgr)
+            else:
+                out = self.engine.ocr(img_bgr, cls=False)
+        return self._parse(out)
+
+
+paddle_engine = None
+
 
 print("[INFO] Memuat model AI...")
 # 1. Model Deteksi Kendaraan Indonesia (dilatih khusus untuk kendaraan jalanan Indonesia)
@@ -457,9 +587,20 @@ else:
 plate_model_legacy = YOLO(os.path.join(MODEL_DIR, "plate_model.pt"))
 body_style_model = YOLO(os.path.join(MODEL_DIR, "body_style_model.pt"))
 char_model = YOLO(os.path.join(MODEL_DIR, "char_model.pt"))
-ocr_reader = easyocr.Reader(['en'], gpu=False)
+paddle_engine = PaddleEngine(device=PADDLE_DEVICE, det_model=PADDLE_DET_MODEL, rec_model=PADDLE_REC_MODEL)
 ai_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ANPR_YOLO")
-print("[INFO] Semua model AI & EasyOCR siap digunakan!")
+ocr_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ANPR_ASYNC_OCR")
+ocr_job_counter = 0
+ocr_job_lock = threading.Lock()
+
+def get_next_ocr_job_id():
+    global ocr_job_counter
+    with ocr_job_lock:
+        ocr_job_counter += 1
+        return ocr_job_counter
+
+print("[INFO] Semua model AI, PaddleOCR & Thread Pools siap digunakan!")
+
 
 def map_vehicle_class_name(cls_id, model=vehicle_model):
     """Memetakan nama kelas deteksi YOLO kendaraan ke format standar: car, motorcycle, bus, truck."""
@@ -510,6 +651,30 @@ SAMSAT_PREFIXES = {
 }
 
 
+def is_valid_indonesian_plate_structure(plate_str):
+    """
+    Memvalidasi apakah string OCR memenuhi struktur plat nomor Indonesia atau format dinas/militer.
+    Returns: (is_valid: bool, plate_type: str or None)
+    """
+    if not plate_str or plate_str in ["TIDAK_TERBACA", "UNKNOWN", ""]:
+        return False, None
+    plate_str = str(plate_str).strip()
+    # Format dinas / militer: e.g. "523-07", "1234-01"
+    if '-' in plate_str:
+        parts = plate_str.split('-')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return True, "military"
+    clean = re.sub(r'[^A-Z0-9]', '', plate_str.upper())
+    # Format sipil Indonesia: 1-2 huruf kode wilayah, 1-4 angka nomor polisi, 1-3 huruf seri akhir
+    m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
+    if m:
+        prefix, digits, suffix = m.groups()
+        if prefix in SAMSAT_PREFIXES:
+            return True, "standard"
+        return True, "standard_general"
+    return False, None
+
+
 def is_valid_plate_box(box, img_w, img_h):
     """Memvalidasi geometri bounding box plat untuk menyingkirkan deteksi palsu (grille, bumper, garis aspal)."""
     x1, y1, x2, y2 = box
@@ -546,14 +711,6 @@ def compute_crop_quality(crop, p_conf=0.5):
     aspect_factor = 1.0 if 2.0 <= aspect <= 5.0 else 0.6
     quality = res_factor * (sharpness ** 0.5) * (max(0.2, p_conf) ** 0.5) * aspect_factor
     return quality
-
-
-def compute_sharpness(crop):
-    """Menghitung nilai Laplacian variance untuk mengukur ketajaman citra / motion blur."""
-    if crop is None or getattr(crop, 'size', 0) == 0:
-        return 0.0
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def enhance_moving_plate_crop(crop):
@@ -719,492 +876,331 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
     return raw_text, avg_conf, line1_chars
 
 
-def read_plate_with_easyocr(plate_crop):
-    """Membaca teks plat nomor menggunakan EasyOCR dengan multi-pass grayscale & Otsu binarization."""
-    h, w = plate_crop.shape[:2]
-    if h == 0 or w == 0:
-        return "", 0.0, []
+# ============================================================
+# PEMBACAAN PLAT NOMOR
+# Dua sinyal independen:
+#   1. PaddleOCR            -> engine OCR utama (paddle_text, paddle_confidence)
+#   2. YOLO Character Model -> sinyal karakter-level (character_model_text, character_model_confidence)
+# Confidence kedua sinyal TIDAK pernah dinaikkan secara artifisial; hasil akhir membawa
+# confidence asli dari sumber yang dipilih. Bonus kesepakatan hanya masuk ke candidate_score (peringkat).
+# ============================================================
+def _alnum(text):
+    return re.sub(r'[^A-Z0-9]', '', str(text).upper())
 
-    # Skala optimal CRAFT / EasyOCR (tinggi ideal ~55-70px untuk pengenalan karakter cepat di CPU)
-    if h < 45:
-        scale = 60.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 60), interpolation=cv2.INTER_LINEAR)
-    elif h > 120:
-        scale = 90.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 90), interpolation=cv2.INTER_AREA)
-    else:
-        proc_crop = plate_crop
 
-    proc_h = proc_crop.shape[0]
-    gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
-    is_black_plate = float(gray.mean()) < 85.0
-
-    ocr_res = []
+def _save_debug_plate_crop(img, tag, suffix=""):
+    """Simpan crop yang BENAR-BENAR dikirim ke PaddleOCR (aktif jika ANPR_DEBUG_CROPS=1)."""
+    if not DEBUG_PLATE_CROPS or img is None or getattr(img, "size", 0) == 0:
+        return
     try:
-        # Jika plat hitam (tulisan putih di latar hitam), invert agar terbaca optimal oleh OCR (tulisan hitam di latar putih)
-        ocr_img = cv2.bitwise_not(gray) if is_black_plate else gray
-        ocr_res.extend(ocr_reader.readtext(ocr_img, paragraph=False))
-        # Hanya jalankan pass 2 (Otsu) jika pass 1 menghasilkan kurang dari 4 karakter agar hemat waktu ~300ms
-        has_clear_text = any(len(re.sub(r'[^A-Z0-9]', '', r[1])) >= 4 for r in ocr_res)
-        if not has_clear_text:
-            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            if is_black_plate:
-                otsu = cv2.bitwise_not(otsu)
-            ocr_res.extend(ocr_reader.readtext(otsu, paragraph=False))
+        os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%H%M%S_%f")[:10]
+        cv2.imwrite(os.path.join(DEBUG_CROPS_DIR, f"{stamp}_{tag or 'plate'}{suffix}.jpg"), img,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    except Exception:
+        pass
+
+
+def _prepare_paddle_input(crop):
+    """Resize ringan ke tinggi yang nyaman bagi detektor teks Paddle + border kecil (tanpa filter agresif)."""
+    h, w = crop.shape[:2]
+    if h < 80:
+        scale, interp = 96.0 / h, cv2.INTER_CUBIC
+    elif h > 160:
+        scale, interp = 128.0 / h, cv2.INTER_AREA
+    else:
+        scale, interp = 1.0, None
+    if scale != 1.0:
+        crop = cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=interp)
+    return cv2.copyMakeBorder(crop, 8, 8, 12, 12, cv2.BORDER_REPLICATE)
+
+
+def _paddle_pass(img, label):
+    """Satu pass PaddleOCR -> list segmen teks. Hasil mentah selalu dicatat ke log."""
+    t0 = time.time()
+    items = paddle_engine.run(img)
+    ms = (time.time() - t0) * 1000.0
+    H = max(1, img.shape[0])
+    lines = []
+    for it in items:
+        raw = it["text"]
+        conf = float(it["conf"])
+        clean = re.sub(r'[^A-Z0-9\-]', '', str(raw).upper().replace('\u2013', '-').replace('\u2014', '-')).strip('-')
+        box = it.get("box")
+        if box:
+            ys = [p[1] for p in box]
+            xs = [p[0] for p in box]
+            cy, x0 = (sum(ys) / len(ys)) / H, min(xs)
+        else:
+            cy, x0 = None, None
+        lines.append({"raw": raw, "clean": clean, "conf": conf, "cy": cy, "x0": x0})
+        print(f"[PADDLE] pass={label} raw='{raw}' conf={conf:.3f} normalized='{clean}' "
+              f"cy={'-' if cy is None else round(cy, 2)}")
+    return lines, ms
+
+
+def _merge_main_plate_line(lines):
+    """
+    Gabungkan segmen pada baris ATAS plat (nomor polisi). Baris bawah (bulan/tahun pajak) diabaikan.
+    Detektor Paddle kadang memecah 'B 1591 BPC' menjadi beberapa segmen; segmen digabung kiri->kanan.
+    Confidence gabungan = rata-rata tertimbang jumlah karakter (tanpa boost).
+    """
+    cand = [l for l in lines if _alnum(l["clean"]) and l["conf"] >= 0.10]
+    if not cand:
+        return "", 0.0
+    boxed = [l for l in cand if l["cy"] is not None]
+    if not boxed:
+        best = max(cand, key=lambda l: l["conf"])
+        return best["clean"], best["conf"]
+    top = sorted([l for l in boxed if l["cy"] < 0.70], key=lambda l: l["cy"])
+    if not top:
+        return "", 0.0
+    rows = []
+    for l in top:
+        if rows and abs(l["cy"] - (sum(r["cy"] for r in rows[-1]) / len(rows[-1]))) <= 0.15:
+            rows[-1].append(l)
+        else:
+            rows.append([l])
+    row = max(rows, key=lambda r: (sum(len(_alnum(x["clean"])) for x in r), sum(x["conf"] for x in r) / len(r)))
+    row = sorted(row, key=lambda l: l["x0"] if l["x0"] is not None else 0.0)
+    parts = [l["clean"] for l in row]
+    if len(parts) == 2 and re.fullmatch(r'\d{3,4}', _alnum(parts[0])) and re.fullmatch(r'\d{2}', _alnum(parts[1])):
+        text = f"{_alnum(parts[0])}-{_alnum(parts[1])}"   # format dinas/militer, misal 523-07
+    else:
+        text = "".join(parts)
+    total = sum(len(_alnum(l["clean"])) for l in row) or 1
+    conf = sum(l["conf"] * len(_alnum(l["clean"])) for l in row) / total
+    return text, float(conf)
+
+
+def read_plate_with_paddleocr(plate_crop, debug_tag=None):
+    """
+    Membaca teks plat dengan PaddleOCR. Pengganti read_plate_with_easyocr().
+    Return: {"text", "confidence", "all_texts", "raw", "ms", "passes", "skipped", ...}
+    """
+    out = {"text": "", "confidence": 0.0, "all_texts": [], "raw": [], "ms": 0.0,
+           "passes": 0, "skipped": None, "crop_w": 0, "crop_h": 0, "sharpness": 0.0}
+    if paddle_engine is None:
+        out["skipped"] = "engine_unavailable"
+        return out
+    if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
+        out["skipped"] = "empty_crop"
+        return out
+    h, w = plate_crop.shape[:2]
+    out["crop_w"], out["crop_h"] = w, h
+    if h < 14 or w < 28:
+        out["skipped"] = "too_small"
+    else:
+        gray0 = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+        out["sharpness"] = float(cv2.Laplacian(gray0, cv2.CV_64F).var())
+        if out["sharpness"] < PADDLE_MIN_SHARPNESS:
+            out["skipped"] = "too_blurry"
+    if out["skipped"]:
+        print(f"[PADDLE] SKIP tag={debug_tag} reason={out['skipped']} crop={w}x{h} sharpness={out['sharpness']:.1f}")
+        return out
+
+    t0 = time.time()
+    try:
+        proc = _prepare_paddle_input(plate_crop)
+        _save_debug_plate_crop(proc, debug_tag, "_p1")
+        lines, _ = _paddle_pass(proc, "1")
+        all_lines = list(lines)
+        text, conf = _merge_main_plate_line(lines)
+        passes = 1
+
+        # Pass 2 (grayscale + CLAHE, invert jika plat gelap) HANYA bila pass 1 tidak menghasilkan teks yang jelas
+        if len(_alnum(text)) < 4:
+            g = cv2.cvtColor(proc, cv2.COLOR_BGR2GRAY)
+            if float(g.mean()) < 85.0:
+                g = cv2.bitwise_not(g)
+            g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(g)
+            proc2 = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+            _save_debug_plate_crop(proc2, debug_tag, "_p2")
+            lines2, _ = _paddle_pass(proc2, "2")
+            all_lines += lines2
+            t2, c2 = _merge_main_plate_line(lines2)
+            n1, n2 = len(_alnum(text)), len(_alnum(t2))
+            if n2 > n1 or (n2 == n1 and c2 > conf):
+                text, conf = t2, c2
+            passes = 2
     except Exception as e:
-        print(f"[DEBUG EasyOCR Error]: {e}")
-        return "", 0.0, []
+        print(f"[PADDLE ERROR] tag={debug_tag}: {e}")
+        out["skipped"] = f"error:{e}"
+        return out
 
-    valid_lines = []
-    all_raw_texts = []
-    for item in ocr_res:
-        bbox, text, conf = item
-        clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
-        if not clean_text:
-            continue
-        # Filter noise rendah (< 0.12 conf)
-        item_conf = float(conf)
-        if item_conf < 0.12:
-            continue
-        all_raw_texts.append(clean_text)
-        cy = (bbox[0][1] + bbox[2][1]) / 2.0
-        norm_cy = cy / float(proc_h)
-        if norm_cy < 0.70:
-            valid_lines.append((clean_text, item_conf, norm_cy))
-
-    if not valid_lines:
-        return "", 0.0, all_raw_texts
-
-    valid_lines.sort(key=lambda x: -x[1])
-    best_text = valid_lines[0][0]
-    best_conf = valid_lines[0][1]
-    return best_text, best_conf, all_raw_texts
+    out.update({
+        "text": text,
+        "confidence": float(conf) if text else 0.0,
+        "all_texts": [l["clean"] for l in all_lines if l["clean"]],
+        "raw": [(l["raw"], round(l["conf"], 3)) for l in all_lines],
+        "ms": (time.time() - t0) * 1000.0,
+        "passes": passes,
+    })
+    print(f"[PADDLE] FINAL tag={debug_tag} raw={out['raw']} normalized='{text}' "
+          f"confidence={out['confidence']:.3f} passes={passes} ms={out['ms']:.1f}")
+    return out
 
 
-def refine_indonesian_plate(char_raw, easy_raw="", all_easy_texts=None):
-    """
-    Menyelaraskan hasil pembacaan plat nomor sesuai regulasi Korlantas Polri Indonesia:
-    1. Kode Wilayah (Prefix): 1-2 Huruf
-    2. Nomor Polisi (Digits): 1-4 Angka
-    3. Seri Akhir (Suffix): 1-3 Huruf (Tanpa huruf 'Q' dan 'I')
-    """
-    c_clean = re.sub(r'[^A-Z0-9]', '', char_raw.upper())
-    e_clean = re.sub(r'[^A-Z0-9]', '', easy_raw.upper()) if easy_raw else ""
-    if all_easy_texts is None:
-        all_easy_texts = []
+# ------------------------------------------------------------
+# Normalisasi struktur plat Indonesia (GENERIK, bukan heuristik khusus EasyOCR / plat tertentu)
+# Struktur: Prefix 1-2 huruf (kode wilayah) + 1-4 angka + Suffix 1-3 huruf. Format dinas: 523-07.
+# Koreksi hanya berbasis posisi (angka di slot huruf / huruf di slot angka).
+# ------------------------------------------------------------
+_PREFIX_FIX = {'0': 'D', '8': 'B', '4': 'A', '5': 'S', '6': 'G', '2': 'Z'}
+_SUFFIX_FIX = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B'}
+_DIGIT_FIX = {'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'A': '4', 'S': '5', 'G': '6', 'B': '8'}
 
-    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07, 151-12)
-    for t in all_easy_texts:
-        tc = re.sub(r'[^A-Z0-9]', '', t.upper())
-        if tc in ('52307', '32307', '523-07', '323-07'):
-            return "523-07"
-        if tc in ('15112', '151-12'):
-            return "151-12"
 
-    dig3 = [t for t in all_easy_texts if len(t) in (3, 4) and t.isdigit()]
-    dig2 = [t for t in all_easy_texts if len(t) == 2 and t.isdigit()]
-    if '523' in dig3 and any(d in ('07', '77') for d in dig2):
-        return "523-07"
-    if '151' in dig3 and '12' in dig2:
-        return "151-12"
-
-    # Jika char_raw hanya noise singkat (<= 2 char) dan terdapat pasangan digit militer di EasyOCR
-    if len(c_clean) <= 2 and not any(len(t) >= 4 and any(c.isalpha() for c in t) for t in all_easy_texts):
-        easy_join = " ".join(all_easy_texts)
-        m_mil = re.search(r'(\d{3,4})[\s\-_]+(\d{2})', easy_join)
-        if m_mil:
-            return f"{m_mil.group(1)}-{m_mil.group(2)}"
-        if dig3 and dig2:
-            return f"{dig3[0]}-{dig2[0]}"
-
-    if not c_clean and not e_clean:
-        return ""
-
-    # Ekstraksi seluruh kandidat suffix dan digit dari EasyOCR
-    easy_digit_candidates = []
-    easy_prefixes = []
-    easy_suffixes = []
-
-    for t in all_easy_texts:
-        t_c = re.sub(r'[^A-Z0-9]', '', t.upper())
-        if not t_c:
-            continue
-
-        # Pola lengkap EasyOCR: misal "81125BMU" -> prefix B, digits 1125, suffix BNV
-        m_full = re.match(r'^([8B0-9A-Z]{1,2})(\d{1,4})([A-Z0-9]{1,3})$', t_c)
-        if m_full:
-            p_cand = m_full.group(1)
-            if p_cand == '8':
-                p_cand = 'B'
-            easy_prefixes.append(p_cand)
-            easy_digit_candidates.append(m_full.group(2))
-            easy_suffixes.append(m_full.group(3))
-
-        # Pola angka yang diawali '8' (khas EasyOCR membaca huruf B sebagai digit 8)
-        if t_c.startswith('8') and len(t_c) >= 5 and t_c[1:5].isdigit():
-            easy_prefixes.append('B')
-            easy_digit_candidates.append(t_c[1:5])
-            if len(t_c) > 5:
-                easy_suffixes.append(t_c[5:])
-
-        if t_c.isalpha() and 2 <= len(t_c) <= 3:
-            easy_suffixes.append(t_c)
-        m_digs = list(re.finditer(r'\d+', t_c))
-        if m_digs:
-            s_tail = t_c[m_digs[-1].end():]
-            if 1 <= len(s_tail) <= 3 and s_tail.isalpha():
-                easy_suffixes.append(s_tail)
-
-        for dm in re.finditer(r'\d{1,4}', t_c):
-            cand = dm.group(0)
-            if cand not in {'0531', '0524', '0525', '0526', '0527', '0528', '0529', '0530', '0532', '0533', '0534'}:
-                easy_digit_candidates.append(cand)
-        if len(t_c) >= 4 and t_c.isdigit():
-            for i in range(len(t_c) - 3):
-                easy_digit_candidates.append(t_c[i:i+4])
-
-    # Pilih kerangka utama: Utamakan teks yang paling lengkap dan berstruktur
-    has_alpha_and_digit_c = any(c.isalpha() for c in c_clean) and any(c.isdigit() for c in c_clean)
-    has_alpha_and_digit_e = any(c.isalpha() for c in e_clean) and any(c.isdigit() for c in e_clean)
-
-    if len(e_clean) >= 6 and len(c_clean) < 5:
-        base_text = e_clean
-    elif len(c_clean) >= 5 and has_alpha_and_digit_c:
-        base_text = c_clean
-    elif len(e_clean) >= 5 and has_alpha_and_digit_e:
-        base_text = e_clean
-    elif len(c_clean) >= 3 or has_alpha_and_digit_c:
-        base_text = c_clean
-    else:
-        base_text = e_clean or c_clean
-
-    # Normalisasi leading '8' menjadi 'B' jika diikuti digit (khas EasyOCR)
-    if base_text.startswith('8') and len(base_text) >= 5 and base_text[1].isdigit():
-        base_text = 'B' + base_text[1:]
-
-    # Parsing struktur plat: Prefix (1-2 huruf), Digits (1-4 angka), Suffix (1-3 huruf)
-    m_struct = re.match(r'^([A-Z]{1,2})(\d{1,4})(.*)$', base_text)
-    if m_struct:
-        prefix = m_struct.group(1)
-        digits = m_struct.group(2)
-        suffix = m_struct.group(3)
-    else:
-        first_digit_idx = -1
-        for i, ch in enumerate(base_text):
-            if ch.isdigit():
-                first_digit_idx = i
-                break
-
-        if first_digit_idx > 0:
-            prefix = base_text[:first_digit_idx]
-            rem = base_text[first_digit_idx:]
-            m_d = re.match(r'^(\d{1,4})(.*)$', rem)
-            if m_d:
-                digits = m_d.group(1)
-                suffix = m_d.group(2)
-            else:
-                digits = rem[:4]
-                suffix = rem[4:]
+def _fit_slot(chars, fix_map, want_alpha):
+    out, fixes = "", 0
+    for ch in chars:
+        ok = ch.isalpha() if want_alpha else ch.isdigit()
+        if ok:
+            out += ch
+        elif ch in fix_map:
+            out += fix_map[ch]
+            fixes += 1
         else:
-            m = re.match(r'^([A-Z0-9]{1,2})([0-9A-Z]{1,4})([A-Z0-9]{1,3})$', base_text)
-            if m:
-                prefix, digits, suffix = m.group(1), m.group(2), m.group(3)
-            else:
-                prefix = base_text[:1] if len(base_text) > 0 else ""
-                digits = base_text[1:5] if len(base_text) > 1 else ""
-                suffix = base_text[5:] if len(base_text) > 5 else ""
-
-    if not suffix and easy_suffixes:
-        suffix = easy_suffixes[0]
-
-    # 1. Normalisasi Prefix (Kode Wilayah)
-    clean_prefix = ""
-    for ch in prefix[:2]:
-        if ch.isalpha():
-            clean_prefix += ch
-        elif ch in {'4': 'A', '8': 'B', '0': 'D', '1': 'B'}:
-            clean_prefix += {'4': 'A', '8': 'B', '0': 'D', '1': 'B'}[ch]
-
-    # Plat nomor Indonesia TIDAK PERNAH diawali huruf 'I' atau angka '1'
-    if clean_prefix in ('', 'I', '1') or (len(clean_prefix) == 1 and clean_prefix not in SAMSAT_PREFIXES):
-        clean_prefix = 'B'
-    elif clean_prefix == "GA":
-        clean_prefix = "BA"
-    elif clean_prefix.startswith('8'):
-        clean_prefix = 'B' + clean_prefix[1:]
-    elif (clean_prefix.startswith('E') or clean_prefix.startswith('8')) and any(t.startswith('8') or t.startswith('B') for t in all_easy_texts):
-        clean_prefix = 'B' + clean_prefix[1:]
-    elif clean_prefix.startswith('O') or clean_prefix.startswith('0'):
-        clean_prefix = 'D' + clean_prefix[1:]
-    elif clean_prefix == "BL" and len(digits) == 3 and c_clean.startswith("B4"):
-        clean_prefix = "B"
-        digits = "4" + digits
-
-    # 2. Normalisasi Digits (Maksimal 4 angka)
-    d_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'P': '8', 'R': '8'}
-    clean_digits = ""
-    for ch in digits[:4]:
-        clean_digits += d_map.get(ch, ch)
-
-    # Disambiguasi digit via EasyOCR jika tersedia
-    for t in all_easy_texts:
-        for dm in re.finditer(r'\d{2,4}', t):
-            ec = dm.group(0)
-            if ec.startswith("81") and clean_digits.startswith("82"):
-                clean_digits = "81" + clean_digits[2:]
-            elif len(ec) == len(clean_digits) and ec in ('8188', '1899', '9501', '9301'):
-                clean_digits = ec
-
-    # Cross-check digit dengan kandidat angka dari EasyOCR
-    for ecand in easy_digit_candidates:
-        if ecand in ('1399', '999', '9999', '236', '902'):
-            clean_digits = ecand
-            break
-        elif ecand in c_clean and len(ecand) in (3, 4):
-            clean_digits = ecand
-            break
-        elif len(ecand) == len(clean_digits) and len(clean_digits) in (3, 4) and sum(a == b for a, b in zip(ecand, clean_digits)) >= (len(clean_digits) - 1):
-            clean_digits = ecand
-            break
-        elif not (len(clean_digits) >= 1 and all(c.isdigit() for c in clean_digits)):
-            if len(ecand) in (1, 2, 3, 4):
-                clean_digits = ecand
-                break
-
-    # Disambiguasi digit khusus:
-    if clean_prefix == 'B' and (re.match(r'^[68]1[68]8$', clean_digits) or clean_digits in ('8288', '8168', '6168', '6188')):
-        clean_digits = '8188'
-    elif clean_prefix == 'B' and clean_digits in ('1730', '7730', '1736', '71736'):
-        clean_digits = '1738'
-
-    # 3. Normalisasi Suffix (1-3 huruf)
-    s_map = {'0': 'O', '1': 'I', '2': 'Z', '4': 'A', '5': 'S', '6': 'G', '8': 'B'}
-    clean_suffix = ""
-    for ch in suffix[:3]:
-        if ch in s_map:
-            clean_suffix += s_map[ch]
-        elif ch.isalpha():
-            clean_suffix += ch
-
-    # Jika suffix dari char model hanya 1-2 huruf, utamakan suffix 2-3 huruf dari EasyOCR
-    if len(clean_suffix) < 2:
-        for es in easy_suffixes:
-            if 2 <= len(es) <= 3 and es.isalpha():
-                clean_suffix = es
-                break
-    elif len(clean_suffix) == 2:
-        for es in easy_suffixes:
-            if len(es) == 3 and es.isalpha():
-                if clean_suffix[0] in es or clean_suffix[1] in es:
-                    clean_suffix = es
-                    break
-    elif any(es == 'KCS' for es in easy_suffixes) and 'K' in clean_suffix:
-        clean_suffix = 'KCS'
-
-    # Disambiguasi Jakarta Utara sedan suffix (B 1736 UAD):
-    # Char model membaca UNU / UWU / UNV / UWV karena huruf A sempit menyerupai N/W dan D menyerupai U/V
-    if clean_prefix == 'B' and clean_digits == '1736' and (clean_suffix.startswith('U') or clean_suffix.startswith('V')):
-        clean_suffix = 'UAD'
-    elif clean_prefix == 'B' and clean_suffix in ('UNU', 'UWU', 'UNV', 'UWV', 'VNV'):
-        clean_suffix = 'UAD'
-
-    # Disambiguasi karakter '5' / 'F' pada suffix (misal K5S -> KFS)
-    if suffix.startswith('K') and (suffix.endswith('5S') or suffix.endswith('FS') or any(es.endswith('FS') for es in easy_suffixes)):
-        clean_suffix = 'KFS'
-    elif '5' in suffix and suffix.endswith(('5S', 'S')):
-        clean_suffix = suffix.replace('5S', 'FS').replace('5', 'S')
-
-    # Disambiguasi suffix BKN / BKW / BMU / BNN -> BNV
-    if clean_suffix.startswith('BN') and clean_suffix.endswith(('W', 'M', 'U')):
-        clean_suffix = 'BNV'
-
-    # Disambiguasi suffix modifikasi (misal JUP terbaca ZEF / ZLF / SLF / JZP / J@P):
-    easy_suffix_chars = "".join(all_easy_texts)
-    if re.match(r'^[ZJS][ZLEK][FP]$', clean_suffix) or (('J' in easy_suffix_chars or 'J' in clean_suffix) and ('P' in easy_suffix_chars or clean_suffix.endswith('P') or clean_suffix.endswith('F')) and len(clean_suffix) == 3):
-        clean_suffix = 'JUP'
-    elif clean_suffix in ('JP', 'JZP', 'JLF', 'ZEF', 'SLF'):
-        clean_suffix = 'JUP'
-
-    # Jika EasyOCR memiliki kecocokan angka persis (misal B9301TBD vs B9301TBO)
-    if clean_digits:
-        for t in all_easy_texts:
-            m_exact = re.search(r'([A-Z]{1,2})?' + clean_digits + r'([A-Z]{1,3})', t.upper())
-            if m_exact:
-                p_opt, s_match = m_exact.group(1), m_exact.group(2)
-                if not p_opt or p_opt == clean_prefix:
-                    if len(s_match) >= len(clean_suffix) or len(clean_suffix) < 2:
-                        clean_suffix = s_match
-                        break
-
-    # Disambiguasi karakter kritis: Q vs D vs O, R vs P, X vs K, N vs K pada akhiran CS
-    if clean_suffix.startswith('N') and clean_suffix.endswith('CS'):
-        clean_suffix = 'K' + clean_suffix[1:]
-    for es in easy_suffixes:
-        es_norm = "".join(s_map.get(c, c) for c in es)
-        if clean_suffix:
-            if len(clean_suffix) == len(es_norm) and clean_suffix[0] == es_norm[0]:
-                if es_norm.endswith('Q') and clean_suffix.endswith(('D', 'O', 'V')):
-                    clean_suffix = es_norm
-                    break
-                elif clean_suffix.endswith('O') and es_norm[-1] in ('D', 'Q', 'G'):
-                    clean_suffix = es_norm
-                    break
-                elif len(clean_suffix) >= 2 and clean_suffix[0] == clean_suffix[1]:
-                    clean_suffix = es_norm
-                    break
-                elif es_norm[-1] in ('Q', 'Y') and clean_suffix[-1] not in ('Q', 'Y'):
-                    clean_suffix = es_norm
-                    break
-                elif ('P' in clean_suffix and 'R' in es_norm) or ('R' in clean_suffix and 'P' in es_norm):
-                    clean_suffix = es_norm
-                    break
-                elif ('X' in es_norm and 'K' in clean_suffix) or ('K' in es_norm and 'X' in clean_suffix):
-                    clean_suffix = es_norm
-                    break
-            elif len(es_norm) > len(clean_suffix) and es_norm.startswith(clean_suffix):
-                clean_suffix = es_norm
-                break
-        else:
-            if 2 <= len(es_norm) <= 3:
-                clean_suffix = es_norm
-                break
-
-    if clean_suffix.endswith('I') and any('Y' in s for s in easy_suffixes):
-        clean_suffix = clean_suffix[:-1] + 'Y'
-    elif clean_suffix == 'TL' and any('TLY' in s for s in easy_suffixes):
-        clean_suffix = 'TLY'
-
-    # Fusi karakter W vs V / M:
-    # Karakter W pada plat sering terbaca V oleh CharModel dan M oleh EasyOCR (misal VOA vs MOA -> WOA)
-    if clean_suffix.startswith('V') and (any(es.startswith(('M', 'W')) for es in easy_suffixes) or any('MOA' in t or 'WOA' in t or 'MON' in t for t in all_easy_texts)):
-        clean_suffix = 'W' + clean_suffix[1:]
-    elif clean_prefix == 'B' and clean_digits == '1399' and clean_suffix in ('VOA', 'MOA', 'WOA', 'NOA'):
-        clean_suffix = 'WOA'
-
-    # Disambiguasi Samsat Depok/Cinere ERL vs CRL / GRL / CAL / RN:
-    if clean_suffix in ('CRL', 'GRL', 'CAL', 'GAL', 'RN', 'RR', 'RL', 'ER1', 'ERI', 'CR1', 'CRI', 'RAW', 'RAWJV', 'RA'):
-        if clean_digits == '236' or any(k in t for t in all_easy_texts for k in ['CRL', 'GRL', 'CAL', 'ERL', 'Crl']):
-            clean_suffix = 'ERL'
-
-    # Disambiguasi Samsat Jakarta JRN vs JRM / JRV / CRK:
-    if clean_suffix in ('JRM', 'JRV', 'CRK', 'JAN') or (clean_prefix == 'B' and clean_digits == '902'):
-        if any('JRN' in t for t in all_easy_texts) or clean_digits == '902' or clean_suffix in ('JRM', 'JRV', 'CRK', 'JAN'):
-            clean_suffix = 'JRN'
-
-    # Disambiguasi suffix QD / OD / OU / 0U / DU -> DV
-    if clean_suffix in ('QD', 'OD', 'OU', '0U', 'DU'):
-        clean_suffix = 'DV'
-
-    # Disambiguasi B 999 DPG (BMW iX / Toyota Alphard):
-    if clean_prefix == 'B' and clean_digits == '999':
-        if clean_suffix.startswith('DP') or clean_suffix in ('DPG', 'DPF', 'DPE', 'DFG', 'IRG', 'IPG', 'DRG', 'D5E', 'DOP') or any('PG' in t or 'DPG' in t or '09PG' in t for t in all_easy_texts):
-            clean_suffix = 'DPG'
-
-    # Disambiguasi Jakarta Timur suffix TBD (char model membaca TBQ atau TBO)
-    if clean_suffix.startswith('TB') and clean_suffix.endswith(('Q', 'O')):
-        clean_suffix = 'TBD'
-
-    # Disambiguasi suffix IS (Mercedes / Plat F Bogor):
-    if clean_suffix in ('ISJ', 'I5J', 'IZS', '1ZS', '15J', 'IS'):
-        clean_suffix = 'IS'
-
-    # Aturan Korlantas: Huruf 'Q' tidak digunakan pada plat nomor Indonesia (ganti D)
-    if 'Q' in clean_suffix:
-        clean_suffix = clean_suffix.replace('Q', 'D')
-
-    # Disambiguasi suffix ERL / CRL (misal B 236 ERL)
-    if clean_digits == '236' or clean_suffix in ('RAW', 'RAWJV', 'RA', 'ER1', 'ERI', 'CR1', 'CRI', 'CRL'):
-        clean_suffix = 'ERL'
-
-    # Suffix BAJ vs BAC (Toyota Sienta B 1591 BAJ):
-    if any('BAJ' in t for t in all_easy_texts) or (clean_prefix == 'B' and clean_digits in ('1591', '151') and clean_suffix in ('BAC', 'BC', 'BAJ')):
-        clean_suffix = 'BAJ'
-        clean_digits = '1591'
-
-    # Suffix DV vs BV / DU (Toyota Calya B 8188 DV):
-    if clean_digits == '8188' and clean_suffix in ('BV', 'BU', 'DU', 'DV', '0U', 'OU'):
-        clean_suffix = 'DV'
-
-    # Suffix DK vs QA / DA / QK (B 1738 DK):
-    if clean_digits == '1738' and clean_suffix in ('QA', 'DA', 'QK', 'OK', 'DK'):
-        clean_suffix = 'DK'
-
-    parts = [p for p in [clean_prefix, clean_digits, clean_suffix] if p]
-    final_text = " ".join(parts) if parts else base_text
-
-    # Validasi minimum: Plat nomor Indonesia minimal 4 karakter (misal B 1 A atau F 19 I)
-    clean_total = re.sub(r'[^A-Z0-9]', '', final_text)
-    if len(clean_total) < 3:
-        return ""
-
-    return final_text
+            return None
+    return out, fixes
 
 
-def ensemble_plate_reading(plate_crop):
-    """Menggabungkan hasil deteksi Character Model dan EasyOCR dengan auto-deskewing adaptif dan motion-blur sharpening."""
-    # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
-    plate_crop = enhance_moving_plate_crop(plate_crop)
+def normalize_indonesian_plate(raw_text):
+    """
+    Mengubah teks mentah OCR menjadi 'PREFIX DIGITS SUFFIX' bila struktur memungkinkan.
+    Return dict: text, prefix, digits, suffix, valid, military, samsat_ok, corrections.
+    Tidak mengarang karakter: bila struktur tidak cocok -> valid=False.
+    """
+    res = {"text": "", "prefix": "", "digits": "", "suffix": "", "valid": False,
+           "military": False, "samsat_ok": False, "corrections": 0}
+    if not raw_text:
+        return res
+    s = str(raw_text).upper().strip()
+    m = re.fullmatch(r'\s*(\d{3,4})\s*-\s*(\d{2})\s*', s)
+    if m:
+        res.update({"text": f"{m.group(1)}-{m.group(2)}", "digits": m.group(1), "suffix": m.group(2),
+                    "valid": True, "military": True})
+        return res
+    clean = re.sub(r'[^A-Z0-9]', '', s)
+    n = len(clean)
+    if n < 3 or n > 9:
+        return res
+    best = None
+    for p_len in (1, 2):
+        for d_len in (4, 3, 2, 1):
+            s_len = n - p_len - d_len
+            if not (1 <= s_len <= 3):
+                continue
+            pre = _fit_slot(clean[:p_len], _PREFIX_FIX, True)
+            dig = _fit_slot(clean[p_len:p_len + d_len], _DIGIT_FIX, False)
+            suf = _fit_slot(clean[p_len + d_len:], _SUFFIX_FIX, True)
+            if pre is None or dig is None or suf is None:
+                continue
+            fixes = pre[1] + dig[1] + suf[1]
+            cost = fixes + (0.0 if pre[0] in SAMSAT_PREFIXES else 1.5)
+            if best is None or cost < best[0]:
+                best = (cost, pre[0], dig[0], suf[0], fixes)
+    if best is None:
+        return res
+    _, pre, dig, suf, fixes = best
+    res.update({"text": f"{pre} {dig} {suf}", "prefix": pre, "digits": dig, "suffix": suf,
+                "valid": True, "samsat_ok": pre in SAMSAT_PREFIXES, "corrections": fixes})
+    return res
 
-    # 1. Pembacaan via Character Model LANGSUNG pada citra tegak asli (Primary - Fast YOLO ~40-80ms)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.08)
+
+def fuse_plate_candidates(char_raw, char_conf, paddle_text, paddle_conf):
+    """
+    Menggabungkan dua sinyal independen. PaddleOCR adalah evidence utama:
+    - Paddle valid & (char tidak valid / keduanya sepakat / conf Paddle tidak jauh di bawah char) -> Paddle
+    - selain itu, jika char model valid -> char model
+    confidence = confidence ASLI sumber terpilih (tidak dinaikkan).
+    candidate_score = ukuran peringkat internal (conf + bonus kesepakatan/Samsat - penalti koreksi).
+    """
+    cn = normalize_indonesian_plate(char_raw)
+    pn = normalize_indonesian_plate(paddle_text)
+    agree = bool(cn["valid"] and pn["valid"] and cn["text"] == pn["text"])
+    if pn["valid"] and (not cn["valid"] or agree or paddle_conf >= char_conf - PADDLE_PRIMARY_MARGIN):
+        chosen, source, conf = pn, "paddle", float(paddle_conf)
+    elif cn["valid"]:
+        chosen, source, conf = cn, "char_model", float(char_conf)
+    else:
+        return {"text": "", "confidence": 0.0, "source": None, "agreement": False,
+                "candidate_score": 0.0, "char_norm": cn, "paddle_norm": pn}
+    score = conf + (0.15 if agree else 0.0) + (0.05 if chosen["samsat_ok"] else 0.0) - 0.05 * chosen["corrections"]
+    return {"text": chosen["text"], "confidence": conf, "source": source, "agreement": agree,
+            "candidate_score": round(max(0.0, min(1.0, score)), 3), "char_norm": cn, "paddle_norm": pn}
+
+
+def ensemble_plate_reading(plate_crop, debug_tag=None):
+    """
+    Pipeline pembacaan satu crop plat:
+      Character YOLO (di crop yang sudah di-sharpen)  ->  PaddleOCR (di crop asli)  ->  fusi kandidat.
+    PaddleOCR SELALU dijalankan (engine OCR wajib), bukan fallback.
+    """
+    t_start = time.time()
+    if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
+        return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
+
+    raw_crop = plate_crop
+    enhanced = enhance_moving_plate_crop(plate_crop)
+
+    # 1. Character Model (sinyal karakter-level)
+    t_c0 = time.time()
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(enhanced, conf=0.08)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
+    paddle_input = raw_crop
 
-    # 1b. Fallback Deskew hanya jika pembacaan awal minim (< 4 karakter atau conf rendah < 0.45)
+    # 1b. Deskew hanya jika pembacaan karakter awal minim
     if char_conf < 0.45 or len(c_clean) < 4:
-        deskewed_crop, skew_angle = deskew_plate(plate_crop)
+        deskewed_crop, skew_angle = deskew_plate(enhanced)
         if abs(skew_angle) >= 3.0:
             d_raw, d_conf, d_chars = read_plate_with_char_model(deskewed_crop, conf=0.08)
             if d_conf > char_conf and len(re.sub(r'[^A-Z0-9]', '', d_raw)) >= len(c_clean):
-                print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f}°")
-                plate_crop = deskewed_crop
-                char_raw, char_conf, line1_chars = d_raw, d_conf, d_chars
-                c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
+                print(f"[DEBUG] Koreksi Kemiringan Plat (Deskew): {skew_angle:+.1f} deg")
+                char_raw, char_conf, line1_chars = d_raw.upper(), d_conf, d_chars
+                hh, ww = raw_crop.shape[:2]
+                M = cv2.getRotationMatrix2D((ww / 2.0, hh / 2.0), skew_angle, 1.0)
+                paddle_input = cv2.warpAffine(raw_crop, M, (ww, hh), flags=cv2.INTER_CUBIC,
+                                              borderMode=cv2.BORDER_REPLICATE)
+    char_ms = (time.time() - t_c0) * 1000.0
 
-    # Fast-Path: Model Karakter YOLO (~40ms di CPU, sangat akurat pada karakter plat Indonesia)
-    # Menghindari delay 1.5 - 3.0 detik dari EasyOCR ketika mobil bergerak
-    m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', c_clean)
-    min_char_conf = min([c["conf"] for c in line1_chars]) if line1_chars else 0.0
+    # 2. PaddleOCR (engine OCR utama)
+    paddle = read_plate_with_paddleocr(paddle_input, debug_tag=debug_tag)
+    paddle_text = (paddle.get("text") or "").upper()
+    paddle_conf = float(paddle.get("confidence", 0.0) or 0.0)
+    paddle_ms = float(paddle.get("ms", 0.0) or 0.0)
 
-    # Lolos fast-path jika:
-    # A. Struktur plat Indonesia lengkap (Prefix 1-2 huruf terdaftar Samsat, 1-4 digit, 3 huruf suffix lengkap) dan seluruh karakter berkeyakinan tinggi
-    # B. Keyakinan sangat tinggi (char_conf >= 0.88 dan min_char_conf >= 0.70)
-    is_samsat = m and (m.group(1) in SAMSAT_PREFIXES or c_clean[0] in {'B', 'D', 'F', 'E', 'L', 'N', 'A', 'H', 'G', 'K', 'R', 'T', 'Z'})
-    has_low_conf = min_char_conf < 0.58
-    has_short_suffix = m and len(m.group(3)) < 3 and len(c_clean) <= 6
-    if not has_low_conf and not has_short_suffix and ((m and is_samsat and char_conf >= 0.80 and min_char_conf >= 0.60) or (m and char_conf >= 0.88 and min_char_conf >= 0.70)):
-        final_formatted = refine_indonesian_plate(char_raw, "", [])
-        print(f"[DEBUG] Fast-Path Plate Reading : '{final_formatted}' (conf: {char_conf:.2f}, {len(line1_chars)} chars)")
-        return {
-            "final": final_formatted,
-            "char_raw": char_raw,
-            "char_conf": char_conf,
-            "easy_raw": "",
-            "easy_conf": 0.0,
-            "confidence": char_conf,
-            "method": "char_model_fast_path"
-        }
+    # 3. Fusi dua sinyal independen
+    fused = fuse_plate_candidates(char_raw, char_conf, paddle_text, paddle_conf)
+    total_ms = (time.time() - t_start) * 1000.0
 
-    # 2. Pembacaan via EasyOCR (Hanya fallback jika char_model tidak lengkap)
-    easy_raw, easy_conf, all_easy = read_plate_with_easyocr(plate_crop)
-    easy_raw = easy_raw.upper()
+    perf_stats.add("character_model_ms", char_ms)
+    if paddle.get("passes"):
+        perf_stats.add("paddleocr_ms", paddle_ms)
+    perf_stats.add("total_ocr_ms", total_ms)
 
-    print(f"[DEBUG] Char Model baca : '{char_raw}' (conf: {char_conf:.2f})")
-    print(f"[DEBUG] EasyOCR baca    : '{easy_raw}' (conf: {easy_conf:.2f}, all: {all_easy})")
+    print(f"[CHAR] text='{char_raw}' conf={char_conf:.3f} ({len(line1_chars)} chars, {char_ms:.1f}ms)")
+    print(f"[FUSE] final='{fused['text']}' source={fused['source']} conf={fused['confidence']:.3f} "
+          f"agreement={fused['agreement']} candidate_score={fused['candidate_score']} total={total_ms:.1f}ms")
 
-    final_formatted = refine_indonesian_plate(char_raw, easy_raw, all_easy)
-    final_conf = max(char_conf, easy_conf) if final_formatted else 0.0
-
-    print(f"[DEBUG] Hasil Terformat : '{final_formatted}'")
-
+    method = {"paddle": "paddleocr_primary", "char_model": "char_model_only"}.get(fused["source"], "no_valid_reading")
     return {
-        "final": final_formatted,
+        "final": fused["text"],
+        "confidence": fused["confidence"],
+        "method": method,
+        "source": fused["source"],
+        "agreement": fused["agreement"],
+        "candidate_score": fused["candidate_score"],
         "char_raw": char_raw,
         "char_conf": char_conf,
-        "easy_raw": easy_raw,
-        "easy_conf": easy_conf,
-        "confidence": final_conf,
-        "method": "char_model_primary_with_samsat_rules"
+        "paddle_text": paddle_text,
+        "paddle_conf": paddle_conf,
+        "paddle_all": paddle.get("all_texts", []),
+        "paddle_skipped": paddle.get("skipped"),
+        "char_ms": round(char_ms, 1),
+        "paddle_ms": round(paddle_ms, 1),
+        "total_ms": round(total_ms, 1),
     }
 
 
@@ -1448,26 +1444,37 @@ def get_front_of_camera_score(cand, plates, img_w, img_h):
 # ============================================================
 class VehicleTrack:
     """
-    Melacak dan mengonfirmasi kendaraan secara temporal adaptif untuk CCTV parkir.
-    Tiga tingkat konfirmasi (Adaptive Confidence):
-    - TIER 1 (HIGH CONFIDENCE >= 90%): Cukup 2 observasi cocok dalam jendela observasi valid (respons kilat ~100-200ms).
-    - TIER 2 (NORMAL CONFIDENCE >= 80%): Membutuhkan 3 observasi cocok dalam jendela observasi valid.
-    - TIER 3 (MODERATE CONFIDENCE 70-79%): Membutuhkan minimal 3 observasi cocok TANPA ADA kandidat saingan kuat (<= 1 conflicting obs).
-    - Mentolerir short gaps / missed frames di antara observasi.
-    - Mengunci plat terkonfirmasi sehingga variasi OCR berikutnya tidak menimpa atau membuat duplikat.
-    State Machine: ANALYZING -> CONFIRMED -> HISTORY_SAVED
+    Melacak dan mengonfirmasi kendaraan secara temporal stabil dengan Controlled Tracking & Lost Interest.
+    State Machine: OUTSIDE_ROI -> ANALYZING -> CONFIRMED -> HISTORY_SAVED (atau LOST_INTEREST / DISCARDED)
     """
     def __init__(self, track_id, initial_det=None):
         self.track_id = track_id
         self.created_at = time.time()
         self.last_seen = time.time()
-        self.frames = deque(maxlen=15)
-        self.status = "ANALYZING"  # Awalnya selalu ANALYZING (temporary detection)
+        self.frames = deque(maxlen=20)
         self.confirmed_data = None
         self.confirmation_score = 0.0
         self.history_saved = False
         self.is_locked = False
         self.last_bbox = None
+        
+        # Controlled Tracking & ROI State
+        is_inside = initial_det.get("inside_interest_area", False) if initial_det else False
+        self.inside_interest_area = is_inside
+        self.ever_inside_roi = is_inside
+        self.frames_outside_after_inside = 0
+        self.lost_interest = False
+        self.lost_interest_time = None
+        self.status = "ANALYZING" if is_inside else "OUTSIDE_ROI"
+
+        # Asynchronous OCR Management State
+        self.ocr_pending = False
+        self.last_ocr_job_id = 0
+        self.last_processed_ocr_job_id = 0
+        self.last_ocr_text = None
+        self.last_ocr_conf = 0.0
+        self.last_ocr_time = None
+
         # Cache body style to avoid re-classifying every frame
         self.cached_body_style = None
         self.cached_body_conf = 0.0
@@ -1477,64 +1484,117 @@ class VehicleTrack:
         self.best_plate_conf = 0.0
         self.plate_readings = []
 
-        # OCR Throttling & Caching per track
-        self.last_ocr_time = 0.0
-        self.last_ocr_text = None
-        self.last_ocr_conf = 0.0
-        self.last_ocr_method = None
+        # Latency Telemetry Timestamps
+        self.first_good_ocr_time = None
+        self.first_good_ocr_text = None
+        self.first_good_ocr_conf = 0.0
+        self.confirmation_time = None
+        self.confirmation_reason = None
+        self.history_saved_time = None
 
-        # Riwayat observasi plat valid (conf >= 0.70)
-        self.valid_plate_observations = deque(maxlen=8)
+        # Candidate accumulation (persists across frames, never reset by noisy frame)
+        self.candidate_counts = {}
+        self.candidate_best_obs = {}
+        self.best_candidate = None
+        self.best_candidate_display = None
+        self.best_candidate_conf = 0.0
+        self.consecutive_plate = ""
+        self.consecutive_count = 0
+        self.valid_plate_observations = deque(maxlen=15)
+
+        # PaddleOCR migration: state tambahan per track
+        self.best_paddle_confidence = 0.0
+        self.last_ocr_frame_id = None
+        self.ocr_calls = 0
+        self.roi_entry_time = self.created_at if is_inside else None
+        self.first_plate_time = None
+        self.first_ocr_result_time = None
+        self.events_sent = set()
+        self.lost_finalized = False
+        self.bench_logged = False
 
         if initial_det:
-            if initial_det.get("license_plate"):
-                self.last_ocr_text = initial_det.get("license_plate")
-                self.last_ocr_conf = initial_det.get("plate_confidence", 0.0) or 0.0
-                self.last_ocr_method = initial_det.get("ocr_method")
-                self.last_ocr_time = time.time()
             self.add_frame(initial_det)
 
     def add_frame(self, det):
-        self.last_seen = time.time()
+        now = time.time()
+        self.last_seen = now
         self.last_bbox = det.get("bbox")
+        is_inside = det.get("inside_interest_area", False)
+        self.inside_interest_area = is_inside
+
+        if is_inside:
+            self.ever_inside_roi = True
+            if self.roi_entry_time is None:
+                self.roi_entry_time = now
+            self.frames_outside_after_inside = 0
+            if self.status == "OUTSIDE_ROI":
+                self.status = "ANALYZING"
+        else:
+            if self.ever_inside_roi:
+                self.frames_outside_after_inside += 1
+            elif self.status not in ["CONFIRMED", "HISTORY_SAVED"]:
+                self.status = "OUTSIDE_ROI"
+
         p_crop = det.get("plate_crop")
         p_conf = det.get("plate_confidence", 0.0) or 0.0
         p_text = det.get("license_plate")
-        ocr_method = det.get("ocr_method")
 
-        # 1. Update best_plate_crop menggunakan metrik Crop Quality
-        if p_crop is not None and getattr(p_crop, 'size', 0) > 0:
-            quality = compute_crop_quality(p_crop, p_conf)
-            if quality > self.best_crop_quality:
+        # 1. Update best_plate_crop menggunakan metrik Crop Quality (HANYA jika kendaraan di dalam ROI)
+        crop_q = 0.0
+        if is_inside and p_crop is not None and getattr(p_crop, 'size', 0) > 0:
+            crop_q = compute_crop_quality(p_crop, p_conf)
+            if crop_q > self.best_crop_quality:
                 self.best_plate_crop = p_crop
-                self.best_crop_quality = quality
+                self.best_crop_quality = crop_q
                 self.best_plate_conf = p_conf
 
-        # 2. Akumulasi pembacaan plat nomor valid sepanjang pergerakan kendaraan
-        # PENTING: Hanya catat observasi jika pembacaan OCR riil (bukan tracking_cache)
-        p_clean = ""
-        is_valid_obs = False
-        if p_text and p_text != "TIDAK_TERBACA" and ocr_method != "tracking_cache":
-            p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper())
-            # Format Indonesia (>= 4 karakter atau format dinas/militer dengan '-') dan conf >= 0.70
-            if (len(p_clean) >= 4 or '-' in p_text) and p_conf >= 0.70:
-                is_valid_obs = True
+        # 2. Akumulasi pembacaan plat nomor valid HANYA saat kendaraan di dalam ROI
+        #    dan HANYA dari hasil OCR baru (preview char-model / kandidat yang diputar ulang tidak dihitung)
+        if is_inside and p_text and det.get("ocr_method") not in NON_EVIDENCE_OCR_METHODS:
+            is_struct, p_type = is_valid_indonesian_plate_structure(p_text)
+            p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper()) if p_text else ""
 
-        if is_valid_obs:
-            obs = {
-                "text": p_text,
-                "clean": p_clean,
-                "conf": p_conf,
-                "time": self.last_seen
-            }
-            self.valid_plate_observations.append(obs)
-            self.plate_readings.append(obs)
+            if is_struct and p_conf >= 0.50:
+                if self.first_good_ocr_time is None:
+                    self.first_good_ocr_time = now
+                    self.first_good_ocr_text = p_text
+                    self.first_good_ocr_conf = p_conf
+                    print(f"""[OCR GOOD]
+track={self.track_id}
+plate=\"{p_clean}\"
+ocr_conf={p_conf:.2f}
+timestamp={self.first_good_ocr_time:.3f}""")
 
-        if ocr_method and ocr_method != "tracking_cache":
-            self.last_ocr_time = self.last_seen
-            self.last_ocr_text = p_text
-            self.last_ocr_conf = p_conf
-            self.last_ocr_method = ocr_method
+                obs = {
+                    "text": p_text,
+                    "clean": p_clean,
+                    "conf": p_conf,
+                    "time": self.last_seen,
+                    "crop_q": crop_q,
+                    "struct": is_struct,
+                    "type": p_type
+                }
+                self.valid_plate_observations.append(obs)
+                self.plate_readings.append(obs)
+
+                self.candidate_counts[p_clean] = self.candidate_counts.get(p_clean, 0) + 1
+                if p_clean not in self.candidate_best_obs or p_conf > self.candidate_best_obs[p_clean]["conf"]:
+                    self.candidate_best_obs[p_clean] = obs
+
+                best_cln = max(self.candidate_counts, key=lambda c: self.candidate_counts[c] * 1.5 + self.candidate_best_obs[c]["conf"])
+                self.best_candidate = best_cln
+                self.best_candidate_display = self.candidate_best_obs[best_cln]["text"]
+                self.best_candidate_conf = self.candidate_best_obs[best_cln]["conf"]
+
+                if p_clean == self.consecutive_plate:
+                    self.consecutive_count += 1
+                else:
+                    self.consecutive_plate = p_clean
+                    self.consecutive_count = 1
+            else:
+                self.consecutive_plate = ""
+                self.consecutive_count = 0
 
         self.frames.append({
             "time": self.last_seen,
@@ -1547,85 +1607,282 @@ class VehicleTrack:
             "plate_crop": p_crop,
             "bbox": det.get("bbox"),
             "plate_bbox": det.get("plate_bbox"),
-            "ocr_method": ocr_method
+            "ocr_method": det.get("ocr_method"),
+            "inside_interest_area": is_inside
         })
 
         # Jika sudah terkonfirmasi dan tersimpan di Entry History, kunci!
         if self.status in ["CONFIRMED", "HISTORY_SAVED"] or self.history_saved or self.is_locked:
             return
 
-        self.status = "ANALYZING"
-        self._evaluate_confirmation()
+        if is_inside:
+            self.status = "ANALYZING"
+            self._evaluate_confirmation()
+        else:
+            if not self.ever_inside_roi:
+                self.status = "OUTSIDE_ROI"
+
+    def debug_snapshot(self, now=None, extra=None):
+        """Snapshot debug telemetry untuk WebSocket / Latest Detection."""
+        now = now or time.time()
+        last_f = self.frames[-1] if self.frames else {}
+        cand_count = self.candidate_counts.get(self.best_candidate, 0) if self.best_candidate else 0
+        if self.lost_interest:
+            ocr_stat = self.status if self.status in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
+        elif not self.inside_interest_area:
+            ocr_stat = "OUTSIDE_ROI"
+        elif self.status in ("CONFIRMED", "HISTORY_SAVED"):
+            ocr_stat = "CONFIRMED"
+        elif cand_count >= 2:
+            ocr_stat = "GOOD_CANDIDATE"
+        else:
+            ocr_stat = "ANALYZING" if self.ever_inside_roi else "IDLE"
+        snap = {
+            "track_id": self.track_id,
+            "vehicle_type": last_f.get("vehicle_type"),
+            "body_style": last_f.get("body_style") or (self.confirmed_data or {}).get("body_style"),
+            "vehicle_confidence": last_f.get("v_conf"),
+            "inside_interest_area": self.inside_interest_area,
+            "last_seen": round(self.last_seen, 3),
+            "last_seen_age_ms": int(round(max(0.0, now - self.last_seen) * 1000)),
+            "lost_interest": self.lost_interest,
+            "status": self.status,
+            "ocr_status": ocr_stat,
+            "ocr_candidate": self.best_candidate_display,
+            "ocr_confidence": round(self.best_candidate_conf, 3) if self.best_candidate_conf else None,
+            "candidate_matches": cand_count,
+            "plate_detected": bool(last_f.get("plate_bbox")),
+            "best_candidate_score": self.get_best_candidate_score(),
+            "temporal_consistency": round(self.get_temporal_consistency(), 2),
+            "ocr_calls": self.ocr_calls,
+            "bbox": self.last_bbox,
+            "plate_bbox": last_f.get("plate_bbox"),
+            "license_plate": (self.confirmed_data or {}).get("license_plate") or self.best_candidate_display,
+            "plate_confidence": (self.confirmed_data or {}).get("plate_confidence") or (
+                round(self.best_candidate_conf, 3) if self.best_candidate_conf else None
+            ),
+        }
+        if extra:
+            snap.update(extra)
+        return snap
+
+    def add_ocr_result(self, job_id, text, conf, crop_q, ocr_method="ensemble", frame_id=None, extra=None):
+        """
+        Mengevaluasi hasil OCR asinkron dan memperbarui tracking kandidat plat nomor.
+        Menolak hasil OCR yang usang / job lama yang selesai lebih lambat dari job yang lebih baik.
+        """
+        now = time.time()
+        is_stale_job = job_id < self.last_processed_ocr_job_id
+        is_clearly_better = (crop_q > self.best_crop_quality * 1.20) or (
+            conf > (self.best_candidate_conf or 0.0) + 0.10
+        )
+        if is_stale_job and not is_clearly_better:
+            print(f"[OCR REJECT] Stale job {job_id} < {self.last_processed_ocr_job_id} for track {self.track_id}")
+            return None
+        if self.best_candidate_conf and conf < (self.best_candidate_conf - 0.08) and crop_q < self.best_crop_quality:
+            print(f"[OCR REJECT] Weaker result conf={conf:.2f} < best={self.best_candidate_conf:.2f} for track {self.track_id}")
+            self.last_processed_ocr_job_id = max(self.last_processed_ocr_job_id, job_id)
+            if frame_id is not None:
+                self.last_ocr_frame_id = frame_id
+            return {
+                "track_id": self.track_id,
+                "ocr_candidate": self.best_candidate_display or text,
+                "ocr_confidence": self.best_candidate_conf,
+                "candidate_matches": self.candidate_counts.get(self.best_candidate, 0) if self.best_candidate else 0,
+                "status": self.status,
+                "is_confirmed": self.status in ["CONFIRMED", "HISTORY_SAVED"]
+            }
+
+        self.last_processed_ocr_job_id = max(self.last_processed_ocr_job_id, job_id)
+        if frame_id is not None:
+            self.last_ocr_frame_id = frame_id
+        self.best_paddle_confidence = max(self.best_paddle_confidence, float((extra or {}).get("paddle_conf") or 0.0))
+        self.last_ocr_text = text
+        self.last_ocr_conf = conf
+        self.last_ocr_time = now
+        if crop_q > self.best_crop_quality:
+            self.best_crop_quality = crop_q
+
+        is_struct, p_type = is_valid_indonesian_plate_structure(text)
+        p_clean = re.sub(r'[^A-Z0-9]', '', text.upper()) if text else ""
+
+        if is_struct and conf >= 0.50:
+            if self.first_good_ocr_time is None:
+                self.first_good_ocr_time = now
+                self.first_good_ocr_text = text
+                self.first_good_ocr_conf = conf
+                print(f"""[OCR GOOD]
+track={self.track_id}
+plate=\"{p_clean}\"
+ocr_conf={conf:.2f}
+timestamp={self.first_good_ocr_time:.3f}""")
+
+            obs = {
+                "text": text,
+                "clean": p_clean,
+                "conf": conf,
+                "time": now,
+                "crop_q": crop_q,
+                "struct": is_struct,
+                "type": p_type,
+                "method": ocr_method,
+                "score": float((extra or {}).get("candidate_score") or conf),
+                "source": (extra or {}).get("source"),
+                "frame_id": frame_id
+            }
+            self.valid_plate_observations.append(obs)
+            self.plate_readings.append(obs)
+
+            self.candidate_counts[p_clean] = self.candidate_counts.get(p_clean, 0) + 1
+            if p_clean not in self.candidate_best_obs or conf > self.candidate_best_obs[p_clean]["conf"]:
+                self.candidate_best_obs[p_clean] = obs
+
+            best_cln = max(self.candidate_counts, key=lambda c: self.candidate_counts[c] * 1.5 + self.candidate_best_obs[c]["conf"])
+            self.best_candidate = best_cln
+            self.best_candidate_display = self.candidate_best_obs[best_cln]["text"]
+            self.best_candidate_conf = self.candidate_best_obs[best_cln]["conf"]
+
+            if p_clean == self.consecutive_plate:
+                self.consecutive_count += 1
+            else:
+                self.consecutive_plate = p_clean
+                self.consecutive_count = 1
+
+            if not self.is_locked and self.status not in ["CONFIRMED", "HISTORY_SAVED"]:
+                self._evaluate_confirmation()
+        else:
+            self.consecutive_plate = ""
+            self.consecutive_count = 0
+
+        return {
+            "track_id": self.track_id,
+            "ocr_candidate": self.best_candidate_display or text,
+            "ocr_confidence": self.best_candidate_conf if self.best_candidate else conf,
+            "candidate_matches": self.candidate_counts.get(self.best_candidate, 1) if self.best_candidate else 0,
+            "status": self.status,
+            "is_confirmed": self.status in ["CONFIRMED", "HISTORY_SAVED"]
+        }
+
+    def check_lost_interest(self, now=None):
+        """
+        Memeriksa apakah kendaraan telah meninggalkan Detection Area atau tidak terlihat melebihi batas waktu (Lost Interest).
+        Saat LOST: tidak ada job OCR baru yang dibuat. Job PaddleOCR yang sudah berjalan dibiarkan selesai
+        (maks LOST_OCR_GRACE_SEC) sebelum kandidat terbaik difinalisasi / dibuang.
+        - Finalisasi kandidat terbaik jika memenuhi syarat konfirmasi (Path A atau Path B).
+        - Jika tidak memenuhi syarat: buang kandidat (DISCARDED) agar riwayat palsu tidak pernah tercatat.
+        """
+        if now is None:
+            now = time.time()
+        if self.lost_interest:
+            if self.lost_finalized:
+                return self.status
+            return self._finalize_lost(now)
+
+        time_since_seen = now - self.last_seen
+        is_time_lost = time_since_seen > LOST_INTEREST_TIMEOUT_SEC
+        is_left_roi = (self.ever_inside_roi and self.frames_outside_after_inside >= LOST_INTEREST_OUTSIDE_FRAMES)
+
+        if is_time_lost or is_left_roi:
+            self.lost_interest = True
+            self.lost_interest_time = now
+            print(f"[LOST INTEREST] Track {self.track_id} ditandai LOST (age={time_since_seen:.2f}s, outside_frames={self.frames_outside_after_inside})")
+            return self._finalize_lost(now)
+
+        return self.status
+
+    def _finalize_lost(self, now):
+        if self.status in ["CONFIRMED", "HISTORY_SAVED"] or self.history_saved:
+            self.lost_finalized = True
+            return self.status
+
+        # Biarkan job PaddleOCR yang sudah berjalan selesai (dibatasi grace period)
+        if self.ocr_pending and (now - (self.lost_interest_time or now)) < LOST_OCR_GRACE_SEC:
+            return self.status
+
+        self.lost_finalized = True
+        best_cln = self.best_candidate
+        if best_cln and best_cln in self.candidate_best_obs:
+            best_obs = self.candidate_best_obs[best_cln]
+            best_conf = best_obs["conf"]
+            best_count = self.candidate_counts.get(best_cln, 0)
+            is_struct = best_obs["struct"]
+            p_type = best_obs["type"]
+
+            can_finalize = (is_struct and best_count >= 2 and best_conf >= 0.70) or \
+                           (is_struct and best_conf >= 0.85 and (len(best_cln) >= 5 or p_type == "military"))
+
+            if can_finalize:
+                reason = f"LOST_INTEREST_FINALIZED (count={best_count}, conf={best_conf:.2f})"
+                print(f"[LOST INTEREST] Kandidat '{best_cln}' memenuhi syarat konfirmasi -> Finalisasi ke Entry History!")
+                self.confirmation_time = now
+                self.confirmation_reason = reason
+                self._finalize_confirmation(best_obs["text"], best_conf, matching_count=best_count, reason=reason)
+                return "CONFIRMED"
+            else:
+                print(f"[LOST INTEREST] Kandidat '{best_cln}' TIDAK memenuhi syarat (count={best_count}, conf={best_conf:.2f}) -> Dibuang tanpa masuk riwayat!")
+                self.status = "DISCARDED"
+                return "DISCARDED"
+        else:
+            self.status = "DISCARDED"
+            return "DISCARDED"
 
     def _evaluate_confirmation(self):
-        # Membutuhkan minimal 2 observasi valid
-        if len(self.valid_plate_observations) < 2:
+        if not self.candidate_counts:
             return
 
-        # Ambil maksimal 5 observasi valid terakhir
-        recent_obs = list(self.valid_plate_observations)[-5:]
+        now = time.time()
+        best_cln = self.best_candidate
+        if not best_cln or best_cln not in self.candidate_best_obs:
+            return
 
-        # Kelompokkan observasi berdasarkan plat bersih
-        candidates = {}
-        for r in recent_obs:
-            clean = r["clean"]
-            if clean not in candidates:
-                candidates[clean] = []
-            candidates[clean].append(r)
+        best_obs = self.candidate_best_obs[best_cln]
+        best_plate = best_obs["text"]
+        best_conf = best_obs["conf"]
+        best_count = self.candidate_counts[best_cln]
+        is_struct = best_obs["struct"]
+        p_type = best_obs["type"]
 
-        candidate_counts = {clean: len(obs_list) for clean, obs_list in candidates.items()}
+        confirmed = False
+        reason = None
 
-        best_stable_plate = None
-        best_stable_conf = 0.0
-        best_tier = None
-        best_matching_count = 0
+        # ============================================================
+        # PATH A — HIGH CONFIDENCE FAST CONFIRMATION
+        # ============================================================
+        # A1: Single observation with very strong evidence (conf >= 0.85 and valid structure)
+        if is_struct and best_conf >= 0.85 and (len(best_cln) >= 5 or p_type == "military"):
+            confirmed = True
+            reason = f"PATH_A_STRONG_SINGLE_OBSERVATION (conf={best_conf:.2f})"
 
-        # Evaluasi setiap kandidat plat nomor:
-        # TIER 1 (HIGH CONFIDENCE >= 90%): Minimal 2 observasi cocok
-        # TIER 2 (NORMAL HIGH CONFIDENCE >= 80%): Minimal 3 observasi cocok
-        # TIER 3 (MODERATE CONFIDENCE 70-79%): Minimal 3 observasi cocok TANPA ADA kandidat saingan kuat (<= 1 conflicting obs)
-        for clean, obs_list in candidates.items():
-            high_conf_obs = [r for r in obs_list if r["conf"] >= 0.90]
-            normal_conf_obs = [r for r in obs_list if r["conf"] >= 0.80]
-            all_valid_obs = [r for r in obs_list if r["conf"] >= 0.70]
+        # A2: Two matching observations with solid confidence (>= 0.75)
+        elif is_struct and best_count >= 2 and best_conf >= 0.75:
+            confirmed = True
+            reason = f"PATH_A_TWO_FRAME_MATCH (count={best_count}, conf={best_conf:.2f})"
 
-            # Cek Tier 1: Minimal 2 observasi ber-confidence >= 90%
-            if len(high_conf_obs) >= 2:
-                best_r = max(high_conf_obs, key=lambda x: x["conf"])
-                if best_tier is None or best_tier > 1 or (best_tier == 1 and best_r["conf"] > best_stable_conf):
-                    best_stable_plate = best_r["text"]
-                    best_stable_conf = best_r["conf"]
-                    best_tier = 1
-                    best_matching_count = len(high_conf_obs)
+        # ============================================================
+        # PATH B — UNCERTAIN / MEDIUM OCR TEMPORAL CONFIRMATION
+        # ============================================================
+        # B1: Consecutive streak >= 3 with confidence >= 0.70
+        elif self.consecutive_count >= 3 and self.consecutive_plate == best_cln and best_conf >= 0.70:
+            confirmed = True
+            reason = f"PATH_B_CONSECUTIVE_STREAK (streak={self.consecutive_count}, conf={best_conf:.2f})"
 
-            # Cek Tier 2: Minimal 3 observasi ber-confidence >= 80% (hanya jika belum ada Tier 1)
-            elif len(normal_conf_obs) >= 3 and (best_tier is None or best_tier > 2):
-                best_r = max(normal_conf_obs, key=lambda x: x["conf"])
-                if best_stable_plate is None or best_r["conf"] > best_stable_conf:
-                    best_stable_plate = best_r["text"]
-                    best_stable_conf = best_r["conf"]
-                    best_tier = 2
-                    best_matching_count = len(normal_conf_obs)
+        # B2: Temporal consensus: >= 3 matching occurrences in observations with confidence >= 0.65
+        elif is_struct and best_count >= 3 and best_conf >= 0.65:
+            confirmed = True
+            reason = f"PATH_B_TEMPORAL_CONSENSUS (matches={best_count}, conf={best_conf:.2f})"
 
-            # Cek Tier 3: Minimal 3 observasi ber-confidence >= 70%
-            # DENGAN PERLINDUNGAN KONFLIK KETAT:
-            # Tidak boleh ada kandidat berbeda yang memiliki >= 2 observasi di recent window!
-            elif len(all_valid_obs) >= 3 and best_tier is None:
-                has_strong_conflict = any(
-                    cnt >= 2 for oth_clean, cnt in candidate_counts.items() if oth_clean != clean
-                )
-                if not has_strong_conflict:
-                    best_r = max(all_valid_obs, key=lambda x: x["conf"])
-                    if best_stable_plate is None or best_r["conf"] > best_stable_conf:
-                        best_stable_plate = best_r["text"]
-                        best_stable_conf = best_r["conf"]
-                        best_tier = 3
-                        best_matching_count = len(all_valid_obs)
+        if confirmed:
+            self.confirmation_time = now
+            self.confirmation_reason = reason
+            dt_from_good = ((now - self.first_good_ocr_time) * 1000.0) if self.first_good_ocr_time else 0.0
+            print(f"""[CONFIRMATION]
+track={self.track_id}
+plate=\"{best_cln}\"
+reason={reason}
+time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
+            self._finalize_confirmation(best_plate, best_conf, matching_count=best_count, reason=reason)
 
-        if best_stable_plate is not None:
-            self._finalize_confirmation(best_stable_plate, best_stable_conf, best_matching_count)
-
-    def _finalize_confirmation(self, stable_plate, stable_conf, matching_count=2):
+    def _finalize_confirmation(self, stable_plate, stable_conf, matching_count=1, reason=""):
         # A. Voting Body Style (Weighted Confidence)
         style_weights = {}
         total_style_weight = 0.0
@@ -1670,39 +1927,34 @@ class VehicleTrack:
             "consistency": round(consistency_score, 2),
             "bbox": best_f["bbox"],
             "plate_bbox": best_f["plate_bbox"],
-            "ocr_method": best_f.get("ocr_method") or "temporal_consensus"
+            "ocr_method": best_f.get("ocr_method") or "fast_path",
+            "confirmation_reason": reason,
+            "confirmation_time": self.confirmation_time
         }
         self.confirmation_score = round(consistency_score, 2)
         self.status = "CONFIRMED"
         self.is_locked = True
 
     def get_current_stability_count(self):
-        """
-        Mengembalikan tuple (current_count, target_count) untuk progress UI (1/2 atau 2/3).
-        """
-        if not self.valid_plate_observations:
-            return 1, 3
+        """Mengembalikan jumlah observasi plat yang cocok saat ini (untuk progress UI 1/3, 2/3, dst)."""
+        if self.status in ["CONFIRMED", "HISTORY_SAVED"] or self.history_saved:
+            return 3
+        if self.best_candidate and self.best_candidate in self.candidate_counts:
+            return min(self.candidate_counts[self.best_candidate], 3)
+        if self.consecutive_count > 0:
+            return min(self.consecutive_count, 3)
+        return 1 if self.frames else 0
 
-        recent_obs = list(self.valid_plate_observations)[-5:]
-        candidates = {}
-        for r in recent_obs:
-            clean = r["clean"]
-            if clean not in candidates:
-                candidates[clean] = []
-            candidates[clean].append(r)
+    def get_best_candidate_score(self):
+        if self.best_candidate and self.best_candidate in self.candidate_best_obs:
+            return round(self.candidate_best_obs[self.best_candidate].get("score", self.best_candidate_conf), 3)
+        return None
 
-        max_matches = 0
-        target = 3
-
-        for clean, obs_list in candidates.items():
-            high_conf_obs = [r for r in obs_list if r["conf"] >= 0.90]
-            if len(high_conf_obs) >= 1:
-                target = 2
-                max_matches = max(max_matches, len(high_conf_obs))
-            else:
-                max_matches = max(max_matches, len(obs_list))
-
-        return max(1, min(max_matches, target)), target
+    def get_temporal_consistency(self):
+        total = sum(self.candidate_counts.values())
+        if not total or not self.best_candidate:
+            return 0.0
+        return self.candidate_counts.get(self.best_candidate, 0) / float(total)
 
     def get_current_consistency(self):
         if not self.frames:
@@ -1717,7 +1969,7 @@ class VehicleTrack:
 
 class VehicleConfirmationManager:
     """
-    Mengelola multi-object tracking dan konfirmasi temporal kendaraan.
+    Mengelola multi-object tracking, controlled tracking, dan konfirmasi temporal kendaraan.
     Menjamin setiap kendaraan unik hanya dicatat 1x ke Entry History saat terkonfirmasi.
     """
     def __init__(self):
@@ -1730,26 +1982,48 @@ class VehicleConfirmationManager:
             self.tracks.clear()
             self.next_fallback_id = 1
 
-    def find_track(self, track_id=None, bbox=None, img_w=1920, img_h=1080):
-        """
-        Mencari track aktif yang sudah ada berdasarkan track_id atau spatial matching (bbox/centroid).
-        Digunakan sebelum OCR/Body classifier untuk instant caching (0 ms).
-        """
+    def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080):
+        """Ambil atau buat track sebelum plate/OCR agar job asinkron tidak kehilangan target."""
         with self.lock:
-            if track_id is not None and track_id in self.tracks:
-                return self.tracks[track_id]
-            if bbox is not None:
+            if raw_tid is not None:
+                tid = raw_tid
+            else:
                 matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h)
-                if matched_id is not None and matched_id in self.tracks:
-                    return self.tracks[matched_id]
-            return None
+                if matched_id is not None:
+                    tid = matched_id
+                else:
+                    tid = self.next_fallback_id
+                    self.next_fallback_id += 1
+            if tid not in self.tracks:
+                self.tracks[tid] = VehicleTrack(tid, None)
+                if bbox:
+                    self.tracks[tid].last_bbox = bbox
+            return tid, self.tracks[tid]
+
+    def check_lost_tracks(self):
+        """Mengevaluasi seluruh track aktif untuk Lost Interest dan memfinalisasi kandidat yang valid."""
+        now = time.time()
+        newly_confirmed_tracks = []
+        newly_lost_tracks = []
+        with self.lock:
+            stale_ids = []
+            for tid, trk in list(self.tracks.items()):
+                was_lost = trk.lost_interest
+                prev_status = trk.status
+                new_status = trk.check_lost_interest(now)
+                if not was_lost and trk.lost_interest:
+                    newly_lost_tracks.append(trk)
+                if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
+                    newly_confirmed_tracks.append(trk)
+
+                # Hapus track yang sudah lost > 10 detik agar memori bersih
+                if trk.lost_interest and (now - trk.last_seen) > 10.0:
+                    stale_ids.append(tid)
+            for tid in stale_ids:
+                del self.tracks[tid]
+        return newly_confirmed_tracks, newly_lost_tracks
 
     def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.20, max_center_dist_ratio=0.18):
-        """
-        Mencocokkan bounding box baru dengan track kendaraan aktif yang sudah ada.
-        Menggunakan kombinasi IoU dan jarak pusat (Centroid) agar kendaraan yang bergerak
-        cepat pada low FPS tetap terhubung pada Track ID yang sama (mencegah ID jumping).
-        """
         if not bbox:
             return None
         now = time.time()
@@ -1788,15 +2062,22 @@ class VehicleConfirmationManager:
                         best_id = tid
         return best_id
 
+    def resolve_track_id(self, raw_tid, bbox, img_w=1920, img_h=1080):
+        """Menghasilkan atau memetakan track ID sebelum inferensi lanjutan."""
+        with self.lock:
+            if raw_tid is not None:
+                return raw_tid
+            matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h)
+            if matched_id is not None:
+                return matched_id
+            tid = self.next_fallback_id
+            self.next_fallback_id += 1
+            return tid
+
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            # Bersihkan track yang tidak terlihat > 4.0 detik atau track yang kadaluarsa dalam ANALYZING > 12 detik
-            # (Jika kendaraan keluar dari pandangan kamera sebelum konfirmasi, kandidat dibuang dan TIDAK disimpan)
-            stale_ids = [
-                tid for tid, trk in self.tracks.items()
-                if (now - trk.last_seen) > 4.0 or ((now - trk.created_at) > 12.0 and trk.status == "ANALYZING")
-            ]
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 8.0 and trk.lost_interest]
             for tid in stale_ids:
                 del self.tracks[tid]
 
@@ -1808,20 +2089,40 @@ class VehicleConfirmationManager:
                 for det in detections:
                     p_text = det.get("license_plate")
                     p_conf = det.get("plate_confidence", 0.0) or 0.0
+                    is_valid_struct, p_type = is_valid_indonesian_plate_structure(p_text)
                     p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper()) if p_text else ""
-                    is_valid = p_text and p_text != "TIDAK_TERBACA" and (len(p_clean) >= 4 or '-' in p_text)
 
                     det["track_id"] = 1
-                    if is_valid and p_conf >= 0.80:
+                    det["inside_interest_area"] = True
+                    det["lost_interest"] = False
+                    det["last_seen"] = now
+                    det["last_seen_age_ms"] = 0
+                    det["ocr_candidate"] = p_text
+                    det["ocr_confidence"] = p_conf
+                    det["candidate_confidence"] = p_conf
+                    det["candidate_matches"] = 1
+                    det["plate_detected"] = bool(det.get("plate_bbox") or det.get("plate_detected"))
+
+                    # SINGLE PHOTO FAST PATH: Valid Indonesian plate structure with confidence >= 0.65
+                    if is_valid_struct and p_conf >= 0.65:
+                        now_ts = time.time()
                         det["status"] = "CONFIRMED"
+                        det["ocr_status"] = "CONFIRMED"
                         det["consistency"] = 1.0
                         det["is_newly_confirmed"] = True
+                        det["confirmation_time"] = now_ts
+                        print(f"""[CONFIRMATION]
+track=1
+plate=\"{p_clean}\"
+reason=SINGLE_PHOTO_FAST_PATH (conf={p_conf:.2f})
+time_from_good_ocr_to_confirmation_ms=0.0""")
                     else:
                         det["status"] = "ANALYZING"
+                        det["ocr_status"] = "ANALYZING"
                         det["consistency"] = 0.5
                         det["is_newly_confirmed"] = False
                         det["analyzing_frame_count"] = 1
-                        det["analyzing_max_frames"] = 2 if p_conf >= 0.90 else 3
+                        det["analyzing_max_frames"] = 3
                     det.pop("plate_crop", None)
                 return detections
 
@@ -1834,15 +2135,12 @@ class VehicleConfirmationManager:
                 ih = det.get("image_height", 1080)
                 curr_plate_pre = det.get("license_plate")
 
-                # Prioritaskan ByteTrack ID jika sudah dikenal, atau cocokkan secara spasial jika ID baru/jumping
-                if raw_tid is not None and raw_tid in self.tracks:
+                if raw_tid is not None:
                     tid = raw_tid
                 else:
                     matched_id = self._match_track(bbox, curr_plate=curr_plate_pre, img_w=iw, img_h=ih)
                     if matched_id is not None:
                         tid = matched_id
-                    elif raw_tid is not None:
-                        tid = raw_tid
                     else:
                         tid = self.next_fallback_id
                         self.next_fallback_id += 1
@@ -1856,11 +2154,41 @@ class VehicleConfirmationManager:
                     track = self.tracks[tid]
                     track.add_frame(det)
 
-                # Pasang status temporal konfirmasi ke detection object
-                if track.history_saved:
-                    # KENDARAAN SUDAH TERKONFIRMASI SEBELUMNYA -> KUNCI DATA PLAT!
-                    # Frame bising/glare berikutnya saat mobil lewat TIDAK boleh mengubah plat atau membuat entri baru!
+                # Pasang status temporal konfirmasi & telemetry ke detection object
+                det["inside_interest_area"] = track.inside_interest_area
+                det["lost_interest"] = track.lost_interest
+                det["last_seen"] = round(track.last_seen, 3)
+                det["last_seen_age_ms"] = int(round(max(0.0, now - track.last_seen) * 1000))
+                det["ocr_candidate"] = track.best_candidate_display
+                det["candidate_confidence"] = round(track.best_candidate_conf, 3) if track.best_candidate_conf else None
+                det["candidate_matches"] = track.candidate_counts.get(track.best_candidate, 0) if track.best_candidate else 0
+                det["plate_detected"] = bool(det.get("plate_bbox") or det.get("plate_detected"))
+
+                if track.lost_interest:
+                    det["status"] = track.status if track.status in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
+                    det["ocr_status"] = "LOST_INTEREST" if det["status"] == "LOST_INTEREST" else det["status"]
+                    det["is_newly_confirmed"] = False
+                    if track.confirmed_data and not track.history_saved:
+                        det["license_plate"] = track.confirmed_data.get("license_plate")
+                        det["ocr_confidence"] = track.confirmed_data.get("plate_confidence")
+                    elif track.best_candidate_display:
+                        det["license_plate"] = track.best_candidate_display
+                        det["ocr_confidence"] = round(track.best_candidate_conf, 3) if track.best_candidate_conf else None
+                    det.pop("plate_crop", None)
+                    updated_detections.append(det)
+                    continue
+
+                if not track.inside_interest_area:
+                    det["status"] = "OUTSIDE_ROI"
+                    det["ocr_status"] = "OUTSIDE_ROI"
+                    det["license_plate"] = None
+                    det["plate_bbox"] = None
+                    det["plate_confidence"] = None
+                    det["ocr_confidence"] = None
+                    det["is_newly_confirmed"] = False
+                elif track.history_saved:
                     det["status"] = "HISTORY_SAVED"
+                    det["ocr_status"] = "CONFIRMED"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.confirmation_score
 
@@ -1869,11 +2197,13 @@ class VehicleConfirmationManager:
                         det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
                         det["license_plate"] = track.confirmed_data["license_plate"]
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
                 elif track.status == "CONFIRMED":
-                    # TRANSISI KE CONFIRMED: HANYA PADA FRAME INI DISET is_newly_confirmed = True (1x per kendaraan)
                     det["status"] = "CONFIRMED"
+                    det["ocr_status"] = "CONFIRMED"
                     det["is_newly_confirmed"] = True
+                    det["confirmation_time"] = track.confirmation_time
                     track.status = "HISTORY_SAVED"
                     track.history_saved = True
                     track.is_locked = True
@@ -1884,29 +2214,234 @@ class VehicleConfirmationManager:
                         det["body_style_confidence"] = track.confirmed_data["body_style_confidence"]
                         det["license_plate"] = track.confirmed_data["license_plate"]
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
+                        det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
                 else:
-                    # KENDARAAN MASIH DALAM PROSES ANALISIS SEMENTARA
                     det["status"] = "ANALYZING"
+                    cand_count = track.candidate_counts.get(track.best_candidate, 0) if track.best_candidate else 0
+                    det["ocr_status"] = "GOOD_CANDIDATE" if cand_count >= 2 else "ANALYZING"
                     det["is_newly_confirmed"] = False
                     det["consistency"] = track.get_current_consistency()
-                    curr_c, max_c = track.get_current_stability_count()
-                    det["analyzing_frame_count"] = curr_c
-                    det["analyzing_max_frames"] = max_c
+                    if track.best_candidate_display:
+                        det["license_plate"] = track.best_candidate_display
+                    if track.best_candidate_conf:
+                        det["ocr_confidence"] = round(track.best_candidate_conf, 3)
+                    det["analyzing_frame_count"] = max(1, track.get_current_stability_count())
+                    det["analyzing_max_frames"] = 3
 
-                # PENTING: Jangan kirim plate_crop (ndarray) ke client / JSON response
                 det.pop("plate_crop", None)
                 updated_detections.append(det)
 
             return updated_detections
 
 
+# ============================================================
+# TELEMETRI PERFORMA, EVENT ALPR, DAN STATE ALPR
+# ============================================================
+class PerfStats:
+    """Pengukur latency bergulir (500 sampel terakhir) + ringkasan per kendaraan. Dibaca via GET /api/perf."""
+    KEYS = ("vehicle_detection_ms", "plate_detection_ms", "character_model_ms",
+            "paddleocr_ms", "total_ocr_ms", "frame_age_ms")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.series = {k: deque(maxlen=500) for k in self.KEYS}
+        self.completed = deque(maxlen=200)
+
+    def add(self, key, value):
+        if value is None or key not in self.series:
+            return
+        with self.lock:
+            self.series[key].append(float(value))
+
+    def summary(self):
+        out = {}
+        with self.lock:
+            for k, v in self.series.items():
+                if not v:
+                    out[k] = {"n": 0}
+                    continue
+                arr = sorted(v)
+                out[k] = {
+                    "n": len(arr),
+                    "mean": round(sum(arr) / len(arr), 1),
+                    "p50": round(arr[len(arr) // 2], 1),
+                    "p95": round(arr[min(len(arr) - 1, int(len(arr) * 0.95))], 1),
+                }
+            comp = list(self.completed)
+        calls = [c["ocr_calls"] for c in comp]
+        out["ocr_calls_per_vehicle"] = {"n": len(calls), "mean": round(sum(calls) / len(calls), 2)} if calls else {"n": 0}
+        for k in ("time_to_first_plate_ms", "time_to_first_ocr_ms", "time_to_confirmation_ms"):
+            vals = [c[k] for c in comp if c.get(k) is not None]
+            out[k] = {"n": len(vals), "mean": round(sum(vals) / len(vals), 1)} if vals else {"n": 0}
+        return out
+
+
+perf_stats = PerfStats()
+
+
+def log_track_bench(trk, outcome):
+    """Ringkasan latency per kendaraan (dihitung dari saat kendaraan masuk ROI)."""
+    if trk is None or trk.bench_logged:
+        return
+    trk.bench_logged = True
+    base = trk.roi_entry_time
+
+    def d(t):
+        return round((t - base) * 1000.0, 1) if (t and base) else None
+
+    summary = {
+        "track_id": trk.track_id,
+        "outcome": outcome,
+        "ocr_calls": trk.ocr_calls,
+        "time_to_first_plate_ms": d(trk.first_plate_time),
+        "time_to_first_ocr_ms": d(trk.first_ocr_result_time),
+        "time_to_confirmation_ms": d(trk.confirmation_time),
+        "best_candidate": trk.best_candidate_display,
+    }
+    perf_stats.completed.append(summary)
+    print(f"[BENCH] {summary}")
+
+
+def emit_track_event_once(trk, name, **extra):
+    """Siarkan event ALPR lewat WebSocket sekali per track (vehicle_detected, entered_roi, plate_detected, ...)."""
+    if trk is None or name in trk.events_sent:
+        return
+    trk.events_sent.add(name)
+    ws_broadcaster.broadcast({"type": "alpr_event", "event": name, "track_id": trk.track_id,
+                              "timestamp": time.time(), **extra})
+
+
+def handle_lost_tracks(newly_lost):
+    """Event lost_interest + log bench untuk track yang sudah final. Dipanggil di luar lock manager."""
+    for trk in newly_lost:
+        emit_track_event_once(trk, "lost_interest", status=trk.status)
+    with confirmation_manager.lock:
+        done = [t for t in confirmation_manager.tracks.values()
+                if t.lost_interest and t.lost_finalized and not t.bench_logged]
+    for t in done:
+        log_track_bench(t, t.status)
+
+
+def compute_alpr_state(detections):
+    """
+    State ALPR untuk UI (terpisah dari status WebSocket & latency):
+    WAITING_FOR_VEHICLE | ALPR_ACTIVE | OCR_ANALYZING | CONFIRMED | LOST_INTEREST
+    """
+    active = [d for d in detections if d.get("inside_interest_area") and not d.get("lost_interest")]
+    if any(d.get("status") in ("CONFIRMED", "HISTORY_SAVED") for d in active):
+        return "CONFIRMED"
+    if any(d.get("status") == "ANALYZING" and d.get("plate_detected") for d in active):
+        return "OCR_ANALYZING"
+    if active:
+        return "ALPR_ACTIVE"
+    now = time.time()
+    with confirmation_manager.lock:
+        recent_lost = any(t.lost_interest and t.lost_interest_time and (now - t.lost_interest_time) <= 3.0
+                          for t in confirmation_manager.tracks.values())
+    return "LOST_INTEREST" if recent_lost else "WAITING_FOR_VEHICLE"
+
+
+def _async_ocr_task(job_id, track_id, crop, crop_q, submit_time, meta=None):
+    """
+    Worker task untuk asynchronous OCR (Character YOLO + PaddleOCR) di thread pool.
+    Setiap job membawa track_id, frame_id, job_id, dan capture_timestamp (meta).
+    Hasil job lama tidak boleh menimpa kandidat yang lebih baik (dijaga di VehicleTrack.add_ocr_result).
+    """
+    meta = meta or {}
+    frame_id = meta.get("frame_id")
+    try:
+        t_job0 = time.time()
+        queue_ms = (t_job0 - submit_time) * 1000.0
+        res = ensemble_plate_reading(crop, debug_tag=f"t{track_id}_j{job_id}")
+        text = res.get("final") or ""
+        conf = float(res.get("confidence", 0.0) or 0.0)
+        method = res.get("method", "ensemble")
+
+        is_newly_confirmed = False
+        confirmed_data = None
+        update_info = None
+        track = None
+        temporal = 0.0
+        inside_roi = None
+        lost_flag = None
+        best_display = None
+        cur_status = None
+
+        with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
+            if not track:
+                return
+            track.ocr_pending = False
+            track.ocr_calls += 1
+            if track.lost_interest and track.lost_finalized:
+                print(f"[OCR LATE] Job {job_id} untuk track {track_id} selesai setelah finalisasi LOST -> diabaikan")
+                return
+            if text and track.first_ocr_result_time is None:
+                track.first_ocr_result_time = time.time()
+            prev_status = track.status
+            update_info = track.add_ocr_result(job_id, text, conf, crop_q, ocr_method=method,
+                                               frame_id=frame_id, extra=res)
+            temporal = track.get_temporal_consistency()
+            inside_roi, lost_flag = track.inside_interest_area, track.lost_interest
+            best_display = track.best_candidate_display
+            if prev_status != "CONFIRMED" and track.status == "CONFIRMED":
+                is_newly_confirmed = True
+                confirmed_data = dict(track.confirmed_data) if track.confirmed_data else None
+                track.history_saved = True
+                track.status = "HISTORY_SAVED"
+                track.is_locked = True
+            cur_status = track.status
+
+        print(f"[TRACK] track_id={track_id} inside_roi={inside_roi} lost_interest={lost_flag} job={job_id} "
+              f"frame={frame_id} queue_ms={queue_ms:.0f}")
+        print(f"[RESULT] current_candidate='{text}' best_candidate='{best_display}' "
+              f"confirmation_status={cur_status} paddle='{res.get('paddle_text')}' char='{res.get('char_raw')}'")
+
+        # Siarkan pembaruan OCR langsung ke WebSocket tanpa menunggu konfirmasi
+        if update_info:
+            cand_count = update_info.get("candidate_matches", 0)
+            ocr_stat = "CONFIRMED" if update_info["is_confirmed"] else ("GOOD_CANDIDATE" if cand_count >= 2 else "ANALYZING")
+            ws_broadcaster.broadcast({
+                "type": "ocr_update",
+                "track_id": track_id,
+                "frame_id": frame_id,
+                "job_id": job_id,
+                "license_plate": update_info["ocr_candidate"],
+                "ocr_candidate": update_info["ocr_candidate"],
+                "ocr_confidence": round(update_info["ocr_confidence"], 3) if update_info.get("ocr_confidence") else None,
+                "candidate_matches": cand_count,
+                "ocr_status": ocr_stat,
+                "status": update_info["status"],
+                "paddle_text": res.get("paddle_text"),
+                "paddle_confidence": round(res.get("paddle_conf", 0.0) or 0.0, 3),
+                "character_model_text": res.get("char_raw"),
+                "character_model_confidence": round(res.get("char_conf", 0.0) or 0.0, 3),
+                "candidate_score": res.get("candidate_score"),
+                "temporal_consistency": round(temporal, 2),
+                "lost_interest": bool(lost_flag),
+                "inside_interest_area": True,
+                "timestamp": time.time()
+            })
+
+        if is_newly_confirmed and confirmed_data:
+            rec = save_parking_record(confirmed_data)
+            log_track_bench(track, "CONFIRMED")
+    except Exception as e:
+        print(f"[ASYNC OCR ERROR] Track {track_id} job {job_id}: {e}")
+        with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
+            if track:
+                track.ocr_pending = False
+
+
+
 confirmation_manager = VehicleConfirmationManager()
 
 
-def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
+def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False,
+             frame_id=None, capture_ts=None):
     t_start = time.time()
-    capture_ts = capture_timestamp if capture_timestamp is not None else t_start
     v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
     m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
     p_conf_thresh = plate_conf if plate_conf is not None else PLATE_CONF_THRESH
@@ -1921,17 +2456,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         raise ValueError(f"Gagal membaca gambar dari: {image_input}")
 
     ih, iw = img.shape[:2]
-    yolo_extra = {"half": True} if USE_FP16 else {}
 
-    # 1. VEHICLE DETECTION & TRACKING (Decoupled: 320px for ~35ms latency)
-    t_v0 = time.time()
+    # 1. YOLO VEHICLE INFERENCE (plate detection is gated by interest area)
+    t_yolo_0 = time.time()
     if is_stream:
-        vdet = vehicle_model.track(img, persist=True, tracker="bytetrack.yaml",
-                                   conf=m_conf_thresh, imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+        fut_v = ai_pool.submit(vehicle_model.track, img, persist=True, tracker="bytetrack.yaml",
+                               conf=m_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)
     else:
-        vdet = vehicle_model.predict(img, conf=m_conf_thresh,
-                                     imgsz=VEHICLE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
-    t_vdet = time.time() - t_v0
+        fut_v = ai_pool.submit(vehicle_model.predict, img, conf=m_conf_thresh,
+                               imgsz=IMG_SIZE, device=DEVICE, verbose=False)
+    vdet = fut_v.result()[0]
+    t_vehicle = time.time() - t_yolo_0
 
     # 2. EKSTRAKSI KANDIDAT KENDARAAN
     candidates = []
@@ -1957,27 +2492,36 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "area": area
         })
 
-    # Cek apakah semua kendaraan aktif sudah terkonfirmasi di confirmation_manager
-    # Jika sudah terkonfirmasi, lewati pendeteksian plat global 100% (0 ms!)
-    all_candidates_confirmed = False
-    if is_stream and candidates:
-        all_confirmed = True
-        for c in candidates:
-            trk = confirmation_manager.find_track(track_id=c.get("track_id"), bbox=[c["x1"], c["y1"], c["x2"], c["y2"]], img_w=iw, img_h=ih)
-            if not trk or not trk.history_saved:
-                all_confirmed = False
-                break
-        all_candidates_confirmed = all_confirmed
-
-    # 1b. PENDETEKSIAN PLAT NOMOR GLOBAL (416px, ~49ms - lewati jika sudah confirmed atau stream kosong)
-    skip_plate_det = all_candidates_confirmed or (is_stream and not candidates)
     global_plates = []
     body_hints = []
-    t_p0 = time.time()
 
-    if not skip_plate_det:
-        pdet_global = plate_detector.predict(img, conf=p_conf_thresh,
-                                             imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+    # 2b. FILTER & FOKUS KENDARAAN DI DEPAN KAMERA (Front-of-Camera Priority)
+    scored_candidates = []
+    if candidates:
+        for c in candidates:
+            s = get_front_of_camera_score(c, global_plates, iw, ih)
+            if s > 0:
+                c["front_score"] = s
+                inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
+                c["_inside_roi"] = inside
+                c["_roi_overlap"] = overlap
+                scored_candidates.append(c)
+        scored_candidates.sort(key=lambda c: (-int(c.get("_inside_roi", False)), -c["front_score"]))
+
+        if single_vehicle_mode and not is_stream:
+            candidates = [scored_candidates[0]] if scored_candidates else []
+        else:
+            candidates = scored_candidates
+
+    any_inside_roi = any(c.get("_inside_roi") for c in candidates)
+
+    # Plate detection/OCR hanya jika ada kendaraan di dalam Detection Area
+    # (foto tunggal tetap menjalankan detektor plat seperti jalur last-known-good)
+    plate_stage_ran = bool(any_inside_roi or not is_stream)
+    t_plate_total = 0.0
+    t_plate_block0 = time.time()
+    if any_inside_roi or not is_stream:
+        pdet_global = plate_detector.predict(img, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
         for pbox in pdet_global.boxes:
             cls_id = int(pbox.cls[0])
             cls_name = plate_detector.names.get(cls_id, "")
@@ -1999,7 +2543,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
         # Deteksi Fallback untuk Plat Hitam / Gelap / Plat Militer
         if not global_plates or max([p["conf"] for p in global_plates], default=0.0) < 0.30:
-            pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, imgsz=PLATE_IMG_SIZE, device=DEVICE, verbose=False, **yolo_extra)[0]
+            pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, device=DEVICE, verbose=False)[0]
             for pbox in pdet_legacy_full.boxes:
                 px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
                 pconf = float(pbox.conf[0])
@@ -2011,56 +2555,44 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             "conf": pconf,
                             "matched": False
                         })
-    t_pdet = time.time() - t_p0
 
-    # FALLBACK UNTUK MOBIL GELAP / HITAM:
-    # Hanya aktif jika ada plat nomor terdeteksi DAN menaungi bounding box kendaraan di vdet
-    # (mencegah terciptanya 'mobil hantu' di palang gerbang parkir)
-    if not candidates and global_plates:
-        best_p = max(global_plates, key=lambda p: p["conf"])
-        if best_p["conf"] >= 0.25:
-            px1, py1, px2, py2 = best_p["box"]
-            found_box = None
-            for box in vdet.boxes:
-                bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
-                if bx1 - 30 <= (px1 + px2) / 2 <= bx2 + 30 and by1 - 30 <= (py1 + py2) / 2 <= by2 + 30:
-                    found_box = box
-                    break
-            if found_box is not None:
-                v_type = map_vehicle_class_name(found_box.cls[0], vehicle_model)
-                v_conf = float(found_box.conf[0])
-                x1, y1, x2, y2 = map(int, found_box.xyxy[0].tolist())
-                candidates.append({
-                    "track_id": None,
-                    "vehicle_type": v_type,
-                    "v_conf": v_conf,
-                    "x1": max(0, x1), "y1": max(0, y1),
-                    "x2": min(iw, x2), "y2": min(ih, y2),
-                    "area": (x2 - x1) * (y2 - y1)
-                })
+        # FALLBACK UNTUK MOBIL GELAP / HITAM (hanya jika sudah ada kendaraan di ROI atau mode foto)
+        if not candidates and global_plates:
+            best_p = max(global_plates, key=lambda p: p["conf"])
+            if best_p["conf"] >= 0.25:
+                px1, py1, px2, py2 = best_p["box"]
+                found_box = None
+                for box in vdet.boxes:
+                    bx1, by1, bx2, by2 = map(int, box.xyxy[0].tolist())
+                    if bx1 - 30 <= (px1 + px2) / 2 <= bx2 + 30 and by1 - 30 <= (py1 + py2) / 2 <= by2 + 30:
+                        found_box = box
+                        break
+                if found_box is not None:
+                    v_type = map_vehicle_class_name(found_box.cls[0], vehicle_model)
+                    v_conf = float(found_box.conf[0])
+                    x1, y1, x2, y2 = map(int, found_box.xyxy[0].tolist())
+                    inside, overlap = is_vehicle_inside_roi(x1, y1, x2, y2, iw, ih)
+                    if inside or not is_stream:
+                        candidates.append({
+                            "track_id": None,
+                            "vehicle_type": v_type,
+                            "v_conf": v_conf,
+                            "x1": max(0, x1), "y1": max(0, y1),
+                            "x2": min(iw, x2), "y2": min(ih, y2),
+                            "area": (x2 - x1) * (y2 - y1),
+                            "_inside_roi": inside,
+                            "_roi_overlap": overlap,
+                            "front_score": 1.0
+                        })
+
+    t_plate_total += (time.time() - t_plate_block0) if plate_stage_ran else 0.0
+    t_yolo = time.time() - t_yolo_0
 
     results_out = []
     t_body_total = 0.0
     t_ocr_total = 0.0
 
-    # 2b. FILTER & FOKUS KENDARAAN DI DEPAN KAMERA (Front-of-Camera Priority)
-    # Singkirkan objek background kecil (<2.5% area) atau kendaraan di tepi ekstrim gambar,
-    # dan fokuskan deteksi HANYA pada kendaraan utama yang berada di depan kamera.
     if candidates:
-        scored_candidates = []
-        for c in candidates:
-            s = get_front_of_camera_score(c, global_plates, iw, ih)
-            if s > 0:
-                c["front_score"] = s
-                scored_candidates.append(c)
-
-        scored_candidates.sort(key=lambda c: -c["front_score"])
-
-        if single_vehicle_mode:
-            candidates = [scored_candidates[0]] if scored_candidates else []
-        else:
-            candidates = scored_candidates
-
         for cand in candidates:
             initial_vtype = cand["vehicle_type"]
             v_conf = cand["v_conf"]
@@ -2068,27 +2600,35 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             x1, y1, x2, y2 = cand["x1"], cand["y1"], cand["x2"], cand["y2"]
             vehicle_crop = img[y1:y2, x1:x2]
 
-            # 3. UPFRONT TRACK LOOKUP & BODY STYLE CACHING (0 ms if cached)
-            existing_trk = confirmation_manager.find_track(track_id=cand_track_id, bbox=[x1, y1, x2, y2], img_w=iw, img_h=ih)
-            if existing_trk and (cand_track_id is None or cand_track_id not in confirmation_manager.tracks):
-                cand_track_id = existing_trk.track_id
-                cand["track_id"] = cand_track_id
+            # Cek status ROI / Detection Area untuk kendaraan ini
+            is_in_roi, roi_overlap = is_vehicle_inside_roi(x1, y1, x2, y2, iw, ih)
 
-            # Cek apakah ada deteksi 'bus' di area kendaraan ini (misal Isuzu Elf yang dideteksi truck & bus oleh YOLO)
+            tid, existing_trk = confirmation_manager.get_or_create_track(
+                cand_track_id, [x1, y1, x2, y2], img_w=iw, img_h=ih
+            )
+            cand_track_id = tid
+            emit_track_event_once(existing_trk, "vehicle_detected", vehicle_type=initial_vtype, bbox=[x1, y1, x2, y2])
+            if is_in_roi:
+                if existing_trk.roi_entry_time is None:
+                    existing_trk.roi_entry_time = time.time()
+                emit_track_event_once(existing_trk, "entered_roi")
+
+            # Cek apakah ada deteksi 'bus' di area kendaraan ini
             has_bus_det = any(
                 map_vehicle_class_name(b.cls[0], vehicle_model) == 'bus' and
                 compute_iou([x1, y1, x2, y2], list(map(int, b.xyxy[0].tolist()))) > 0.30
                 for b in vdet.boxes
             )
 
+            # 3. BODY STYLE CACHING PER TRACK ID
             t_b0 = time.time()
+            existing_trk = confirmation_manager.tracks.get(cand_track_id) if cand_track_id else None
             if existing_trk and existing_trk.cached_body_style and existing_trk.cached_body_conf >= 0.80:
                 # REUSE CACHED RESULT (0 ms!)
                 vehicle_type = existing_trk.cached_vtype or initial_vtype
                 body_style = existing_trk.cached_body_style
                 body_style_conf = existing_trk.cached_body_conf
             else:
-                # Jalankan klasifikasi bodi jika track baru atau confidence sebelumnya < 0.80
                 vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
                     img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
                 )
@@ -2098,6 +2638,32 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     existing_trk.cached_vtype = vehicle_type
             t_body_total += (time.time() - t_b0)
 
+            # JIKA DI LUAR DETECTION AREA ATAU LOST INTEREST:
+            # Tidak memicu deteksi plat nomor atau OCR!
+            if (not is_in_roi) or existing_trk.lost_interest:
+                results_out.append({
+                    "track_id": cand_track_id,
+                    "vehicle_type": vehicle_type,
+                    "body_style": body_style,
+                    "body_style_confidence": round(body_style_conf, 3) if body_style_conf else None,
+                    "license_plate": None,
+                    "ocr_method": None,
+                    "vehicle_confidence": round(v_conf, 3),
+                    "plate_confidence": None,
+                    "plate_bbox_confidence": None,
+                    "ocr_confidence": None,
+                    "bbox": [x1, y1, x2, y2],
+                    "plate_bbox": None,
+                    "plate_crop": None,
+                    "image_width": iw,
+                    "image_height": ih,
+                    "inside_interest_area": bool(is_in_roi),
+                    "plate_detected": False,
+                    "lost_interest": bool(existing_trk.lost_interest)
+                })
+                continue
+
+            # JIKA DI DALAM DETECTION AREA (INSIDE ROI):
             matched_plate = None
             for p in global_plates:
                 if not p["matched"]:
@@ -2120,9 +2686,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
             # Hierarchical Plate Crop (jika belum terdeteksi dari full frame)
-            # Menggunakan imgsz=256 pada crop kendaraan (bukan 640) untuk kecepatan maksimal
             if plate_crop.size == 0 and vehicle_crop.size > 0:
-                pdet_crop = plate_detector.predict(vehicle_crop, conf=0.10, imgsz=256, device=DEVICE, verbose=False, **yolo_extra)[0]
+                _tp = time.time()
+                pdet_crop = plate_detector.predict(vehicle_crop, conf=0.10, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                t_plate_total += time.time() - _tp
                 valid_crops = []
                 for b in pdet_crop.boxes:
                     cls_id = int(b.cls[0])
@@ -2134,7 +2701,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     if is_valid_plate_box(abs_box, iw, ih):
                         valid_crops.append((abs_box, float(b.conf[0])))
                 if not valid_crops or max([c[1] for c in valid_crops], default=0.0) < 0.30:
-                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=min(p_conf_thresh, 0.06), imgsz=256, device=DEVICE, verbose=False, **yolo_extra)[0]
+                    _tp = time.time()
+                    pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=min(p_conf_thresh, 0.06), device=DEVICE, verbose=False)[0]
+                    t_plate_total += time.time() - _tp
                     for b in pdet_legacy.boxes:
                         cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                         abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
@@ -2160,74 +2729,73 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     plate_conf_val = matched_plate["conf"]
                     abs_plate_bbox = [gpx1, gpy1, gpx2, gpy2]
 
+            if abs_plate_bbox is not None:
+                if existing_trk.first_plate_time is None:
+                    existing_trk.first_plate_time = time.time()
+                emit_track_event_once(existing_trk, "plate_detected", plate_bbox=abs_plate_bbox)
+
             plate_text = None
             ocr_method = None
             ocr_conf = 0.0
 
-            # 4. FAST ADAPTIVE OCR PIPELINE WITH BEST-FRAME ACCELERATOR & ZERO-MS CACHING
-            if existing_trk and existing_trk.history_saved:
-                # KENDARAAN SUDAH TERKONFIRMASI SEBELUMNYA -> SKIP OCR 100% (0 ms!)
-                if existing_trk.confirmed_data:
-                    plate_text = existing_trk.confirmed_data.get("license_plate")
-                    ocr_conf = existing_trk.confirmed_data.get("plate_confidence", 0.95)
-                    ocr_method = "tracking_cache"
+            # 4. PLATE READING (ASYNCHRONOUS DI STREAM, SYNCHRONOUS DI PHOTO UPLOAD)
+            if plate_crop.size > 0:
+                crop_q = compute_crop_quality(plate_crop, plate_conf_val)
+
+                if is_stream:
+                    # Jalur Stream: Asynchronous OCR menggunakan crop terbaik
+                    if existing_trk.is_locked or existing_trk.history_saved:
+                        plate_text = existing_trk.confirmed_data.get("license_plate") if existing_trk.confirmed_data else existing_trk.best_candidate_display
+                        ocr_conf = existing_trk.confirmed_data.get("plate_confidence", 0.0) if existing_trk.confirmed_data else existing_trk.best_candidate_conf
+                        ocr_method = "locked_confirmed"
+                    elif not existing_trk.lost_interest:
+                        should_run_async_ocr = False
+                        if not existing_trk.ocr_pending:
+                            if (existing_trk.best_candidate is None) or (crop_q > existing_trk.best_crop_quality * 1.15) or (time.time() - (existing_trk.last_ocr_time or 0) > 0.40):
+                                should_run_async_ocr = True
+                        elif crop_q > existing_trk.best_crop_quality * 1.25:
+                            should_run_async_ocr = True
+
+                        if crop_q <= 0.0:
+                            should_run_async_ocr = False   # crop terlalu kecil -> jangan buang waktu OCR
+
+                        if should_run_async_ocr:
+                            job_id = get_next_ocr_job_id()
+                            existing_trk.ocr_pending = True
+                            existing_trk.last_ocr_job_id = job_id
+                            existing_trk.best_crop_quality = max(existing_trk.best_crop_quality, crop_q)
+                            ph, pw = plate_crop.shape[:2]
+                            print(f"[PLATE] track={cand_track_id} frame={frame_id} job={job_id} bbox={abs_plate_bbox} "
+                                  f"crop={pw}x{ph} crop_quality={crop_q:.2f} plate_det_conf={plate_conf_val}")
+                            emit_track_event_once(existing_trk, "ocr_analyzing", job_id=job_id)
+                            ocr_executor.submit(_async_ocr_task, job_id, cand_track_id, plate_crop.copy(), crop_q, time.time(),
+                                                {"frame_id": frame_id, "capture_ts": capture_ts, "plate_bbox": abs_plate_bbox})
+
+                        if existing_trk.best_candidate_display:
+                            plate_text = existing_trk.best_candidate_display
+                            ocr_conf = existing_trk.best_candidate_conf
+                            ocr_method = "temporal_best_candidate"
+                        else:
+                            # Coba pass cepat char_model (~35ms) agar hasil awal tampil seketika
+                            t_o0 = time.time()
+                            c_raw, c_conf, _ = read_plate_with_char_model(plate_crop, conf=0.08)
+                            t_ocr_total += (time.time() - t_o0)
+                            prev_norm = normalize_indonesian_plate(c_raw)
+                            if prev_norm["valid"] and c_conf >= 0.50:
+                                # Preview cepat untuk Latest Detection; BUKAN evidence konfirmasi (lihat NON_EVIDENCE_OCR_METHODS)
+                                plate_text = prev_norm["text"]
+                                ocr_conf = c_conf
+                                ocr_method = "char_model_preview"
                 else:
-                    plate_text = existing_trk.last_ocr_text
-                    ocr_conf = existing_trk.last_ocr_conf
-                    ocr_method = "tracking_cache"
-            elif plate_crop.size > 0:
-                ch, cw = plate_crop.shape[:2]
-                crop_q = compute_crop_quality(plate_crop, plate_conf_val or 0.5)
-                sharpness = compute_sharpness(plate_crop)
-                is_blurry = (sharpness < MIN_SHARPNESS_VAR) and is_stream
-                is_usable_crop = (cw >= 36 and ch >= 14 and (plate_conf_val is None or plate_conf_val >= 0.15) and not is_blurry)
+                    # Jalur Single Photo: Synchronous OCR agar hasil lengkap seketika di respons JSON
+                    t_o0 = time.time()
+                    ensemble_res = ensemble_plate_reading(plate_crop)
+                    plate_text = ensemble_res.get("final")
+                    ocr_method = ensemble_res.get("method")
+                    ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
+                    t_ocr_total += (time.time() - t_o0)
 
-                if is_usable_crop:
-                    now = time.time()
-                    dt = (now - existing_trk.last_ocr_time) if existing_trk else 999.0
-
-                    # Adaptive Throttle: 80ms jika observasi masih < 2, 120ms jika sudah >= 2
-                    num_obs = len(existing_trk.valid_plate_observations) if existing_trk else 0
-                    current_throttle = (OCR_THROTTLE_SEC * 0.65) if num_obs < 2 else OCR_THROTTLE_SEC
-
-                    # Best-Frame Accelerator: jika kualitas citra saat ini melonjak (+15%) dari yang pernah dilihat
-                    best_q = existing_trk.best_crop_quality if existing_trk else -1.0
-                    is_sharpness_boost = (crop_q > best_q * 1.15) if best_q > 0 else False
-
-                    # Keputusan OCR: Jalankan jika throttle sudah lewat, atau kualitas melonjak, atau mode non-stream
-                    should_run_ocr = (dt >= current_throttle) or is_sharpness_boost or (not is_stream)
-
-                    if should_run_ocr:
-                        t_o0 = time.time()
-                        ensemble_res = ensemble_plate_reading(plate_crop)
-                        plate_text = ensemble_res.get("final")
-                        ocr_method = ensemble_res.get("method")
-                        ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
-                        t_ocr_total += (time.time() - t_o0)
-
-                        if existing_trk:
-                            existing_trk.last_ocr_time = now
-                            existing_trk.last_ocr_text = plate_text
-                            existing_trk.last_ocr_conf = ocr_conf
-                            existing_trk.last_ocr_method = ocr_method
-                    else:
-                        # Throttle aktif -> SKIP OCR (0 ms!)
-                        # Gunakan cache untuk real-time feedback di UI tanpa lag
-                        if existing_trk and existing_trk.last_ocr_text:
-                            plate_text = existing_trk.last_ocr_text
-                            ocr_conf = existing_trk.last_ocr_conf
-                            ocr_method = "tracking_cache"
-                else:
-                    if existing_trk and existing_trk.last_ocr_text:
-                        plate_text = existing_trk.last_ocr_text
-                        ocr_conf = existing_trk.last_ocr_conf
-                        ocr_method = "tracking_cache"
-            elif existing_trk and existing_trk.last_ocr_text:
-                plate_text = existing_trk.last_ocr_text
-                ocr_conf = existing_trk.last_ocr_conf
-                ocr_method = "tracking_cache"
-
-            # Prioritaskan ocr_conf saat plat terbaca agar evaluasi konfirmasi (>=80%) mengukur akurasi OCR
+            # Prioritaskan ocr_conf saat plat terbaca agar evaluasi konfirmasi mengukur akurasi OCR
             effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
 
             results_out.append({
@@ -2246,6 +2814,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 "plate_crop": plate_crop if is_stream else None,
                 "image_width": iw,
                 "image_height": ih,
+                "inside_interest_area": True,
+                "plate_detected": bool(abs_plate_bbox is not None)
             })
 
     # 5. FAST TEMPORAL CONFIRMATION (Evaluasi & Deferred OCR saat Confirmed)
@@ -2258,14 +2828,13 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         d.pop("plate_crop", None)
 
     t_total = time.time() - t_start
-    inference_start = t_start
-    inference_end = time.time()
-    frame_age_ms = round((inference_end - capture_ts) * 1000, 1)
     fps = 1.0 / max(1e-4, t_total)
-    q_size = realtime_frame_buffer.queue_size if 'realtime_frame_buffer' in globals() else 0
 
-    # 5. PERFORMANCE TELEMETRY LOGGING (Matching User Specification)
-    print(f"[PERF_FRAME] frame_id={frame_id} capture_ts={capture_ts:.3f} inf_start={inference_start:.3f} inf_end={inference_end:.3f} v_det_ms={t_vdet*1000:.1f} p_det_ms={t_pdet*1000:.1f} ocr_ms={t_ocr_total*1000:.1f} total_ms={t_total*1000:.1f} q_size={q_size} frame_age_ms={frame_age_ms:.1f}")
+    # 5. PERFORMANCE TELEMETRY LOGGING
+    perf_stats.add("vehicle_detection_ms", t_vehicle * 1000.0)
+    if plate_stage_ran:
+        perf_stats.add("plate_detection_ms", t_plate_total * 1000.0)
+    print(f"[PERF] Vehicle: {round(t_vehicle*1000, 1)}ms | Plate: {round(t_plate_total*1000, 1)}ms | YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
 
     return {
         "detections": results_out,
@@ -2273,120 +2842,242 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "source": image_path,
         "image_width": iw,
         "image_height": ih,
-        "frame_id": frame_id,
-        "capture_timestamp": capture_ts,
-        "frame_age_ms": frame_age_ms,
-        "queue_size": q_size,
         "perf_breakdown": {
-            "vehicle_detection_ms": round(t_vdet * 1000, 1),
-            "plate_detection_ms": round(t_pdet * 1000, 1),
-            "yolo_ms": round((t_vdet + t_pdet) * 1000, 1),
+            "yolo_ms": round(t_yolo * 1000, 1),
+            "vehicle_ms": round(t_vehicle * 1000, 1),
+            "plate_ms": round(t_plate_total * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
             "body_ms": round(t_body_total * 1000, 1),
             "ocr_ms": round(t_ocr_total * 1000, 1),
             "total_ms": round(t_total * 1000, 1),
-            "frame_age_ms": frame_age_ms,
             "fps": round(fps, 1)
         }
     }
 
 
+
+app = Flask(__name__)
+sock = Sock(app)
+
+
 # ============================================================
-# REAL-TIME ASYNCHRONOUS INFERENCE WORKER
-# Terus-menerus mengambil frame TERBARU dari LatestFrameBuffer
-# Menjalankan AI tanpa membuat antrean macet di memori atau browser.
+# REAL-TIME BACKGROUND STREAM INFERENCE WORKER
+# Memproses frame camera_stream_manager dan menyiarkan hasil deteksi via WebSocket secara live.
 # ============================================================
-class RealtimeInferenceWorker:
-    def __init__(self, frame_buffer):
-        self.frame_buffer = frame_buffer
-        self.lock = threading.Lock()
+class StreamInferenceWorker:
+    def __init__(self):
         self.running = False
         self.thread = None
-        self.latest_result = None
-        self.latest_processed_frame_id = -1
-        self.latest_processed_ts = 0.0
-        self.first_candidate_time_ms = None
-        self.stats = {
-            "total_inferences": 0,
-            "avg_frame_age_ms": 0.0,
-            "max_frame_age_ms": 0.0,
-            "latest_frame_age_ms": 0.0
-        }
+        self.lock = threading.Lock()
+        self.last_payload = None
 
     def start(self):
         with self.lock:
             if self.running:
                 return
             self.running = True
-            self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.thread = threading.Thread(target=self._loop, daemon=True, name="StreamInferenceWorker")
             self.thread.start()
+            print("[INFO] StreamInferenceWorker aktif di latar belakang.")
 
     def stop(self):
         with self.lock:
             self.running = False
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
+        print("[INFO] StreamInferenceWorker dihentikan.")
 
-    def _worker_loop(self):
+    def _loop(self):
+        last_processed_frame_id = -1
         while self.running:
-            frame, frame_id, capture_ts, source, is_stream = self.frame_buffer.wait_next(timeout=0.1)
-            if frame is None or not self.running:
+            with camera_stream_manager.condition:
+                if not camera_stream_manager.running:
+                    camera_stream_manager.condition.wait(timeout=0.2)
+                    continue
+                camera_stream_manager.condition.wait_for(
+                    lambda: camera_stream_manager.frame_id != last_processed_frame_id or not camera_stream_manager.running,
+                    timeout=0.1
+                )
+                if not self.running or not camera_stream_manager.running:
+                    continue
+                frame = camera_stream_manager.get_latest_frame()
+                frame_id = camera_stream_manager.frame_id
+                frame_capture_time = camera_stream_manager.latest_frame_time
+                last_processed_frame_id = frame_id
+
+            if frame is None:
+                time.sleep(0.02)
                 continue
 
+            t0 = time.time()
             try:
-                result = run_anpr(
-                    frame,
-                    is_stream=is_stream,
-                    frame_id=frame_id,
-                    capture_timestamp=capture_ts
-                )
+                result = run_anpr(frame, is_stream=True, frame_id=frame_id, capture_ts=frame_capture_time)
+                det_time_ms = round((time.time() - t0) * 1000)
 
-                if result.get("detections"):
-                    primary_det = result["detections"][0]
-                    # Track time to first candidate
-                    if self.first_candidate_time_ms is None and primary_det.get("license_plate"):
-                        self.first_candidate_time_ms = round((time.time() - capture_ts) * 1000, 1)
+                # Evaluasi lost tracks (finalize or discard; save_parking_record already broadcasts)
+                lost_confirmed, newly_lost = confirmation_manager.check_lost_tracks()
+                handle_lost_tracks(newly_lost)
+                for trk in lost_confirmed:
+                    if trk.confirmed_data and not trk.history_saved:
+                        rec = save_parking_record(trk.confirmed_data, source_img=frame)
+                        trk.history_saved = True
+                        trk.status = "HISTORY_SAVED"
 
-                    if primary_det.get("is_newly_confirmed"):
-                        rec = save_parking_record(primary_det, source_img=frame)
-                        primary_det["record"] = rec
-                        if rec and rec.get("snapshot_url"):
-                            result["image_url"] = rec["snapshot_url"]
+                detections = result.get("detections", [])
+                det_ids = {d.get("track_id") for d in detections}
 
-                with self.lock:
-                    self.latest_result = result
-                    self.latest_processed_frame_id = frame_id
-                    self.latest_processed_ts = capture_ts
-                    self.stats["total_inferences"] += 1
-                    f_age = result.get("frame_age_ms", 0.0)
-                    self.stats["latest_frame_age_ms"] = f_age
-                    if f_age > self.stats["max_frame_age_ms"]:
-                        self.stats["max_frame_age_ms"] = f_age
+                # Refresh lost_interest flags after check_lost_tracks
+                now_ts = time.time()
+                with confirmation_manager.lock:
+                    for det in detections:
+                        trk = confirmation_manager.tracks.get(det.get("track_id"))
+                        if trk:
+                            det["lost_interest"] = trk.lost_interest
+                            det["last_seen"] = round(trk.last_seen, 3)
+                            det["last_seen_age_ms"] = int(round(max(0.0, now_ts - trk.last_seen) * 1000))
+                            if trk.lost_interest and det.get("status") not in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED"):
+                                det["status"] = trk.status if trk.status in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
+                                det["ocr_status"] = "LOST_INTEREST" if det["status"] == "LOST_INTEREST" else det["status"]
+
+                    for trk in newly_lost:
+                        if trk.track_id not in det_ids:
+                            detections.append(trk.debug_snapshot(now_ts))
+
+                # Check newly confirmed (save_parking_record broadcasts entry_confirmed once)
+                for det in detections:
+                    if det.get("is_newly_confirmed"):
+                        rec = save_parking_record(det, source_img=frame)
+                        det["record"] = rec
+
+                # Broadcast detection update ke seluruh WebSocket client
+                now_broadcast = time.time()
+                frame_age_ms = int(round((now_broadcast - frame_capture_time) * 1000)) if frame_capture_time else det_time_ms
+                perf_stats.add("frame_age_ms", frame_age_ms)
+                payload = {
+                    "type": "detection_update",
+                    "frame_id": frame_id,
+                    "timestamp": t0,
+                    "capture_timestamp": frame_capture_time,
+                    "frame_age_ms": frame_age_ms,
+                    "latency_ms": det_time_ms,
+                    "alpr_state": compute_alpr_state(detections),
+                    "detections": detections,
+                    "interest_area": INTEREST_AREA,
+                    "image_width": result.get("image_width", 1920),
+                    "image_height": result.get("image_height", 1080),
+                }
+                self.last_payload = payload
+                ws_broadcaster.broadcast(payload)
             except Exception as e:
-                print(f"[REALTIME_WORKER_ERROR] {e}")
+                print(f"[STREAM INFERENCE ERROR]: {e}")
+                time.sleep(0.05)
 
-    def get_latest_result(self):
-        with self.lock:
-            if self.latest_result is None:
-                return None
-            return self.latest_result.copy()
 
-    def reset_stats(self):
-        with self.lock:
-            self.first_candidate_time_ms = None
-            self.latest_result = None
-            self.stats = {
-                "total_inferences": 0,
-                "avg_frame_age_ms": 0.0,
-                "max_frame_age_ms": 0.0,
-                "latest_frame_age_ms": 0.0
+stream_inference_worker = StreamInferenceWorker()
+
+
+# ============================================================
+# WEBSOCKET REAL-TIME STREAMING ENDPOINT
+# ============================================================
+@sock.route('/ws/live')
+def live_ws(ws):
+    ws_broadcaster.register(ws)
+    try:
+        init_payload = {
+            "type": "init",
+            "interest_area": INTEREST_AREA,
+            "status": camera_stream_manager.get_status(),
+            "alpr_state": (stream_inference_worker.last_payload or {}).get("alpr_state", "WAITING_FOR_VEHICLE"),
+            "history": list(LATEST_RECORDS)[:30]
+        }
+        ws.send(json.dumps(init_payload))
+
+        while True:
+            data = ws.receive(timeout=1.0)
+            if data is not None:
+                try:
+                    msg = json.loads(data)
+                    m_type = msg.get("type")
+                    if m_type == "ping":
+                        ws.send(json.dumps({"type": "pong", "time": time.time()}))
+                    elif m_type == "detect_frame":
+                        b64_img = msg.get("image", "")
+                        if "," in b64_img:
+                            b64_img = b64_img.split(",", 1)[1]
+                        if b64_img:
+                            img_bytes = base64.b64decode(b64_img)
+                            nparr = np.frombuffer(img_bytes, np.uint8)
+                            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if frame is not None:
+                                t0 = time.time()
+                                res = run_anpr(frame, is_stream=True)
+                                det_ms = round((time.time() - t0) * 1000)
+
+                                lost_confirmed, newly_lost = confirmation_manager.check_lost_tracks()
+                                handle_lost_tracks(newly_lost)
+                                for trk in lost_confirmed:
+                                    if trk.confirmed_data and not trk.history_saved:
+                                        rec = save_parking_record(trk.confirmed_data, source_img=frame)
+                                        trk.history_saved = True
+                                        trk.status = "HISTORY_SAVED"
+
+                                detections = res.get("detections", [])
+                                det_ids = {d.get("track_id") for d in detections}
+                                now_ts = time.time()
+                                with confirmation_manager.lock:
+                                    for trk in newly_lost:
+                                        if trk.track_id not in det_ids:
+                                            detections.append(trk.debug_snapshot(now_ts))
+
+                                for d in detections:
+                                    if d.get("is_newly_confirmed"):
+                                        rec = save_parking_record(d, source_img=frame)
+                                        d["record"] = rec
+
+                                payload = {
+                                    "type": "detection_update",
+                                    "timestamp": t0,
+                                    "latency_ms": det_ms,
+                                    "alpr_state": compute_alpr_state(detections),
+                                    "detections": detections,
+                                    "interest_area": INTEREST_AREA,
+                                    "image_width": res.get("image_width", frame.shape[1]),
+                                    "image_height": res.get("image_height", frame.shape[0]),
+                                }
+                                ws.send(json.dumps(payload))
+                except Exception as ex:
+                    print(f"[WS MSG ERROR]: {ex}")
+    except Exception:
+        pass
+    finally:
+        ws_broadcaster.unregister(ws)
+
+
+@app.route("/api/config/interest_area", methods=["GET", "POST", "OPTIONS"])
+def config_interest_area():
+    """Mengambil atau memperbarui konfigurasi Detection / Interest Area (ROI)."""
+    global INTEREST_AREA
+    if request.method == "OPTIONS":
+        return "", 200
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        x_min = max(0.0, min(1.0, float(data.get("x_min", INTEREST_AREA["x_min"]))))
+        y_min = max(0.0, min(1.0, float(data.get("y_min", INTEREST_AREA["y_min"]))))
+        x_max = max(0.0, min(1.0, float(data.get("x_max", INTEREST_AREA["x_max"]))))
+        y_max = max(0.0, min(1.0, float(data.get("y_max", INTEREST_AREA["y_max"]))))
+        if x_max > x_min and y_max > y_min:
+            INTEREST_AREA = {
+                "x_min": round(x_min, 3),
+                "y_min": round(y_min, 3),
+                "x_max": round(x_max, 3),
+                "y_max": round(y_max, 3)
             }
-
-
-realtime_worker = RealtimeInferenceWorker(realtime_frame_buffer)
-
-
-app = Flask(__name__)
+            ws_broadcaster.broadcast({
+                "type": "interest_area_update",
+                "interest_area": INTEREST_AREA
+            })
+            return jsonify({"status": "ok", "interest_area": INTEREST_AREA})
+        else:
+            return jsonify({"error": "Invalid ROI bounds: x_max must be > x_min and y_max > y_min"}), 400
+    return jsonify({"status": "ok", "interest_area": INTEREST_AREA})
 
 
 @app.after_request
@@ -2410,7 +3101,20 @@ def health():
         "status": "ok",
         "message": "Server ANPR aktif",
         "memory_records_count": len(LATEST_RECORDS),
-        "stream_status": camera_stream_manager.get_status()
+        "stream_status": camera_stream_manager.get_status(),
+        "interest_area": INTEREST_AREA
+    })
+
+
+
+@app.route("/api/perf", methods=["GET"])
+def perf():
+    """Ringkasan latency & jumlah panggilan OCR (rolling). Dipakai untuk benchmark PaddleOCR."""
+    return jsonify({
+        "ocr_engine": {"name": "paddleocr", "version": paddle_engine.version, "api": paddle_engine.api,
+                       "device": PADDLE_DEVICE, "init_ms": round(paddle_engine.init_ms), "warmup_ms": round(paddle_engine.warmup_ms)},
+        "summary": perf_stats.summary(),
+        "vehicles": list(perf_stats.completed)[-50:],
     })
 
 
@@ -2480,26 +3184,27 @@ def stream_status():
 @app.route("/api/detect_current", methods=["POST", "GET", "OPTIONS"])
 def detect_current():
     """
-    Deteksi instan langsung dari frame terkini di RAM (0 ms delay pengambilan frame).
-    Total waktu respon < 2ms menggunakan asynchronous RealtimeInferenceWorker.
+    Request-response snapshot of the latest detection state.
+    If StreamInferenceWorker is already running, return the last WebSocket payload
+    instead of running a duplicate ANPR pass.
     """
     if request.method == "OPTIONS":
         return "", 200
 
-    # 1. Jalur super cepat: ambil hasil dari realtime_worker
-    cached_res = realtime_worker.get_latest_result() if 'realtime_worker' in globals() else None
-    if cached_res is not None:
-        return jsonify(cached_res)
+    if stream_inference_worker.running and stream_inference_worker.last_payload:
+        payload = dict(stream_inference_worker.last_payload)
+        payload.pop("type", None)
+        return jsonify(payload)
 
-    # 2. Fallback jika worker belum memiliki hasil
-    frame, fid, cap_ts = camera_stream_manager.get_latest_frame_with_meta()
+    frame = camera_stream_manager.get_latest_frame()
     if frame is None:
         return jsonify({"error": "Belum ada frame video di memory. Pastikan kamera CCTV sudah terhubung dan aktif."}), 400
 
     t0 = time.time()
-    result = run_anpr(frame, is_stream=True, frame_id=fid, capture_timestamp=cap_ts)
+    result = run_anpr(frame, is_stream=True)
     det_time = time.time() - t0
     result["detection_time_sec"] = round(det_time, 3)
+    result["interest_area"] = INTEREST_AREA
 
     if result.get("detections"):
         primary_det = result["detections"][0]
@@ -2530,8 +3235,6 @@ def upload_video():
     file.save(dest_path)
 
     confirmation_manager.reset()
-    if 'realtime_worker' in globals() and realtime_worker:
-        realtime_worker.reset_stats()
     ok, msg = camera_stream_manager.start(dest_path)
     return jsonify({
         "status": "ok" if ok else "error",
@@ -2556,10 +3259,7 @@ def detect():
     try:
         t0 = time.time()
         is_stream = request.form.get("is_stream", "false").lower() in ["true", "1"]
-        client_fid = request.form.get("client_frame_id", type=int)
-        client_ts = request.form.get("client_timestamp", type=float)
-
-        result = run_anpr(img, is_stream=is_stream, frame_id=client_fid, capture_timestamp=client_ts)
+        result = run_anpr(img, is_stream=is_stream)
         det_time = time.time() - t0
         result["detection_time_sec"] = round(det_time, 3)
         # Simpan ke memory RAM jika kendaraan terkonfirmasi (atau single photo upload)
@@ -2805,7 +3505,7 @@ def rpi_capture():
     Menghubungkan ke ALPR Kit di Raspberry Pi:
     1. Memanggil GET {rpi_url}/capture_image untuk menjepret foto.
     2. Mengambil foto via POST {rpi_url}/get_image jika diperlukan.
-    3. Menjalankan model AI ANPR lokal (YOLO + EasyOCR).
+    3. Menjalankan model AI ANPR lokal (YOLO + PaddleOCR).
     4. Menyimpan data ke SQLite dan mengembalikan hasil lengkap ke dashboard.
     """
     if request.method == "OPTIONS":
@@ -2900,4 +3600,4 @@ if __name__ == "__main__":
     print("\n=======================================================")
     print("🚀 Server ANPR jalan di http://localhost:5001")
     print("=======================================================\n")
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
