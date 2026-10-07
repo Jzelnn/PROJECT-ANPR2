@@ -6,7 +6,7 @@ echo   MENGINSTAL DEPENDENSI ANPR SYSTEM...
 echo ========================================================
 echo.
 cd /d "%~dp0"
-pip install -r requirements.txt
+pip install -r backend\requirements.txt
 echo.
 echo ========================================================
 echo   INSTALASI SELESAI!

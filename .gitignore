@@ -10,18 +10,26 @@ venv/
 *.db
 *.sqlite3
 
-# Snapshots / dynamic captures (keep directory via .gitkeep)
-captures/*
-!captures/.gitkeep
+# Output runtime (folder tetap ada lewat .gitkeep)
+output/screenshots/*
+!output/screenshots/.gitkeep
+output/results/*
+!output/results/.gitkeep
+output/logs/*
+!output/logs/.gitkeep
 
-# Temporary upload files
-temp_upload.jpg
+# Bobot model (besar). File yang sudah dilacak git tetap dilacak.
+models/**/*.pt
 
-# Local Scratch, Datasets, and raw weights
-scratch/
-dataset/
-* (*).pt
-best.pt
-last.pt
-vehicle_model_indo.pt
-plate_detector_best.pt
+# Dataset training & data uji (besar)
+datasets/*/*
+!datasets/*/.gitkeep
+test/videos/*
+!test/videos/.gitkeep
+test/images/*
+test/scratch/
+
+# Jupyter Notebooks & Scratch
+*.ipynb
+.ipynb_checkpoints/
+

@@ -2,7 +2,8 @@ flask
 flask-cors
 flask-sock
 ultralytics
-easyocr
+paddleocr>=3.0
+paddlepaddle>=3.0
 opencv-python
 requests
 numpy
