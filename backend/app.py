@@ -655,6 +655,24 @@ SAMSAT_PREFIXES = {
 }
 
 
+def is_tax_date(text):
+    """Mendeteksi tanggal pajak / bulan-tahun pada plat nomor (e.g. '09-25', '02.28', '11.44', '1328')"""
+    if not text:
+        return False
+    raw = str(text).strip()
+    clean = re.sub(r'[^0-9\.\-]', '', raw)
+    if re.match(r'^(0[1-9]|1[0-2])[\.\-](2[0-9]|3[0-9])$', clean):
+        return True
+    if len(clean) == 4 and clean.isdigit():
+        mm = int(clean[:2])
+        yy = int(clean[2:])
+        if 1 <= mm <= 12 and 20 <= yy <= 39:
+            return True
+    if re.match(r'^[A-Z0-9]{2}[\.\-][0-9]{2}$', raw.upper()):
+        return True
+    return False
+
+
 def is_valid_indonesian_plate_structure(plate_str):
     """
     Memvalidasi apakah string OCR memenuhi struktur plat nomor Indonesia atau format dinas/militer.
@@ -663,16 +681,21 @@ def is_valid_indonesian_plate_structure(plate_str):
     if not plate_str or plate_str in ["TIDAK_TERBACA", "UNKNOWN", ""]:
         return False, None
     plate_str = str(plate_str).strip()
-    # Format dinas / militer: e.g. "523-07", "1234-01"
+    if is_tax_date(plate_str):
+        return False, None
+
+    # Format dinas / militer: e.g. "523-07", "1234-01", "12345-00" (min 3 digit angka sebelum strip)
     if '-' in plate_str:
         parts = plate_str.split('-')
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 2 <= len(parts[0]) <= 4 and len(parts[1]) == 2:
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 3 <= len(parts[0]) <= 5 and len(parts[1]) == 2:
             return True, "military"
-    clean = re.sub(r'[^A-Z0-9]', '', plate_str.upper())
-    # Plat standar sipil Indonesia minimal 5 karakter (e.g. B 123 AB, B 1234 A, DK 123 A)
-    # Menolak artefak halusinasi 3-4 karakter (misal 'B 5 Z', 'B 1 A' pada gril/emblem)
-    if len(clean) < 5:
         return False, None
+
+    clean = re.sub(r'[^A-Z0-9]', '', plate_str.upper())
+    # Plat standar sipil Indonesia minimal 4 karakter (e.g. B 1 A, B 12 AB, B 1234 ABC)
+    if len(clean) < 4:
+        return False, None
+
     # Format sipil Indonesia: 1-2 huruf kode wilayah (wajib terdaftar di Samsat), 1-4 angka nomor polisi, 1-3 huruf seri akhir
     m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
     if m:
@@ -784,7 +807,7 @@ def compute_iou(box1, box2):
     return inter / union if union > 0 else 0
 
 
-def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
+def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     """Deteksi karakter plat menggunakan YOLO char_model dengan NMS dan pemisahan 2 baris."""
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
@@ -847,7 +870,6 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
         return "", 0.0, []
 
     # Pemisahan 2 Baris Plat (Baris 1 = Nomor Polisi, Baris 2 = Bulan & Tahun Pajak)
-    # Cek apakah plat miring atau hanya memiliki 1 baris (karakter <= 8 tanpa tumpukan vertikal)
     if len(kept) <= 8:
         has_vertical_stack = False
         for i in range(len(kept)):
@@ -865,7 +887,6 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
         line1_chars = []
 
     if not line1_chars:
-        # Jika ada tumpukan vertikal atau karakter banyak (>=9), pisahkan baris 1 dan baris 2
         row1 = []
         for d in kept:
             is_bottom = any(other["cy"] < d["cy"] - 12 and abs(other["cx"] - d["cx"]) < 15 for other in kept)
@@ -884,7 +905,7 @@ def read_plate_with_char_model(plate_crop, conf=0.08, iou_threshold=0.35):
 
 
 def read_plate_with_paddleocr(plate_crop):
-    """Membaca teks plat nomor menggunakan PaddleOCR."""
+    """Membaca teks plat nomor menggunakan PaddleOCR dengan penanganan multi-token & eliminasi tanggal pajak."""
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
         return "", 0.0, []
@@ -905,24 +926,42 @@ def read_plate_with_paddleocr(plate_crop):
             inv = cv2.bitwise_not(proc_crop)
             items = paddle_engine.run(inv)
 
-    valid_lines = []
-    all_raw_texts = []
+    non_date_items = []
     for item in items:
-        text = item.get("text", "")
+        text = str(item.get("text", "")).strip()
         conf = float(item.get("conf", 0.0) or 0.0)
-        clean_text = re.sub(r'[^A-Z0-9\-]', '', text.upper())
-        if not clean_text or conf < 0.12:
+        if not text or conf < 0.20:
             continue
-        all_raw_texts.append(clean_text)
-        valid_lines.append((clean_text, conf))
+        if is_tax_date(text):
+            continue
+        non_date_items.append((text, conf))
 
-    if not valid_lines:
-        return "", 0.0, all_raw_texts
+    if not non_date_items:
+        return "", 0.0, []
 
-    valid_lines.sort(key=lambda x: -x[1])
-    best_text = valid_lines[0][0]
-    best_conf = valid_lines[0][1]
-    return best_text, best_conf, all_raw_texts
+    all_raw_texts = [t for t, _ in non_date_items]
+    candidates = []
+
+    for t, c in non_date_items:
+        candidates.append((t, c))
+
+    if len(non_date_items) > 1:
+        joined = " ".join([t for t, _ in non_date_items])
+        avg_c = float(np.mean([c for _, c in non_date_items]))
+        candidates.append((joined, avg_c))
+
+    valid_cand = []
+    for t, c in candidates:
+        parsed = refine_indonesian_plate("", t, all_raw_texts)
+        if parsed and is_valid_indonesian_plate_structure(parsed)[0]:
+            valid_cand.append((parsed, c))
+
+    if valid_cand:
+        valid_cand.sort(key=lambda x: -x[1])
+        return valid_cand[0][0], valid_cand[0][1], all_raw_texts
+
+    non_date_items.sort(key=lambda x: -x[1])
+    return non_date_items[0][0], non_date_items[0][1], all_raw_texts
 
 
 def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
@@ -931,7 +970,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     1. Kode Wilayah (Prefix): 1-2 Huruf (dicocokkan dengan SAMSAT_PREFIXES)
     2. Nomor Polisi (Digits): 1-4 Angka
     3. Seri Akhir (Suffix): 1-3 Huruf (Tanpa huruf 'Q')
-    Menggunakan boundary parsing tanpa regex greedy yang merusak huruf/angka valid.
+    Disambiguasi akurat tanpa halusinasi dari string numerik murni.
     """
     if all_paddle_texts is None:
         all_paddle_texts = []
@@ -939,82 +978,68 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     c_raw = str(char_raw).strip().upper() if char_raw else ""
     p_raw = str(paddle_raw).strip().upper() if paddle_raw else ""
 
-    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-4 Digit + '-' + 2 Digit, misal 523-07, 151-12)
-    for t in ([c_raw, p_raw] + [str(x).strip().upper() for x in all_paddle_texts]):
+    # 0. DETEKSI PLAT MILITER / TNI / DINAS (Format 3-5 Digit + '-' + 2 Digit, misal 523-07, 151-12)
+    for t in ([p_raw, c_raw] + [str(x).strip().upper() for x in all_paddle_texts]):
         if '-' in t:
             parts = t.split('-')
-            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 2 <= len(parts[0]) <= 4 and len(parts[1]) == 2:
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 3 <= len(parts[0]) <= 5 and len(parts[1]) == 2:
                 return f"{parts[0]}-{parts[1]}"
 
+    pref_map = {'8': 'B', '0': 'D', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A'}
+    suff_map = {'8': 'B', '0': 'O', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A', '6': 'G'}
+    digit_map = {'O': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'Q': '0'}
+
     def _parse_candidate_text(raw_text):
-        if not raw_text:
+        if not raw_text or is_tax_date(raw_text):
             return ""
         raw = str(raw_text).strip().upper()
 
-        # A. Cek jika kata dipisahkan spasi (format khas PaddleOCR e.g. "B 2175 BJH")
-        tokens = [t for t in re.split(r'[\s_]+', raw) if t]
+        # A. 3 Token Terpisah (misal "B" "2175" "BJH" atau "B" "2049" "88K")
+        tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', raw).split() if t]
         if len(tokens) == 3:
-            p_tok = re.sub(r'[^A-Z]', '', tokens[0])
-            d_tok = re.sub(r'[^0-9]', '', tokens[1])
-            s_tok = re.sub(r'[^A-Z]', '', tokens[2])
-            if p_tok in SAMSAT_PREFIXES and 1 <= len(d_tok) <= 4 and 1 <= len(s_tok) <= 3:
-                return f"{p_tok} {d_tok} {s_tok}"
+            p_raw, d_raw, s_raw = tokens[0], tokens[1], tokens[2]
+            p_tok = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_raw])
+            d_tok = ''.join([ch if ch.isdigit() else digit_map.get(ch, '') for ch in d_raw])
+            if any(ch.isalpha() for ch in s_raw):
+                s_tok = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_raw])
+                s_tok = re.sub(r'[^A-Z]', '', s_tok)
+                if p_tok in SAMSAT_PREFIXES and 1 <= len(d_tok) <= 4 and d_tok.isdigit() and 1 <= len(s_tok) <= 3 and s_tok.isalpha():
+                    return f"{p_tok} {d_tok} {s_tok}"
 
+        # B. Teks Gabungan (misal "B2175BJH", "82489PZH", "W6035DK", "B9301TBD")
         clean = re.sub(r'[^A-Z0-9]', '', raw)
-        if not clean or len(clean) < 3:
+        if not clean or len(clean) < 4:
             return ""
 
-        # B. Cek 2-huruf Samsat prefix (AA, AB, AD, BK, DK, KT, dsb.)
-        if len(clean) >= 4 and clean[:2] in SAMSAT_PREFIXES:
-            rem = clean[2:]
-            m = re.match(r'^(\d{1,4})([A-Z]{1,3})$', rem)
-            if m:
-                return f"{clean[:2]} {m.group(1)} {m.group(2)}"
+        if clean[0] == '8' and len(clean) >= 5 and (clean[1].isdigit() or clean[1] == 'B'):
+            clean = 'B' + clean[1:]
 
-        # C. Cek 1-huruf Samsat prefix (B, D, F, L, N, dsb.)
-        if len(clean) >= 3 and clean[:1] in SAMSAT_PREFIXES:
-            rem = clean[1:]
-            m = re.match(r'^(\d{1,4})([A-Z]{1,3})$', rem)
-            if m:
-                return f"{clean[:1]} {m.group(1)} {m.group(2)}"
-
-        # D. Disambiguasi posisi OCR untuk karakter yang mirip (8->B, 6->B, 0->D, O->0, dsb.)
-        p_map = {'4': 'A', '8': 'B', '6': 'B', '0': 'D', '1': 'B', '5': 'S', '2': 'Z', '3': 'E'}
-        d_map = {'O': '0', 'D': '0', 'Q': '0', 'C': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'P': '8', 'R': '8'}
-        s_map = {'0': 'O', '1': 'I', '2': 'Z', '3': 'E', '4': 'A', '5': 'S', '6': 'G', '8': 'B', 'Q': 'D', 'W': 'H'}
-
-        for pref_len in [1, 2]:
-            if len(clean) < pref_len + 2:
-                continue
-            pref_raw = clean[:pref_len]
-            clean_pref = ''.join([ch if ch.isalpha() else p_map.get(ch, '') for ch in pref_raw])
-            if clean_pref not in SAMSAT_PREFIXES:
-                continue
-            rem = clean[pref_len:]
-            for d_len in [4, 3, 2, 1]:
-                if len(rem) <= d_len:
-                    continue
-                s_len = len(rem) - d_len
-                if 1 <= s_len <= 3:
-                    d_raw = rem[:d_len]
-                    s_raw = rem[d_len:]
-                    clean_d = ''.join([ch if ch.isdigit() else d_map.get(ch, '') for ch in d_raw])
-                    clean_s = ''.join([s_map.get(ch, ch) if not ch.isalpha() else s_map.get(ch, ch) for ch in s_raw])
-                    clean_s = re.sub(r'[^A-Z]', '', clean_s)
-                    if len(clean_d) == d_len and clean_d.isdigit() and len(clean_s) == s_len and clean_s.isalpha():
-                        return f"{clean_pref} {clean_d} {clean_s}"
+        for p_len in [2, 1]:
+            if len(clean) >= p_len + 2:
+                p_cand = clean[:p_len]
+                p_cand_clean = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_cand])
+                if p_cand_clean in SAMSAT_PREFIXES:
+                    rem = clean[p_len:]
+                    m = re.match(r'^(\d{1,4})([A-Z0-9]{1,3})$', rem)
+                    if m:
+                        d_cand = m.group(1)
+                        s_raw = m.group(2)
+                        if any(ch.isalpha() for ch in s_raw):
+                            s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_raw])
+                            s_cand = re.sub(r'[^A-Z]', '', s_cand)
+                            if 1 <= len(s_cand) <= 3 and s_cand.isalpha():
+                                return f"{p_cand_clean} {d_cand} {s_cand}"
 
         return ""
 
-    # Uji kandidat berurutan: PaddleOCR, Char Model, dan ekstraksi baris PaddleOCR
     candidates_to_try = []
-    if p_raw:
+    if p_raw and not is_tax_date(p_raw):
         candidates_to_try.append(p_raw)
-    if c_raw:
-        candidates_to_try.append(c_raw)
     for ext in all_paddle_texts:
-        if ext and ext not in candidates_to_try:
+        if ext and ext not in candidates_to_try and not is_tax_date(ext):
             candidates_to_try.append(ext)
+    if c_raw and c_raw not in candidates_to_try and not is_tax_date(c_raw):
+        candidates_to_try.append(c_raw)
 
     for cand in candidates_to_try:
         parsed = _parse_candidate_text(cand)
@@ -1022,12 +1047,6 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             is_valid, _ = is_valid_indonesian_plate_structure(parsed)
             if is_valid:
                 return parsed
-
-    # Jika tidak ada yang lolos struktur lengkap, gunakan fallback terbersih jika memiliki panjang >= 5
-    for cand in candidates_to_try:
-        clean = re.sub(r'[^A-Z0-9]', '', cand)
-        if len(clean) >= 5:
-            return clean
 
     return ""
 
@@ -1043,27 +1062,28 @@ def ensemble_plate_reading(plate_crop):
     # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
     plate_crop = enhance_moving_plate_crop(plate_crop)
 
-    # 1. Pembacaan via Character Model LANGSUNG pada citra asli (Primary - Fast YOLO ~40ms)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.08)
-    char_raw = char_raw.upper()
-    c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
-
-    # 1b. Fallback Deskew hanya jika pembacaan awal minim (< 4 karakter atau conf rendah < 0.45)
-    if char_conf < 0.45 or len(c_clean) < 4:
-        deskewed_crop, skew_angle = deskew_plate(plate_crop)
-        if abs(skew_angle) >= 3.0:
-            d_raw, d_conf, d_chars = read_plate_with_char_model(deskewed_crop, conf=0.08)
-            if d_conf > char_conf and len(re.sub(r'[^A-Z0-9]', '', d_raw)) >= len(c_clean):
-                plate_crop = deskewed_crop
-                char_raw, char_conf, line1_chars = d_raw, d_conf, d_chars
-                c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
-
-    # 2. Pembacaan via PaddleOCR
+    # 1. Pembacaan via PaddleOCR (Akurasi tertinggi)
     paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(plate_crop)
     paddle_raw = paddle_raw.upper()
 
+    # 2. Pembacaan via Character Model (Corroborating Fast YOLO)
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.20)
+    char_raw = char_raw.upper()
+    c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
+
+    # 2b. Fallback Deskew hanya jika pembacaan PaddleOCR dan Char Model belum mendapatkan plat valid
+    if not is_valid_indonesian_plate_structure(paddle_raw)[0] and (char_conf < 0.45 or len(c_clean) < 4):
+        deskewed_crop, skew_angle = deskew_plate(plate_crop)
+        if abs(skew_angle) >= 3.0:
+            d_paddle, d_pconf, d_all_p = read_plate_with_paddleocr(deskewed_crop)
+            if d_pconf > paddle_conf:
+                paddle_raw, paddle_conf, all_paddle = d_paddle, d_pconf, d_all_p
+            d_raw, d_conf, d_chars = read_plate_with_char_model(deskewed_crop, conf=0.20)
+            if d_conf > char_conf:
+                char_raw, char_conf = d_raw, d_conf
+
     final_formatted = refine_indonesian_plate(char_raw, paddle_raw, all_paddle)
-    final_conf = max(char_conf, paddle_conf) if final_formatted else 0.0
+    final_conf = max(paddle_conf, char_conf) if final_formatted else 0.0
 
     return {
         "final": final_formatted,
@@ -1072,7 +1092,7 @@ def ensemble_plate_reading(plate_crop):
         "paddle_raw": paddle_raw,
         "paddle_conf": paddle_conf,
         "confidence": final_conf,
-        "method": "char_model_primary_with_paddleocr"
+        "method": "ensemble_paddle_primary"
     }
 
 
