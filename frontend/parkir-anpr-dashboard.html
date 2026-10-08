@@ -2125,14 +2125,27 @@ function addLogRow(det, isInit=false){
   const row = document.createElement('div');
   row.className = 'log-row';
   if (det.track_id) row.setAttribute('data-track-id', det.track_id);
-  const ms = det.latency_ms;
-  const latText = ms ? ` <span style="font-size:11px; color:#10b981; font-weight:600;">(${ms}ms)</span>` : '';
+  
+  const procMs = det.processing_ms != null ? det.processing_ms : det.latency_ms;
+  let timingTooltip = '';
+  if (det.timing) {
+    const v = det.timing.vehicle_ms != null ? `V: ${det.timing.vehicle_ms}ms` : '';
+    const p = det.timing.plate_ms != null ? `P: ${det.timing.plate_ms}ms` : '';
+    const o = det.timing.ocr_ms != null ? `OCR: ${det.timing.ocr_ms}ms` : '';
+    timingTooltip = [v, p, o].filter(Boolean).join(' | ');
+  }
+  
+  const procDisplay = procMs != null ? `<span style="font-size:11px; color:#059669; background:#d1fae5; padding:1px 6px; border-radius:4px; font-weight:600; font-family:'IBM Plex Mono',monospace; cursor:default;" title="${timingTooltip || ('Processing: ' + procMs + 'ms')}">${procMs} ms</span>` : '';
   const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';
-  const confScore = det.consistency ? `<span style="font-size:11px; background:#d1fae5; color:#065f46; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600;">${Math.round(det.consistency * 100)}%</span>` : '';
+  const confScore = det.consistency ? `<span style="font-size:11px; background:#eff6ff; color:#1d4ed8; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600;">${Math.round(det.consistency * 100)}%</span>` : '';
+  
   row.innerHTML = `
     <span class="log-time">${timeStr}</span>
     <span class="log-plate">${trackPrefix}${det.license_plate || '-'}</span>
-    <span class="log-type">${(det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type)}${confScore}${latText}</span>
+    <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
+      <span>${(det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle')}${confScore}</span>
+      ${procDisplay}
+    </span>
   `;
   const logList = document.getElementById('logList');
   if (isInit) {
