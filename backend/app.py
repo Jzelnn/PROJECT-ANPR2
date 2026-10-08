@@ -1354,6 +1354,8 @@ class VehicleTrack:
         self.frames_outside_after_inside = 0
         self.lost_interest = False
         self.lost_interest_time = None
+        self.lifecycle_state = "NEW"
+        self.frames_missing = 0
         self.status = "ANALYZING" if is_inside else "OUTSIDE_ROI"
 
         # Asynchronous Task Management State (Latest-Only Architecture)
@@ -1846,16 +1848,19 @@ class VehicleConfirmationManager:
     """
     Mengelola multi-object tracking, controlled tracking, dan konfirmasi temporal kendaraan.
     Menjamin setiap kendaraan unik hanya dicatat 1x ke Entry History saat terkonfirmasi.
+    Lifecycle: NEW -> ACTIVE -> EXITING -> EXPIRED
     """
     def __init__(self):
         self.tracks = {}
         self.lock = threading.RLock()
         self.next_fallback_id = 1
+        self.primary_track_id = None
 
     def reset(self):
         with self.lock:
             self.tracks.clear()
             self.next_fallback_id = 1
+            self.primary_track_id = None
 
     def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080):
         """Ambil atau buat track sebelum plate/OCR agar job asinkron tidak kehilangan target."""
@@ -1873,7 +1878,7 @@ class VehicleConfirmationManager:
                 self.tracks[tid] = VehicleTrack(tid, None)
                 if bbox:
                     self.tracks[tid].last_bbox = bbox
-                print(f"[TRACK_CREATED] track_id={tid} bbox={bbox}", flush=True)
+                print(f"[TRACK_CREATED]\ntrack_id={tid}", flush=True)
             return tid, self.tracks[tid]
 
     def check_lost_tracks(self):
@@ -1889,55 +1894,45 @@ class VehicleConfirmationManager:
                 new_status = trk.check_lost_interest(now)
                 if not was_lost and trk.lost_interest:
                     newly_lost_tracks.append(trk)
-                    print(f"[TRACK_EXITING] track_id={tid} age={now - trk.last_seen:.2f}s", flush=True)
+                    trk.lifecycle_state = "EXITING"
+                    print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
                 if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
                     newly_confirmed_tracks.append(trk)
 
-                # Hapus track yang sudah lost > 10 detik agar memori bersih
-                if trk.lost_interest and (now - trk.last_seen) > 10.0:
+                # Hapus track yang sudah lost / tidak terlihat > 1.5s agar tidak tersisa di active state
+                if (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > 1.5:
                     stale_ids.append(tid)
+
             for tid in stale_ids:
-                print(f"[TRACK_EXPIRED] track_id={tid}", flush=True)
+                trk = self.tracks[tid]
+                trk.lifecycle_state = "EXPIRED"
+                print(f"[TRACK_EXPIRED]\ntrack_id={tid}", flush=True)
                 del self.tracks[tid]
+
+            if stale_ids:
+                active_ids = [t for t, tr in self.tracks.items() if tr.lifecycle_state == "ACTIVE"]
+                print(f"[ACTIVE_TRACKS]\ntrack_ids={active_ids}", flush=True)
+
         return newly_confirmed_tracks, newly_lost_tracks
 
-    def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.20, max_center_dist_ratio=0.18):
+    def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.45):
         if not bbox:
             return None
         now = time.time()
-        cx = (bbox[0] + bbox[2]) / 2.0
-        cy = (bbox[1] + bbox[3]) / 2.0
 
         best_id = None
-        best_score = -1.0
-
-        curr_clean = re.sub(r'[^A-Z0-9]', '', curr_plate.upper()) if curr_plate else ""
+        best_iou = -1.0
 
         for tid, trk in self.tracks.items():
-            if (now - trk.last_seen) > 3.0 or trk.lost_interest:
+            # Hanya cocokkan dengan track yang aktif dalam 0.5 detik terakhir dan TIDAK lost/exiting
+            if (now - trk.last_seen) > 0.5 or trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "EXPIRED", "DISCARDED"):
                 continue
 
-            # Jika track lama sudah punya plat nomor terkonfirmasi dan plat saat ini berbeda jelas, jangan match!
-            if trk.confirmed_data and trk.confirmed_data.get("license_plate"):
-                trk_clean = re.sub(r'[^A-Z0-9]', '', trk.confirmed_data["license_plate"].upper())
-                if len(trk_clean) >= 5 and len(curr_clean) >= 5 and trk_clean != curr_clean:
-                    continue
-
             if trk.last_bbox:
-                lx1, ly1, lx2, ly2 = trk.last_bbox
-                lcx = (lx1 + lx2) / 2.0
-                lcy = (ly1 + ly2) / 2.0
-
                 iou = compute_iou(bbox, trk.last_bbox)
-                dx = abs(cx - lcx) / max(1, img_w)
-                dy = abs(cy - lcy) / max(1, img_h)
-                dist = (dx**2 + dy**2)**0.5
-
-                if iou >= iou_thresh or dist <= max_center_dist_ratio:
-                    score = iou + (1.0 - min(1.0, dist / max_center_dist_ratio))
-                    if score > best_score:
-                        best_score = score
-                        best_id = tid
+                if iou >= iou_thresh and iou > best_iou:
+                    best_iou = iou
+                    best_id = tid
         return best_id
 
     def resolve_track_id(self, raw_tid, bbox, img_w=1920, img_h=1080):
@@ -1955,11 +1950,24 @@ class VehicleConfirmationManager:
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 8.0 and trk.lost_interest]
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 1.5 and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST"))]
             for tid in stale_ids:
+                trk = self.tracks[tid]
+                trk.lifecycle_state = "EXPIRED"
+                print(f"[TRACK_EXPIRED]\ntrack_id={tid}", flush=True)
                 del self.tracks[tid]
+            if stale_ids:
+                active_ids = [t for t, tr in self.tracks.items() if tr.lifecycle_state == "ACTIVE"]
+                print(f"[ACTIVE_TRACKS]\ntrack_ids={active_ids}", flush=True)
 
             if not detections:
+                if self.primary_track_id is not None:
+                    print(f"[PRIMARY_SWITCH]\nold_track_id={self.primary_track_id}\nnew_track_id=None", flush=True)
+                    self.primary_track_id = None
+                for tid, trk in self.tracks.items():
+                    if trk.lifecycle_state == "ACTIVE":
+                        trk.lifecycle_state = "EXITING"
+                        print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
                 return []
 
             # Jika single photo upload manual (bukan live stream)
@@ -2006,17 +2014,17 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
 
             # Mode Stream / Live CCTV
             updated_detections = []
+            visible_tids = set()
             for det in detections:
                 raw_tid = det.get("track_id")
                 bbox = det.get("bbox")
                 iw = det.get("image_width", 1920)
                 ih = det.get("image_height", 1080)
-                curr_plate_pre = det.get("license_plate")
 
                 if raw_tid is not None:
                     tid = raw_tid
                 else:
-                    matched_id = self._match_track(bbox, curr_plate=curr_plate_pre, img_w=iw, img_h=ih)
+                    matched_id = self._match_track(bbox, img_w=iw, img_h=ih)
                     if matched_id is not None:
                         tid = matched_id
                     else:
@@ -2024,13 +2032,20 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         self.next_fallback_id += 1
 
                 det["track_id"] = tid
+                visible_tids.add(tid)
 
                 if tid not in self.tracks:
                     self.tracks[tid] = VehicleTrack(tid, det)
                     track = self.tracks[tid]
+                    print(f"[TRACK_CREATED]\ntrack_id={tid}", flush=True)
                 else:
                     track = self.tracks[tid]
                     track.add_frame(det)
+
+                track.frames_missing = 0
+                if track.lifecycle_state != "ACTIVE" and not track.lost_interest:
+                    track.lifecycle_state = "ACTIVE"
+                    print(f"[TRACK_ACTIVE]\ntrack_id={tid}", flush=True)
 
                 # Pasang status temporal konfirmasi & telemetry ke detection object
                 det["inside_interest_area"] = track.inside_interest_area
@@ -2110,19 +2125,40 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                 det.pop("plate_crop", None)
                 updated_detections.append(det)
 
+            # Tandai track yang tidak terdeteksi di frame ini sebagai EXITING
+            for tid, trk in self.tracks.items():
+                if tid not in visible_tids:
+                    trk.frames_missing = getattr(trk, 'frames_missing', 0) + 1
+                    if trk.lifecycle_state == "ACTIVE":
+                        trk.lifecycle_state = "EXITING"
+                        print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
+
+            # Primary Track Switching Tracking
+            active_candidates = [d for d in updated_detections if d.get("inside_interest_area") and not d.get("lost_interest") and d.get("status") != "OUTSIDE_ROI"]
+            new_primary_id = active_candidates[0].get("track_id") if active_candidates else None
+            if new_primary_id != self.primary_track_id:
+                print(f"[PRIMARY_SWITCH]\nold_track_id={self.primary_track_id}\nnew_track_id={new_primary_id}", flush=True)
+                self.primary_track_id = new_primary_id
+
             return updated_detections
 
 
 def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_det, body_hints, frame_id=None, capture_timestamp=None):
     """Worker task untuk asynchronous vehicle body classification di background thread pool."""
     try:
+        with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
+                return
+
         vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
             full_img, bbox, initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
         )
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED] type=body frame_id={frame_id} track_id={track_id} reason=track_lost_or_expired", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
             track.cached_body_style = body_style
             track.cached_body_conf = body_style_conf
@@ -2159,8 +2195,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
     try:
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED] type=plate frame_id={frame_id} track_id={track_id} reason=track_lost_before_infer", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
 
         vx1, vy1, vx2, vy2 = v_bbox
@@ -2186,7 +2222,6 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     if initial_vtype != "motorcycle" and rel_y < 0.32:
                         continue
                     # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.60): plat bumper mendapat bobot 2.4x
-                    # Menyingkirkan deteksi palsu di gril/emblem atas (rel_y ~ 0.40-0.55)
                     y_factor = 2.4 if rel_y >= 0.60 else (1.1 if rel_y >= 0.48 else 0.5)
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
@@ -2219,8 +2254,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
         ocr_to_submit = None
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED] type=plate frame_id={frame_id} track_id={track_id} reason=track_lost_after_infer", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
             track.plate_infer_ms = plate_duration_ms
             if abs_plate_bbox is not None:
@@ -2271,7 +2306,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if track:
-                if not track.lost_interest and not track.is_locked and track.pending_plate_frame is not None:
+                if not track.lost_interest and not track.is_locked and getattr(track, 'lifecycle_state', '') == 'ACTIVE' and track.pending_plate_frame is not None:
                     next_plate_job = track.pending_plate_frame
                     track.pending_plate_frame = None
                     track.plate_pending = True
@@ -2287,6 +2322,12 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
     """Worker task untuk asynchronous PaddleOCR & ensemble plate reading di thread pool."""
     t_ocr_start = time.time()
     try:
+        with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
+                return
+
         res = ensemble_plate_reading(crop)
         t_ocr_end = time.time()
         ocr_duration_ms = (t_ocr_end - t_ocr_start) * 1000.0
@@ -2301,8 +2342,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
 
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED] type=ocr frame_id={frame_id} track_id={track_id} reason=track_lost_or_expired", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
             track.ocr_infer_ms = ocr_duration_ms
             prev_status = track.status
@@ -2348,7 +2389,7 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if track:
-                if not track.lost_interest and not track.is_locked and track.status not in ("CONFIRMED", "HISTORY_SAVED") and track.pending_ocr_job is not None:
+                if not track.lost_interest and not track.is_locked and getattr(track, 'lifecycle_state', '') == 'ACTIVE' and track.status not in ("CONFIRMED", "HISTORY_SAVED") and track.pending_ocr_job is not None:
                     next_ocr_job = track.pending_ocr_job
                     track.pending_ocr_job = None
                     track.ocr_pending = True

@@ -1481,12 +1481,17 @@ function handleDetectionResult(data, silent=false){
   let activeDet = null;
   if (data.detections && data.detections.length > 0){
     // Prioritaskan kendaraan yang sedang AKTIF di dalam Detection Area (ROI)
-    activeDet = data.detections.find(d => d.inside_interest_area && !d.lost_interest);
+    activeDet = data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI');
   }
 
   if (activeDet){
     consecutiveEmptyCycles = 0;
     activeDet.latency_ms = detMs;
+    // Primary track switch: clean old boxes immediately if tracking a new vehicle
+    if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
+      console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
+      clearBoxes();
+    }
     lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
     drawBoxes(activeDet);
@@ -1509,6 +1514,9 @@ function handleDetectionResult(data, silent=false){
     }
   } else {
     // Begitu kendaraan keluar dari area deteksi, langsung bersihkan active track dan bounding box seketika
+    if (lastActiveTrackId !== null) {
+      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
+    }
     lastActiveTrackId = null;
     clearBoxes();
     drawRoiBox(currentRoi);
@@ -2165,24 +2173,6 @@ async function loadHistoryFromBackend(){
     logList.innerHTML = '';
     if (data.records && data.records.length > 0){
       data.records.forEach(r => addLogRow(r, true));
-      // Display latest record on result card
-      const latest = data.records[0];
-      lastDetectionData = latest;
-      const vType = typeLabel[latest.vehicle_type] || latest.vehicle_type;
-      const bStyle = latest.body_style || '';
-      document.getElementById('tagVehicle').textContent = vType;
-      const tagBody = document.getElementById('tagBodyStyle');
-      if (bStyle && bStyle.toLowerCase() !== vType.toLowerCase()){
-        tagBody.style.display = 'inline-block';
-        tagBody.textContent = bStyle;
-      } else {
-        tagBody.style.display = 'none';
-      }
-      document.getElementById('plateText').textContent = latest.license_plate || '-';
-      document.getElementById('pctConf').textContent = latest.confidence ? Math.round(latest.confidence*100)+'%' : '-';
-      const latElem = document.getElementById('pctLatency');
-      if (latElem) latElem.textContent = '-';
-      document.getElementById('detTime').textContent = latest.timestamp.slice(11, 19);
     } else {
       logList.innerHTML = '<div style="padding:18px;font-size:12px;color:var(--text-dim);text-align:center;">No vehicle records yet</div>';
     }
