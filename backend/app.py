@@ -106,15 +106,15 @@ CONFIRM_CONF_THRESH = 0.80
 # Bounding box tegak lurus (non-slanted rectangle) [x_min, y_min, x_max, y_max] (0.0 s/d 1.0).
 # ============================================================
 DEFAULT_INTEREST_AREA = {
-    "x_min": float(os.environ.get("ANPR_ROI_XMIN", 0.18)),
+    "x_min": float(os.environ.get("ANPR_ROI_XMIN", 0.265)),
     "y_min": float(os.environ.get("ANPR_ROI_YMIN", 0.20)),
     "x_max": float(os.environ.get("ANPR_ROI_XMAX", 0.60)),
-    "y_max": float(os.environ.get("ANPR_ROI_YMAX", 0.85)),
+    "y_max": float(os.environ.get("ANPR_ROI_YMAX", 0.71)),
     "points": [
-        [0.18, 0.20],
+        [0.265, 0.20],
         [0.60, 0.20],
-        [0.60, 0.85],
-        [0.18, 0.85]
+        [0.60, 0.71],
+        [0.265, 0.71]
     ]
 }
 INTEREST_AREA = dict(DEFAULT_INTEREST_AREA)
@@ -1820,6 +1820,7 @@ class VehicleConfirmationManager:
                 self.tracks[tid] = VehicleTrack(tid, None)
                 if bbox:
                     self.tracks[tid].last_bbox = bbox
+                print(f"[TRACK_CREATED] track_id={tid} bbox={bbox}", flush=True)
             return tid, self.tracks[tid]
 
     def check_lost_tracks(self):
@@ -1835,6 +1836,7 @@ class VehicleConfirmationManager:
                 new_status = trk.check_lost_interest(now)
                 if not was_lost and trk.lost_interest:
                     newly_lost_tracks.append(trk)
+                    print(f"[TRACK_EXITING] track_id={tid} age={now - trk.last_seen:.2f}s", flush=True)
                 if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
                     newly_confirmed_tracks.append(trk)
 
@@ -1842,6 +1844,7 @@ class VehicleConfirmationManager:
                 if trk.lost_interest and (now - trk.last_seen) > 10.0:
                     stale_ids.append(tid)
             for tid in stale_ids:
+                print(f"[TRACK_EXPIRED] track_id={tid}", flush=True)
                 del self.tracks[tid]
         return newly_confirmed_tracks, newly_lost_tracks
 
@@ -1858,7 +1861,7 @@ class VehicleConfirmationManager:
         curr_clean = re.sub(r'[^A-Z0-9]', '', curr_plate.upper()) if curr_plate else ""
 
         for tid, trk in self.tracks.items():
-            if (now - trk.last_seen) > 3.0:
+            if (now - trk.last_seen) > 3.0 or trk.lost_interest:
                 continue
 
             # Jika track lama sudah punya plat nomor terkonfirmasi dan plat saat ini berbeda jelas, jangan match!
@@ -2057,7 +2060,7 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
             return updated_detections
 
 
-def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_det, body_hints):
+def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_det, body_hints, frame_id=None, capture_timestamp=None):
     """Worker task untuk asynchronous vehicle body classification di background thread pool."""
     try:
         vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
@@ -2066,6 +2069,7 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if not track or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED] type=body frame_id={frame_id} track_id={track_id} reason=track_lost_or_expired", flush=True)
                 return
             track.cached_body_style = body_style
             track.cached_body_conf = body_style_conf
@@ -2079,6 +2083,8 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
         # Siarkan update body style via WebSocket
         ws_broadcaster.broadcast({
             "type": "body_update",
+            "frame_id": frame_id,
+            "capture_timestamp": capture_timestamp,
             "track_id": track_id,
             "vehicle_type": vehicle_type,
             "body_style": body_style,
@@ -2093,11 +2099,17 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
                 track.body_pending = False
 
 
-def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_time, initial_vtype="car"):
+def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_time, initial_vtype="car", frame_id=None, capture_timestamp=None):
     """Worker task untuk asynchronous Plate Detection di background thread pool."""
     t_plate_start = time.time()
     print(f"[PERF_LATENCY] [PLATE_INFERENCE_START: track_id={track_id} time={t_plate_start:.3f}]", flush=True)
     try:
+        with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
+            if not track or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED] type=plate frame_id={frame_id} track_id={track_id} reason=track_lost_before_infer", flush=True)
+                return
+
         vx1, vy1, vx2, vy2 = v_bbox
         vh = max(1, vy2 - vy1)
         plate_conf_val = None
@@ -2152,6 +2164,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if not track or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED] type=plate frame_id={frame_id} track_id={track_id} reason=track_lost_after_infer", flush=True)
                 return
             track.plate_pending = False
             if abs_plate_bbox is not None:
@@ -2162,10 +2175,12 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
 
         if abs_plate_bbox is not None:
             t_plate_sent = time.time()
-            print(f"[PERF_LATENCY] [PLATE_BOX_SENT: track_id={track_id} plate_bbox={abs_plate_bbox} time={t_plate_sent:.3f}]", flush=True)
+            print(f"[PLATE_RESULT] frame_id={frame_id} track_id={track_id} conf={plate_conf_val:.3f} bbox={abs_plate_bbox}", flush=True)
             # Siarkan pembaruan plat nomor langsung ke WebSocket tanpa menunggu OCR selesai!
             ws_broadcaster.broadcast({
                 "type": "plate_update",
+                "frame_id": frame_id,
+                "capture_timestamp": capture_timestamp,
                 "track_id": track_id,
                 "plate_bbox": abs_plate_bbox,
                 "plate_confidence": round(plate_conf_val, 3),
@@ -2185,7 +2200,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         job_id = get_next_ocr_job_id()
                         track.ocr_pending = True
                         track.last_ocr_job_id = job_id
-                        ocr_executor.submit(_async_ocr_task, job_id, track_id, plate_crop, crop_q, full_img, time.time())
+                        ocr_executor.submit(_async_ocr_task, job_id, track_id, plate_crop, crop_q, full_img, time.time(), frame_id, capture_timestamp)
     except Exception as e:
         print(f"[ASYNC PLATE ERROR] Track {track_id}: {e}")
         with confirmation_manager.lock:
@@ -2194,7 +2209,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 track.plate_pending = False
 
 
-def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time):
+def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame_id=None, capture_timestamp=None):
     """Worker task untuk asynchronous PaddleOCR & ensemble plate reading di thread pool."""
     t_ocr_start = time.time()
     print(f"[PERF_LATENCY] [OCR_START: track_id={track_id} time={t_ocr_start:.3f}]", flush=True)
@@ -2212,11 +2227,12 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time):
 
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track:
+            if not track or track.lost_interest:
+                print(f"[STALE_RESULT_DISCARDED] type=ocr frame_id={frame_id} track_id={track_id} reason=track_lost_or_expired", flush=True)
+                if track:
+                    track.ocr_pending = False
                 return
             track.ocr_pending = False
-            if track.lost_interest:
-                return
             prev_status = track.status
             update_info = track.add_ocr_result(job_id, text, conf, crop_q, ocr_method=method)
 
@@ -2229,12 +2245,15 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time):
                 t_conf = time.time()
                 print(f"[PERF_LATENCY] [CONFIRMATION: track_id={track_id} plate='{confirmed_data.get('license_plate')}' time={t_conf:.3f} reason='{track.confirmation_reason}']", flush=True)
 
+        print(f"[OCR_RESULT] frame_id={frame_id} track_id={track_id} text='{text}' conf={conf:.2f}", flush=True)
         # Siarkan pembaruan OCR langsung ke WebSocket tanpa menunggu konfirmasi
         if update_info:
             cand_count = update_info.get("candidate_matches", 0)
             ocr_stat = "CONFIRMED" if update_info["is_confirmed"] else ("GOOD_CANDIDATE" if cand_count >= 2 else "ANALYZING")
             ws_broadcaster.broadcast({
                 "type": "ocr_update",
+                "frame_id": frame_id,
+                "capture_timestamp": capture_timestamp,
                 "track_id": track_id,
                 "license_plate": update_info["ocr_candidate"],
                 "ocr_candidate": update_info["ocr_candidate"],
@@ -2261,7 +2280,7 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time):
 confirmation_manager = VehicleConfirmationManager()
 
 
-def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False):
+def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
     t_start = time.time()
     v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
     m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
@@ -2345,6 +2364,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         else:
             candidates = scored_candidates
 
+    print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id'] if candidates else None}", flush=True)
     any_inside_roi = any(c.get("_inside_roi") for c in candidates)
 
     # Single Photo Mode: Jalankan deteksi plat global synchronous untuk akurasi foto
@@ -2404,7 +2424,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 cand_track_id, [x1, y1, x2, y2], img_w=iw, img_h=ih
             )
             cand_track_id = tid
-            print(f"[PERF_LATENCY] [TRACK_CREATED: track_id={tid} bbox={[x1, y1, x2, y2]} in_roi={is_in_roi}]", flush=True)
 
             # Cek apakah ada deteksi 'bus' di area kendaraan ini
             has_bus_det = any(
@@ -2447,7 +2466,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 if not existing_trk.cached_body_style and not existing_trk.body_pending and not existing_trk.lost_interest:
                     existing_trk.body_pending = True
                     body_executor.submit(_async_body_task, cand_track_id, img.copy(), [x1, y1, x2, y2],
-                                         initial_vtype, v_conf, has_bus_det, body_hints)
+                                         initial_vtype, v_conf, has_bus_det, body_hints, frame_id, capture_timestamp)
 
                 if not existing_trk.is_locked and not existing_trk.lost_interest:
                     now_plate = time.time()
@@ -2465,7 +2484,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             iw,
                             ih,
                             now_plate,
-                            initial_vtype
+                            initial_vtype,
+                            frame_id,
+                            capture_timestamp
                         )
 
                     # 2. Asynchronous OCR refinement jika plat sudah terdeteksi
@@ -2477,7 +2498,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                                          existing_trk.last_plate_bbox[2], existing_trk.last_plate_bbox[3])
                         crop_q = compute_crop_quality(p_crop, existing_trk.last_plate_conf)
                         ocr_executor.submit(_async_ocr_task, job_id, cand_track_id,
-                                            p_crop, crop_q, img.copy(), time.time())
+                                            p_crop, crop_q, img.copy(), time.time(), frame_id, capture_timestamp)
 
                 vehicle_type = existing_trk.cached_vtype or initial_vtype
                 body_style = existing_trk.cached_body_style
@@ -2775,6 +2796,9 @@ def live_ws(ws):
                     if m_type == "ping":
                         ws.send(json.dumps({"type": "pong", "time": time.time()}))
                     elif m_type == "detect_frame":
+                        client_frame_id = msg.get("frame_id")
+                        client_capture_ts = msg.get("capture_timestamp")
+                        print(f"[WS_FRAME_RECEIVED] frame_id={client_frame_id} capture_ts={client_capture_ts}", flush=True)
                         b64_img = msg.get("image", "")
                         if "," in b64_img:
                             b64_img = b64_img.split(",", 1)[1]
@@ -2784,7 +2808,7 @@ def live_ws(ws):
                             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                             if frame is not None:
                                 t0 = time.time()
-                                res = run_anpr(frame, is_stream=True)
+                                res = run_anpr(frame, is_stream=True, frame_id=client_frame_id, capture_timestamp=client_capture_ts)
                                 det_ms = round((time.time() - t0) * 1000)
 
                                 lost_confirmed, newly_lost = confirmation_manager.check_lost_tracks()
@@ -2810,8 +2834,13 @@ def live_ws(ws):
                                         rec = save_parking_record(d, source_img=frame)
                                         d["record"] = rec
 
+                                now_broadcast = time.time()
+                                frame_age_ms = int(round((now_broadcast - client_capture_ts) * 1000)) if client_capture_ts else det_ms
                                 payload = {
                                     "type": "detection_update",
+                                    "frame_id": client_frame_id,
+                                    "capture_timestamp": client_capture_ts,
+                                    "frame_age_ms": frame_age_ms,
                                     "timestamp": t0,
                                     "latency_ms": det_ms,
                                     "detections": detections,

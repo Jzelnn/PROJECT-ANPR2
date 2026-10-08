@@ -697,6 +697,7 @@ let isCameraConnected = false;
 let currentMediaStream = null;
 let isScanning = false;
 let lastDetectionData = null;
+let lastActiveTrackId = null;
 let isContinuousDetectActive = false;
 let lastLoggedPlate = "";
 let lastLoggedTime = 0;
@@ -705,9 +706,11 @@ let fpsPollTimer = null;
 let latestRenderedFrameId = -1;
 let latestRenderedCaptureTime = 0.0;
 let clientFrameCounter = 0;
+let inFlightFrameId = null;
+let inFlightFrameTime = 0;
 let liveWs = null;
 let wsReconnectTimer = null;
-let currentRoi = { x_min: 0.183, y_min: 0.195, x_max: 0.645, y_max: 0.950, points: [[0.183,0.324],[0.552,0.195],[0.645,0.798],[0.296,0.950]] };
+let currentRoi = { x_min: 0.265, y_min: 0.20, x_max: 0.60, y_max: 0.71, points: [[0.265,0.20],[0.60,0.20],[0.60,0.71],[0.265,0.71]] };
 
 // ============================================================
 // SWITCH CAMERA SOURCE (RPi ALPR Kit vs RPi Stream vs Webcam)
@@ -1378,23 +1381,31 @@ async function runContinuousDetectLoop(){
 
 async function performDetectCycle(silent=true){
   if (isScanning || !isCameraConnected) return;
-  isScanning = true;
 
   const src = document.getElementById('camSourceSelect').value;
+  // Mode Stream: Server streams run automatically via StreamInferenceWorker over WebSocket
+  if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream'){
+    return;
+  }
+
+  // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
+  const nowMs = Date.now();
+  if (inFlightFrameId !== null) {
+    // Watchdog: If frame in flight took > 2000ms, release it
+    if (nowMs - inFlightFrameTime > 2000) {
+      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out, resetting backpressure.`);
+      inFlightFrameId = null;
+    } else {
+      return;
+    }
+  }
+
+  isScanning = true;
   const aiTxt = document.getElementById('aiStatusText');
   if (aiTxt && isContinuousDetectActive) aiTxt.textContent = "AI DETECTING...";
 
-  const t0 = performance.now();
   try {
-    // Mode Stream: Hikvision ISAPI, CCTV RTSP, DroidCam, RPi, ZeroTier (Direct RAM < 1s)
-    if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream'){
-      const resp = await fetch(DETECT_CURRENT_URL, { method: "POST" });
-      const roundtripMs = Math.round(performance.now() - t0);
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.error || "Gagal membaca frame kamera");
-      data.roundtrip_ms = roundtripMs;
-      handleDetectionResult(data, silent);
-    } else if (src === 'webcam' || src === 'video_file'){
+    if (src === 'webcam' || src === 'video_file'){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
@@ -1409,38 +1420,23 @@ async function performDetectCycle(silent=true){
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-        await new Promise((resolve) => {
-          canvas.toBlob(async (blob) => {
-            if (!blob){ resolve(); return; }
-            clientFrameCounter++;
-            const clientCaptureTs = Date.now() / 1000.0;
-            const formData = new FormData();
-            formData.append("image", blob, src === 'video_file' ? "video_frame.jpg" : "webcam_frame.jpg");
-            formData.append("is_stream", "true");
-            formData.append("client_frame_id", clientFrameCounter);
-            formData.append("client_timestamp", clientCaptureTs);
-            try {
-              const reqStart = performance.now();
-              const resp = await fetch(API_URL, { method: "POST", body: formData });
-              if (resp.ok){
-                const data = await resp.json();
-                data.roundtrip_ms = Math.round(performance.now() - reqStart);
-                handleDetectionResult(data, silent);
-              }
-            } catch(e){
-              console.warn("Video/Webcam detect error:", e);
-            } finally {
-              resolve();
-            }
-          }, 'image/jpeg', 0.80);
-        });
+        if (liveWs && liveWs.readyState === WebSocket.OPEN){
+          clientFrameCounter++;
+          const clientCaptureTs = Date.now() / 1000.0;
+          inFlightFrameId = clientFrameCounter;
+          inFlightFrameTime = Date.now();
+          const b64 = canvas.toDataURL('image/jpeg', 0.80);
+          liveWs.send(JSON.stringify({
+            type: "detect_frame",
+            frame_id: clientFrameCounter,
+            capture_timestamp: clientCaptureTs,
+            image: b64
+          }));
+        }
       }
     }
   } catch(err){
     console.warn("Auto-detect cycle:", err.message);
-    if (!silent){
-      showToast(err.message);
-    }
   } finally {
     isScanning = false;
     if (aiTxt && isContinuousDetectActive) aiTxt.textContent = "AI ACTIVE";
@@ -1452,6 +1448,7 @@ function handleDetectionResult(data, silent=false){
   if (data.frame_id != null && data.frame_id > 0) {
     if (data.frame_id < latestRenderedFrameId) {
       // Discard stale result that arrived after a newer frame was already processed
+      console.warn(`[STALE_FRAME_DISCARDED] frame_id=${data.frame_id} latest=${latestRenderedFrameId}`);
       return;
     }
     latestRenderedFrameId = data.frame_id;
@@ -1490,6 +1487,7 @@ function handleDetectionResult(data, silent=false){
   if (activeDet){
     consecutiveEmptyCycles = 0;
     activeDet.latency_ms = detMs;
+    lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
     drawBoxes(activeDet);
     updateResultCard(activeDet, detMs);
@@ -1510,7 +1508,8 @@ function handleDetectionResult(data, silent=false){
       showToast(`${trackText}${plateShow} - ${statusText}${timeMs}`);
     }
   } else {
-    // Begitu kendaraan keluar dari area deteksi, langsung OFF sistem dan bersihkan bounding box seketika
+    // Begitu kendaraan keluar dari area deteksi, langsung bersihkan active track dan bounding box seketika
+    lastActiveTrackId = null;
     clearBoxes();
     drawRoiBox(currentRoi);
     lastDetectionData = null;
@@ -1837,6 +1836,64 @@ function drawBoxes(det){
   } else {
     place();
   }
+}
+
+function drawPlateBoxOnly(det){
+  if (!det || !det.plate_bbox || det.inside_interest_area === false || det.status === 'OUTSIDE_ROI' || det.lost_interest){
+    return;
+  }
+  const target = document.getElementById('liveVideo') || document.getElementById('liveStreamImg') || document.getElementById('feedImg');
+  if (!target) return;
+  const wrap = target.parentElement;
+  if (!wrap) return;
+
+  const elemW = target.clientWidth;
+  const elemH = target.clientHeight;
+  let refW = det.image_width || (lastDetectionData && lastDetectionData.image_width) || 1920;
+  let refH = det.image_height || (lastDetectionData && lastDetectionData.image_height) || 1080;
+  const natW = target.videoWidth || target.naturalWidth;
+  const natH = target.videoHeight || target.naturalHeight;
+  if (!refW || !refH){ refW = natW; refH = natH; }
+  if (!elemW || !elemH || !refW || !refH) return;
+
+  const dispRatio = (natW && natH) ? (natW / natH) : (refW / refH);
+  const elemRatio = elemW / elemH;
+
+  let renderW, renderH, offsetX, offsetY;
+  if (elemRatio > dispRatio) {
+    renderH = elemH;
+    renderW = elemH * dispRatio;
+    offsetX = (elemW - renderW) / 2;
+    offsetY = 0;
+  } else {
+    renderW = elemW;
+    renderH = elemW / dispRatio;
+    offsetX = 0;
+    offsetY = (elemH - renderH) / 2;
+  }
+  const scale = renderW / refW;
+
+  let boxPlate = wrap.querySelector('#detBoxPlate');
+  const [x1,y1,x2,y2] = det.plate_bbox;
+  if (!boxPlate){
+    boxPlate = document.createElement('div');
+    boxPlate.id = 'detBoxPlate';
+    boxPlate.className = 'det-box plate-box';
+    const pLabel = document.createElement('div');
+    pLabel.className = 'det-label';
+    pLabel.style.background = '#f2c94c';
+    pLabel.style.color = '#000';
+    pLabel.style.fontWeight = '700';
+    boxPlate.appendChild(pLabel);
+    wrap.appendChild(boxPlate);
+  }
+  boxPlate.style.display = 'block';
+  boxPlate.style.left = Math.round(offsetX + x1 * scale) + 'px';
+  boxPlate.style.top = Math.round(offsetY + y1 * scale) + 'px';
+  boxPlate.style.width = Math.round((x2 - x1) * scale) + 'px';
+  boxPlate.style.height = Math.round((y2 - y1) * scale) + 'px';
+  const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
+  boxPlate.querySelector('.det-label').textContent = plateLabel;
 }
 
 // Reposition bounding boxes on window resize
@@ -2274,8 +2331,11 @@ function handleWsMessage(msg){
       drawRoiBox(currentRoi);
     }
   } else if (msg.type === "detection_update"){
-    // Realtime detection broadcast from StreamInferenceWorker via WebSocket
-    // Translate WS payload fields to what handleDetectionResult expects
+    // Release in-flight backpressure
+    if (inFlightFrameId !== null && (msg.frame_id == null || msg.frame_id >= inFlightFrameId)){
+      inFlightFrameId = null;
+    }
+    // Realtime detection broadcast from StreamInferenceWorker or live_ws via WebSocket
     const wsNow = Date.now() / 1000.0;
     const frameAge = msg.capture_timestamp
       ? Math.round((wsNow - msg.capture_timestamp) * 1000)
@@ -2292,18 +2352,55 @@ function handleWsMessage(msg){
     };
     updateAiIndicator(true, "AI ACTIVE (WS)");
     handleDetectionResult(detPayload, true);
+  } else if (msg.type === "plate_update"){
+    // STALE ASYNC RESULT PROTECTION:
+    // Validate that msg.track_id matches currently active track
+    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
+      console.log(`[STALE_RESULT_DISCARDED] type=plate msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
+      return;
+    }
+    lastDetectionData.plate_bbox = msg.plate_bbox;
+    lastDetectionData.plate_confidence = msg.plate_confidence;
+    lastDetectionData.plate_detected = true;
+    if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
+    if (msg.status) lastDetectionData.status = msg.status;
+    drawPlateBoxOnly(lastDetectionData);
+    updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
-    // Realtime async OCR candidate broadcast directly into Latest Detection without waiting for Entry History!
-    if (lastDetectionData && (lastDetectionData.track_id === msg.track_id || !lastDetectionData.track_id)){
-      lastDetectionData.ocr_text = msg.license_plate;
-      lastDetectionData.license_plate = msg.license_plate;
-      lastDetectionData.ocr_confidence = msg.ocr_confidence;
-      lastDetectionData.candidate_matches = msg.candidate_matches;
-      lastDetectionData.ocr_status = msg.ocr_status;
-      lastDetectionData.status = msg.status || lastDetectionData.status;
+    // STALE ASYNC OCR RESULT PROTECTION:
+    // Validate that msg.track_id matches currently active track
+    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
+      console.log(`[STALE_RESULT_DISCARDED] type=ocr msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
+      return;
+    }
+    lastDetectionData.ocr_text = msg.license_plate;
+    lastDetectionData.license_plate = msg.license_plate;
+    lastDetectionData.ocr_confidence = msg.ocr_confidence;
+    lastDetectionData.candidate_matches = msg.candidate_matches;
+    lastDetectionData.ocr_status = msg.ocr_status;
+    lastDetectionData.status = msg.status || lastDetectionData.status;
 
-      updateResultCard(lastDetectionData);
-      drawBoxes(lastDetectionData);
+    updateResultCard(lastDetectionData);
+    const pLabel = document.querySelector('#detBoxPlate .det-label');
+    if (pLabel && msg.license_plate) {
+      pLabel.textContent = msg.license_plate;
+    }
+  } else if (msg.type === "body_update"){
+    // STALE ASYNC BODY RESULT PROTECTION:
+    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
+      console.log(`[STALE_RESULT_DISCARDED] type=body msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
+      return;
+    }
+    lastDetectionData.vehicle_type = msg.vehicle_type || lastDetectionData.vehicle_type;
+    lastDetectionData.body_style = msg.body_style;
+    lastDetectionData.body_style_confidence = msg.body_style_confidence;
+    updateResultCard(lastDetectionData);
+    const vLabel = document.querySelector('#detBoxVehicle .det-label');
+    if (vLabel) {
+      const trackPrefix = `[#${lastDetectionData.track_id}] `;
+      const baseLabel = lastDetectionData.body_style || typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type;
+      const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
+      vLabel.textContent = `${trackPrefix}${baseLabel}${vehConf}`;
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
