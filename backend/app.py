@@ -74,6 +74,8 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 import config
 CAPTURES_DIR = config.SCREENSHOTS_DIR
 os.makedirs(CAPTURES_DIR, exist_ok=True)
+DEBUG_CROPS_DIR = os.path.join(CAPTURES_DIR, "debug_crops")
+os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 
 # ============================================================
 # PERFORMANCE & DETECTION CONFIGURATION
@@ -985,7 +987,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 3 <= len(parts[0]) <= 5 and len(parts[1]) == 2:
                 return f"{parts[0]}-{parts[1]}"
 
-    pref_map = {'8': 'B', '0': 'D', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A'}
+    pref_map = {'8': 'B'}
     suff_map = {'8': 'B', '0': 'O', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A', '6': 'G'}
     digit_map = {'O': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'Q': '0'}
 
@@ -2278,6 +2280,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
 
         if abs_plate_bbox is not None:
             t_plate_sent = time.time()
+            print(f"[PLATE_DETECTION]\ntrack_id={track_id}\nframe_id={frame_id}\nplate_bbox={abs_plate_bbox}\nconf={plate_conf_val}", flush=True)
             # FAST PLATE BBOX: Broadcast immediately to WebSocket without waiting for OCR!
             ws_broadcaster.broadcast({
                 "type": "plate_update",
@@ -2327,13 +2330,25 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
                 print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
 
+        # Simpan debug crop untuk evaluasi visual
+        if crop is not None and getattr(crop, 'size', 0) > 0:
+            crop_fname = f"f{frame_id}_t{track_id}_{int(time.time()*1000)%1000000}.jpg"
+            crop_path = os.path.join(DEBUG_CROPS_DIR, crop_fname)
+            try:
+                cv2.imwrite(crop_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            except Exception:
+                pass
+
         res = ensemble_plate_reading(crop)
         t_ocr_end = time.time()
         ocr_duration_ms = (t_ocr_end - t_ocr_start) * 1000.0
         text = res.get("final")
         conf = float(res.get("confidence", 0.0) or 0.0)
         method = res.get("method", "ensemble")
+        raw_paddle = res.get("paddle_raw", "")
+        raw_char = res.get("char_raw", "")
         print(f"[OCR_END]\ntrack_id={track_id}\nframe_id={frame_id}\ntext={text}\nconfidence={conf:.2f}\nduration_ms={ocr_duration_ms:.1f}", flush=True)
+        print(f"[OCR_RESULT]\ntrack_id={track_id}\nframe_id={frame_id}\nraw_paddle={raw_paddle}\nraw_char={raw_char}\nfinal={text}\nconf={conf:.2f}", flush=True)
 
         is_newly_confirmed = False
         confirmed_data = None
@@ -2400,6 +2415,103 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
 
 
 confirmation_manager = VehicleConfirmationManager()
+
+
+def generate_annotated_frame(img, detections, interest_area=None, frame_id=None):
+    """
+    Menghasilkan citra teranotasi utuh (annotated result frame) langsung dari backend:
+    - Area Deteksi (ROI polygon / bounding box dengan warna cyan/hijau transparan & border)
+    - Bounding box kendaraan (warna hijau/amber, label tipe kendaraan + confidence)
+    - Bounding box plat nomor (warna kuning/hijau, label nomor plat + OCR confidence)
+    Mengembalikan data URI standar Base64 JPEG (data:image/jpeg;base64,...) yang valid dan dapat langsung
+    dirender oleh browser tanpa broken image error.
+    """
+    if img is None or getattr(img, 'size', 0) == 0:
+        return None
+
+    try:
+        t_draw_0 = time.time()
+        annotated = img.copy()
+        ih, iw = annotated.shape[:2]
+
+        roi_cfg = interest_area or INTEREST_AREA
+        # 1. Gambar ROI Polygon
+        if roi_cfg and "points" in roi_cfg and isinstance(roi_cfg["points"], list) and len(roi_cfg["points"]) >= 3:
+            pts = np.array([[int(p[0] * iw), int(p[1] * ih)] for p in roi_cfg["points"]], np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            cv2.polylines(annotated, [pts], isClosed=True, color=(255, 230, 0), thickness=2)
+            min_pt = np.min(pts, axis=0)[0]
+            cv2.putText(annotated, "DETECTION AREA", (max(10, int(min_pt[0])), max(20, int(min_pt[1]) - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
+        elif roi_cfg and "x_min" in roi_cfg:
+            rx1 = int(roi_cfg.get("x_min", 0.0) * iw)
+            ry1 = int(roi_cfg.get("y_min", 0.0) * ih)
+            rx2 = int(roi_cfg.get("x_max", 1.0) * iw)
+            ry2 = int(roi_cfg.get("y_max", 1.0) * ih)
+            cv2.rectangle(annotated, (rx1, ry1), (rx2, ry2), (255, 230, 0), 2)
+            cv2.putText(annotated, "DETECTION AREA", (rx1 + 8, max(20, ry1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
+
+        # 2. Gambar setiap deteksi kendaraan & plat
+        for det in (detections or []):
+            if not isinstance(det, dict):
+                continue
+            v_box = det.get("bbox")
+            if v_box and len(v_box) == 4:
+                vx1, vy1, vx2, vy2 = map(int, v_box)
+                is_lost = det.get("lost_interest", False)
+                v_color = (128, 128, 128) if is_lost else (0, 255, 0)
+                # BBox Kendaraan
+                cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), v_color, 2)
+
+                # Label Kendaraan
+                v_type = det.get("body_style") or det.get("vehicle_type") or "vehicle"
+                v_conf = det.get("vehicle_confidence")
+                tid = det.get("track_id")
+                v_label = f"#{tid} {v_type.upper()}" if tid is not None else v_type.upper()
+                if v_conf:
+                    v_label += f" {int(v_conf*100)}%"
+
+                # Background badge untuk teks kendaraan
+                (tw, th), _ = cv2.getTextSize(v_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                lbl_y1 = max(0, vy1 - th - 8)
+                cv2.rectangle(annotated, (vx1, lbl_y1), (vx1 + tw + 8, lbl_y1 + th + 8), v_color, -1)
+                cv2.putText(annotated, v_label, (vx1 + 4, lbl_y1 + th + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+            # BBox Plat Nomor
+            p_box = det.get("plate_bbox")
+            if p_box and len(p_box) == 4:
+                px1, py1, px2, py2 = map(int, p_box)
+                p_color = (0, 255, 255) # Yellow/Gold
+                cv2.rectangle(annotated, (px1, py1), (px2, py2), p_color, 2)
+
+                # Label Plat & OCR
+                plate_txt = det.get("license_plate")
+                ocr_conf = det.get("ocr_confidence") or det.get("plate_confidence")
+                if plate_txt:
+                    p_label = f"{plate_txt}"
+                    if ocr_conf:
+                        p_label += f" ({int(ocr_conf*100)}%)"
+                    (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    plbl_y1 = max(0, py1 - pth - 6)
+                    cv2.rectangle(annotated, (px1, plbl_y1), (px1 + ptw + 8, plbl_y1 + pth + 6), p_color, -1)
+                    cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # 3. Encode JPEG
+        ret, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ret:
+            return None
+
+        b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
+        data_uri = f"data:image/jpeg;base64,{b64_str}"
+        draw_dur_ms = (time.time() - t_draw_0) * 1000.0
+        print(f"[RESULT_IMAGE_CREATED]\nframe_id={frame_id}\nformat=jpeg\nbytes_len={len(buf)}\nduration_ms={draw_dur_ms:.1f}", flush=True)
+        return data_uri
+    except Exception as ex:
+        print(f"[RESULT_IMAGE_ERROR]: {ex}", flush=True)
+        return None
 
 
 def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
@@ -2783,6 +2895,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_total = time.time() - t_start
     fps = 1.0 / max(1e-4, t_total)
 
+    annotated_uri = generate_annotated_frame(img, results_out, interest_area=INTEREST_AREA, frame_id=frame_id)
+
     # 5. PERFORMANCE TELEMETRY LOGGING
     print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
 
@@ -2792,6 +2906,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "source": image_path,
         "image_width": iw,
         "image_height": ih,
+        "annotated_image": annotated_uri,
         "perf_breakdown": {
             "yolo_ms": round(t_yolo * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
@@ -2906,12 +3021,15 @@ class StreamInferenceWorker:
                     "frame_age_ms": frame_age_ms,
                     "latency_ms": det_time_ms,
                     "detections": detections,
+                    "annotated_image": result.get("annotated_image"),
                     "interest_area": INTEREST_AREA,
                     "image_width": result.get("image_width", 1920),
                     "image_height": result.get("image_height", 1080),
                 }
                 self.last_payload = payload
                 ws_broadcaster.broadcast(payload)
+                if result.get("annotated_image"):
+                    print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
             except Exception as e:
@@ -2993,11 +3111,14 @@ def live_ws(ws):
                                     "timestamp": t0,
                                     "latency_ms": det_ms,
                                     "detections": detections,
+                                    "annotated_image": res.get("annotated_image"),
                                     "interest_area": INTEREST_AREA,
                                     "image_width": res.get("image_width", frame.shape[1]),
                                     "image_height": res.get("image_height", frame.shape[0]),
                                 }
                                 ws.send(json.dumps(payload))
+                                if res.get("annotated_image"):
+                                    print(f"[RESULT_IMAGE_SENT]\nframe_id={client_frame_id}\nrecipient=ws_client", flush=True)
                                 print(f"[DETECTION_SENT]\nframe_id={client_frame_id}\nactive_tracks={det_ids}", flush=True)
                                 print(f"[PERF_TOTAL]\nframe_id={client_frame_id}\nduration_ms={det_ms}", flush=True)
                 except Exception as ex:
