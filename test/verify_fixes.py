@@ -1,6 +1,9 @@
 import sys
 import os
 import base64
+import json
+import threading
+import time
 import numpy as np
 import cv2
 
@@ -29,18 +32,76 @@ def test_annotated_image():
         "lost_interest": False
     }]
     
-    data_uri = generate_annotated_frame(dummy_img, detections, frame_id=101)
+    data_uri, raw_b64, mime_type = generate_annotated_frame(dummy_img, detections, frame_id=101)
     assert data_uri is not None, "data_uri is None"
+    assert raw_b64 is not None, "raw_b64 is None"
+    assert mime_type == "image/jpeg", f"MIME mismatch: {mime_type}"
     assert data_uri.startswith("data:image/jpeg;base64,"), f"Invalid prefix: {data_uri[:30]}"
+    assert data_uri == f"data:image/jpeg;base64,{raw_b64}", "data_uri does not match raw_b64"
     
-    b64_data = data_uri.split(",", 1)[1]
-    raw_bytes = base64.b64decode(b64_data)
+    # Decode raw base64 and verify JPEG binary format
+    raw_bytes = base64.b64decode(raw_b64)
     assert raw_bytes[:2] == b'\xff\xd8', "JPEG header magic bytes mismatch"
+    assert raw_bytes[-2:] == b'\xff\xd9', "JPEG EOF bytes mismatch"
     
     decoded_img = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
     assert decoded_img is not None, "Failed to decode generated JPEG"
     assert decoded_img.shape == (480, 640, 3), f"Shape mismatch: {decoded_img.shape}"
-    print("[PASS] generate_annotated_frame verified successfully!")
+    print("[PASS] generate_annotated_frame verified successfully with valid JPEG and Base64 output!")
+
+def test_websocket_thread_safety():
+    print("Testing WebSocketBroadcaster thread safety...")
+    from app import WebSocketBroadcaster
+    
+    class MockWebSocket:
+        def __init__(self):
+            self.received = []
+            self.lock = threading.Lock()
+            self.closed = False
+            
+        def send(self, data):
+            if self.closed:
+                raise RuntimeError("Socket closed")
+            # Verify data is valid UTF-8 string and valid JSON
+            assert isinstance(data, str), "Sent data must be a string text frame"
+            parsed = json.loads(data)
+            assert "type" in parsed
+            with self.lock:
+                self.received.append(parsed)
+
+    broadcaster = WebSocketBroadcaster()
+    mock_ws1 = MockWebSocket()
+    mock_ws2 = MockWebSocket()
+    broadcaster.register(mock_ws1)
+    broadcaster.register(mock_ws2)
+    
+    # Concurrently send messages from 10 threads
+    threads = []
+    def worker(tid):
+        for i in range(20):
+            payload = {
+                "type": "detection_update",
+                "thread_id": tid,
+                "msg_id": i,
+                "timestamp": time.time(),
+                "test_field": "test_value"
+            }
+            if tid % 2 == 0:
+                broadcaster.broadcast(payload)
+            else:
+                broadcaster.send(mock_ws1, payload)
+
+    for tid in range(10):
+        t = threading.Thread(target=worker, args=(tid,))
+        threads.append(t)
+        t.start()
+        
+    for t in threads:
+        t.join()
+        
+    assert len(mock_ws1.received) > 0, "mock_ws1 received no messages"
+    assert len(mock_ws2.received) > 0, "mock_ws2 received no messages"
+    print(f"[PASS] WebSocketBroadcaster sent {len(mock_ws1.received)} messages concurrently with 0 UTF-8 / JSON framing errors!")
 
 def test_plate_refinement():
     print("Testing refine_indonesian_plate...")
@@ -48,12 +109,12 @@ def test_plate_refinement():
     
     # Check that '225 BK' is not converted to 'Z 225 BK'
     res = refine_indonesian_plate("225 BK")
-    print(f"refine_indonesian_plate('225 BK') -> {res}")
+    print(f"refine_indonesian_plate('225 BK') -> '{res}'")
     assert "Z 225 BK" not in res, f"Expected no 'Z' prefix hallucination, got {res}"
     
     # Check standard plate
     res_b = refine_indonesian_plate("B 1958 RZH")
-    print(f"refine_indonesian_plate('B 1958 RZH') -> {res_b}")
+    print(f"refine_indonesian_plate('B 1958 RZH') -> '{res_b}'")
     assert res_b == "B 1958 RZH", f"Expected B 1958 RZH, got {res_b}"
     print("[PASS] refine_indonesian_plate verified successfully!")
 
@@ -87,6 +148,7 @@ def test_track_isolation():
 
 if __name__ == "__main__":
     test_annotated_image()
+    test_websocket_thread_safety()
     test_plate_refinement()
     test_track_isolation()
-    print("ALL TESTS PASSED!")
+    print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")

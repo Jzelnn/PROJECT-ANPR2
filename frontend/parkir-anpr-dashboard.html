@@ -2265,8 +2265,25 @@ function initWebSocket(){
 
     liveWs.onmessage = (evt) => {
       try {
-        const msg = JSON.parse(evt.data);
-        handleWsMessage(msg);
+        if (typeof evt.data === 'string') {
+          const msg = JSON.parse(evt.data);
+          handleWsMessage(msg);
+        } else if (evt.data instanceof Blob) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            try {
+              const msg = JSON.parse(reader.result);
+              handleWsMessage(msg);
+            } catch(e) {
+              console.warn("[WS] Error parsing Blob message:", e);
+            }
+          };
+          reader.readAsText(evt.data);
+        } else if (evt.data instanceof ArrayBuffer) {
+          const text = new TextDecoder('utf-8').decode(evt.data);
+          const msg = JSON.parse(text);
+          handleWsMessage(msg);
+        }
       } catch(err){
         console.warn("[WS] Error parsing message:", err);
       }
@@ -2343,13 +2360,28 @@ function handleWsMessage(msg){
     const frameAge = msg.capture_timestamp
       ? Math.round((wsNow - msg.capture_timestamp) * 1000)
       : (msg.frame_age_ms != null ? msg.frame_age_ms : null);
+
+    // Extract valid Data URI for result image
+    let validImgUri = null;
+    const rawImg = msg.result_image || msg.annotated_image;
+    if (rawImg && typeof rawImg === 'string' && rawImg.length > 50) {
+      if (rawImg.startsWith('data:')) {
+        validImgUri = rawImg;
+      } else {
+        const mime = msg.image_mime_type || 'image/jpeg';
+        validImgUri = `data:${mime};base64,${rawImg}`;
+      }
+    }
+
     const detPayload = {
       detections: msg.detections || [],
       detection_time_sec: msg.latency_ms != null ? msg.latency_ms / 1000.0 : null,
+      processing_ms: msg.processing_ms || msg.latency_ms,
       frame_id: msg.frame_id,
       capture_timestamp: msg.capture_timestamp,
       frame_age_ms: frameAge,
-      annotated_image: msg.annotated_image,
+      result_image: validImgUri,
+      annotated_image: validImgUri,
       interest_area: msg.interest_area,
       image_width: msg.image_width,
       image_height: msg.image_height

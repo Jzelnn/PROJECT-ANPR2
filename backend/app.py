@@ -170,35 +170,65 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
 # ============================================================
 # WEBSOCKET BROADCASTER FOR REAL-TIME ANPR TELEMETRY
 # Mengirimkan pembaruan deteksi real-time & OCR ke seluruh frontend client yang terhubung.
+# Dilengkapi per-client write lock untuk mencegah interleave frame & error decoding UTF-8.
 # ============================================================
 class WebSocketBroadcaster:
     def __init__(self):
         self.clients = set()
-        self.lock = threading.Lock()
+        self.client_locks = {}
+        self.lock = threading.RLock()
 
     def register(self, ws):
         with self.lock:
             self.clients.add(ws)
+            if ws not in self.client_locks:
+                self.client_locks[ws] = threading.Lock()
             print(f"[WS] Client connected. Total active clients: {len(self.clients)}")
 
     def unregister(self, ws):
         with self.lock:
             self.clients.discard(ws)
+            self.client_locks.pop(ws, None)
             print(f"[WS] Client disconnected. Total active clients: {len(self.clients)}")
 
-    def broadcast(self, message_dict):
+    def send(self, ws, message_dict):
+        """Kirim pesan JSON individual ke 1 client secara thread-safe tanpa frame collision."""
         with self.lock:
-            if not self.clients:
-                return
-            msg_str = json.dumps(message_dict)
-            dead = []
-            for ws in list(self.clients):
-                try:
+            ws_lock = self.client_locks.get(ws)
+        if not ws_lock:
+            ws_lock = self.lock
+        try:
+            msg_str = json.dumps(message_dict, ensure_ascii=True)
+            with ws_lock:
+                ws.send(msg_str)
+            return True
+        except Exception:
+            self.unregister(ws)
+            return False
+
+    def broadcast(self, message_dict):
+        """Siarkan pesan JSON ke seluruh client secara thread-safe."""
+        with self.lock:
+            active_clients = list(self.clients)
+        if not active_clients:
+            return
+        msg_str = json.dumps(message_dict, ensure_ascii=True)
+        dead = []
+        for ws in active_clients:
+            with self.lock:
+                ws_lock = self.client_locks.get(ws)
+            if not ws_lock:
+                ws_lock = self.lock
+            try:
+                with ws_lock:
                     ws.send(msg_str)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.clients.discard(ws)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            with self.lock:
+                for ws in dead:
+                    self.clients.discard(ws)
+                    self.client_locks.pop(ws, None)
 
 
 ws_broadcaster = WebSocketBroadcaster()
@@ -2423,11 +2453,13 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
     - Area Deteksi (ROI polygon / bounding box dengan warna cyan/hijau transparan & border)
     - Bounding box kendaraan (warna hijau/amber, label tipe kendaraan + confidence)
     - Bounding box plat nomor (warna kuning/hijau, label nomor plat + OCR confidence)
-    Mengembalikan data URI standar Base64 JPEG (data:image/jpeg;base64,...) yang valid dan dapat langsung
-    dirender oleh browser tanpa broken image error.
+    Mengembalikan tuple: (data_uri, raw_base64, mime_type)
+    - data_uri: 'data:image/jpeg;base64,...' (Data URI standar)
+    - raw_base64: '...' (Raw Base64 string tanpa header prefix)
+    - mime_type: 'image/jpeg'
     """
     if img is None or getattr(img, 'size', 0) == 0:
-        return None
+        return None, None, None
 
     try:
         t_draw_0 = time.time()
@@ -2459,6 +2491,8 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
             v_box = det.get("bbox")
             if v_box and len(v_box) == 4:
                 vx1, vy1, vx2, vy2 = map(int, v_box)
+                vx1, vy1 = max(0, min(iw - 1, vx1)), max(0, min(ih - 1, vy1))
+                vx2, vy2 = max(0, min(iw, vx2)), max(0, min(ih, vy2))
                 is_lost = det.get("lost_interest", False)
                 v_color = (128, 128, 128) if is_lost else (0, 255, 0)
                 # BBox Kendaraan
@@ -2483,6 +2517,8 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
             p_box = det.get("plate_bbox")
             if p_box and len(p_box) == 4:
                 px1, py1, px2, py2 = map(int, p_box)
+                px1, py1 = max(0, min(iw - 1, px1)), max(0, min(ih - 1, py1))
+                px2, py2 = max(0, min(iw, px2)), max(0, min(ih, py2))
                 p_color = (0, 255, 255) # Yellow/Gold
                 cv2.rectangle(annotated, (px1, py1), (px2, py2), p_color, 2)
 
@@ -2499,19 +2535,20 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
                     cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-        # 3. Encode JPEG
+        # 3. Encode JPEG dengan verifikasi integritas
         ret, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ret:
-            return None
+        if not ret or buf is None or len(buf) == 0:
+            print(f"[RESULT_IMAGE_ERROR] cv2.imencode failed for frame_id={frame_id}", flush=True)
+            return None, None, None
 
-        b64_str = base64.b64encode(buf.tobytes()).decode('utf-8')
-        data_uri = f"data:image/jpeg;base64,{b64_str}"
+        raw_b64 = base64.b64encode(buf.tobytes()).decode('ascii')
+        data_uri = f"data:image/jpeg;base64,{raw_b64}"
         draw_dur_ms = (time.time() - t_draw_0) * 1000.0
-        print(f"[RESULT_IMAGE_CREATED]\nframe_id={frame_id}\nformat=jpeg\nbytes_len={len(buf)}\nduration_ms={draw_dur_ms:.1f}", flush=True)
-        return data_uri
+        print(f"[RESULT_IMAGE_CREATED]\nframe_id={frame_id}\nformat=jpeg\nmime_type=image/jpeg\ndimensions={iw}x{ih}\nbytes_len={len(buf)}\nb64_len={len(raw_b64)}\nduration_ms={draw_dur_ms:.1f}", flush=True)
+        return data_uri, raw_b64, "image/jpeg"
     except Exception as ex:
         print(f"[RESULT_IMAGE_ERROR]: {ex}", flush=True)
-        return None
+        return None, None, None
 
 
 def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
@@ -2895,7 +2932,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_total = time.time() - t_start
     fps = 1.0 / max(1e-4, t_total)
 
-    annotated_uri = generate_annotated_frame(img, results_out, interest_area=INTEREST_AREA, frame_id=frame_id)
+    data_uri, raw_b64, mime_type = generate_annotated_frame(img, results_out, interest_area=INTEREST_AREA, frame_id=frame_id)
 
     # 5. PERFORMANCE TELEMETRY LOGGING
     print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
@@ -2906,7 +2943,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "source": image_path,
         "image_width": iw,
         "image_height": ih,
-        "annotated_image": annotated_uri,
+        "image_mime_type": mime_type,
+        "result_image": data_uri,
+        "annotated_image": data_uri,
+        "raw_base64_image": raw_b64,
         "perf_breakdown": {
             "yolo_ms": round(t_yolo * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
@@ -3020,15 +3060,19 @@ class StreamInferenceWorker:
                     "capture_timestamp": frame_capture_time,
                     "frame_age_ms": frame_age_ms,
                     "latency_ms": det_time_ms,
+                    "processing_ms": det_time_ms,
                     "detections": detections,
+                    "image_mime_type": result.get("image_mime_type", "image/jpeg"),
+                    "result_image": result.get("result_image"),
                     "annotated_image": result.get("annotated_image"),
+                    "raw_base64_image": result.get("raw_base64_image"),
                     "interest_area": INTEREST_AREA,
                     "image_width": result.get("image_width", 1920),
                     "image_height": result.get("image_height", 1080),
                 }
                 self.last_payload = payload
                 ws_broadcaster.broadcast(payload)
-                if result.get("annotated_image"):
+                if result.get("result_image"):
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
@@ -3053,16 +3097,18 @@ def live_ws(ws):
             "status": camera_stream_manager.get_status(),
             "history": list(LATEST_RECORDS)[:30]
         }
-        ws.send(json.dumps(init_payload))
+        ws_broadcaster.send(ws, init_payload)
 
         while True:
             data = ws.receive(timeout=1.0)
             if data is not None:
                 try:
+                    if isinstance(data, bytes):
+                        data = data.decode('utf-8', errors='ignore')
                     msg = json.loads(data)
                     m_type = msg.get("type")
                     if m_type == "ping":
-                        ws.send(json.dumps({"type": "pong", "time": time.time()}))
+                        ws_broadcaster.send(ws, {"type": "pong", "time": time.time()})
                     elif m_type == "detect_frame":
                         client_frame_id = msg.get("frame_id")
                         client_capture_ts = msg.get("capture_timestamp")
@@ -3110,14 +3156,18 @@ def live_ws(ws):
                                     "frame_age_ms": frame_age_ms,
                                     "timestamp": t0,
                                     "latency_ms": det_ms,
+                                    "processing_ms": det_ms,
                                     "detections": detections,
+                                    "image_mime_type": res.get("image_mime_type", "image/jpeg"),
+                                    "result_image": res.get("result_image"),
                                     "annotated_image": res.get("annotated_image"),
+                                    "raw_base64_image": res.get("raw_base64_image"),
                                     "interest_area": INTEREST_AREA,
                                     "image_width": res.get("image_width", frame.shape[1]),
                                     "image_height": res.get("image_height", frame.shape[0]),
                                 }
-                                ws.send(json.dumps(payload))
-                                if res.get("annotated_image"):
+                                ws_broadcaster.send(ws, payload)
+                                if res.get("result_image"):
                                     print(f"[RESULT_IMAGE_SENT]\nframe_id={client_frame_id}\nrecipient=ws_client", flush=True)
                                 print(f"[DETECTION_SENT]\nframe_id={client_frame_id}\nactive_tracks={det_ids}", flush=True)
                                 print(f"[PERF_TOTAL]\nframe_id={client_frame_id}\nduration_ms={det_ms}", flush=True)
