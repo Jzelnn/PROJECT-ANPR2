@@ -16,7 +16,7 @@ import json
 from urllib.parse import urlparse
 import numpy as np
 import cv2
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory, send_file
 from flask_cors import CORS
 from flask_sock import Sock
 
@@ -2541,7 +2541,15 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
             print(f"[RESULT_IMAGE_ERROR] cv2.imencode failed for frame_id={frame_id}", flush=True)
             return None, None, None
 
-        raw_b64 = base64.b64encode(buf.tobytes()).decode('ascii')
+        jpeg_bytes = buf.tobytes()
+        try:
+            latest_result_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
+            with open(latest_result_path, "wb") as f:
+                f.write(jpeg_bytes)
+        except Exception:
+            pass
+
+        raw_b64 = base64.b64encode(jpeg_bytes).decode('ascii')
         data_uri = f"data:image/jpeg;base64,{raw_b64}"
         draw_dur_ms = (time.time() - t_draw_0) * 1000.0
         print(f"[RESULT_IMAGE_CREATED]\nframe_id={frame_id}\nformat=jpeg\nmime_type=image/jpeg\ndimensions={iw}x{ih}\nbytes_len={len(buf)}\nb64_len={len(raw_b64)}\nduration_ms={draw_dur_ms:.1f}", flush=True)
@@ -3479,6 +3487,50 @@ def clear_history():
 def serve_capture(filename):
     """Menyajikan file foto bukti snapshot kendaraan."""
     return send_from_directory(CAPTURES_DIR, filename)
+
+
+@app.route("/api/latest_result_image", methods=["GET"])
+def get_latest_result_image():
+    """Menyajikan gambar JPEG teranotasi hasil deteksi terbaru langsung ke browser."""
+    latest_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
+    if os.path.exists(latest_path):
+        return send_file(latest_path, mimetype="image/jpeg")
+    return jsonify({"error": "Belum ada gambar hasil deteksi. Silakan lakukan deteksi / upload foto terlebih dahulu."}), 404
+
+
+@app.route("/view_result")
+def view_result_page():
+    """Halaman instan untuk melihat foto hasil deteksi terbaru secara langsung di browser."""
+    html_content = """<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ANPR Result Image Viewer</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; display: flex; flex-direction: column; align-items: center; }
+        h1 { font-size: 20px; font-weight: 700; color: #38bdf8; margin-bottom: 8px; }
+        p { font-size: 13px; color: #94a3b8; margin-top: 0; margin-bottom: 20px; }
+        .img-card { background: #1e293b; padding: 12px; border-radius: 12px; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0,0,0,0.5); max-width: 90vw; }
+        img { max-width: 100%; max-height: 75vh; border-radius: 8px; display: block; }
+        .btn-wrap { margin-top: 16px; display: flex; gap: 10px; }
+        button, a { background: #2563eb; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; text-decoration: none; border: none; cursor: pointer; transition: 0.2s; }
+        button:hover, a:hover { background: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <h1>🚗 Foto Hasil Deteksi ANPR Terbaru</h1>
+    <p>Citra teranotasi langsung dari backend (Bounding Box Kendaraan + Plat Nomor + OCR)</p>
+    <div class="img-card">
+        <img id="resImg" src="/api/latest_result_image" alt="Hasil Deteksi" onerror="this.alt='Belum ada deteksi yang dijalankan.'">
+    </div>
+    <div class="btn-wrap">
+        <button onclick="document.getElementById('resImg').src='/api/latest_result_image?t=' + Date.now()">🔄 Refresh Foto</button>
+        <a href="/dashboard">⬅ Kembali ke Dashboard</a>
+    </div>
+</body>
+</html>"""
+    return Response(html_content, mimetype="text/html")
 
 
 @app.route("/api/stream/capture", methods=["POST", "OPTIONS"])

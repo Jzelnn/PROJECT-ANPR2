@@ -1589,6 +1589,10 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     det.latency_ms = detMs;
     if (detMs > 0) updateLatencyIndicator(detMs);
     lastDetectionData = det;
+    if (data.result_image || data.annotated_image) {
+      const feedImg = document.getElementById('feedImg');
+      if (feedImg) feedImg.src = data.result_image || data.annotated_image;
+    }
     drawBoxes(det);
     updateResultCard(det, detMs);
     if (det.is_newly_confirmed) {
