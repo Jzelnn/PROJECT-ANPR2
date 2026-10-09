@@ -289,7 +289,7 @@ def draw_annotations_on_image(img, detections, interest_area=None):
             b_style_raw = str(det.get("body_style") or "").strip()
 
             if b_style_raw and v_type_raw and b_style_raw.lower() != v_type_raw.lower():
-                v_label = f"{v_type_raw.upper()} • {b_style_raw.upper()}"
+                v_label = f"{v_type_raw.upper()} - {b_style_raw.upper()}"
             elif b_style_raw:
                 v_label = b_style_raw.upper()
             elif v_type_raw:
@@ -2004,20 +2004,8 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             ]
 
     def get_current_plate_bbox(self, cur_vbbox=None):
-        """Mengembalikan posisi plat yang disesuaikan secara real-time dengan pergerakan bodi kendaraan."""
-        if not self.last_plate_bbox:
-            return None
-        if not self.rel_plate_bbox or not cur_vbbox:
-            return self.last_plate_bbox
-        vx1, vy1, vx2, vy2 = cur_vbbox
-        vw = max(1.0, float(vx2 - vx1))
-        vh = max(1.0, float(vy2 - vy1))
-        r0, r1, r2, r3 = self.rel_plate_bbox
-        px1 = max(0, int(round(vx1 + r0 * vw)))
-        py1 = max(0, int(round(vy1 + r1 * vh)))
-        px2 = max(px1 + 10, int(round(vx1 + r2 * vw)))
-        py2 = max(py1 + 5, int(round(vy1 + r3 * vh)))
-        return [px1, py1, px2, py2]
+        """Mengembalikan posisi plat absolut yang dideteksi secara presisi."""
+        return self.last_plate_bbox
 
 
 class VehicleConfirmationManager:
