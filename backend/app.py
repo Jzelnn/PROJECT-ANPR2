@@ -242,6 +242,85 @@ LAST_RECORDED_PLATES = {}  # {safe_plate: {"time": float, "rec": dict}}
 GATE_COOLDOWN_SEC = 15.0
 
 
+def draw_annotations_on_image(img, detections, interest_area=None):
+    """
+    Menggambar visualisasi bounding box kendaraan, plat nomor, label OCR, dan ROI
+    ke dalam frame citra.
+    """
+    if img is None or getattr(img, 'size', 0) == 0:
+        return img
+
+    annotated = img.copy()
+    ih, iw = annotated.shape[:2]
+    roi_cfg = interest_area or INTEREST_AREA
+
+    # 1. Gambar ROI Polygon
+    if roi_cfg and "points" in roi_cfg and isinstance(roi_cfg["points"], list) and len(roi_cfg["points"]) >= 3:
+        pts = np.array([[int(p[0] * iw), int(p[1] * ih)] for p in roi_cfg["points"]], np.int32)
+        pts = pts.reshape((-1, 1, 2))
+        cv2.polylines(annotated, [pts], isClosed=True, color=(255, 230, 0), thickness=2)
+        min_pt = np.min(pts, axis=0)[0]
+        cv2.putText(annotated, "DETECTION AREA", (max(10, int(min_pt[0])), max(20, int(min_pt[1]) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
+    elif roi_cfg and "x_min" in roi_cfg:
+        rx1 = int(roi_cfg.get("x_min", 0.0) * iw)
+        ry1 = int(roi_cfg.get("y_min", 0.0) * ih)
+        rx2 = int(roi_cfg.get("x_max", 1.0) * iw)
+        ry2 = int(roi_cfg.get("y_max", 1.0) * ih)
+        cv2.rectangle(annotated, (rx1, ry1), (rx2, ry2), (255, 230, 0), 2)
+        cv2.putText(annotated, "DETECTION AREA", (rx1 + 8, max(20, ry1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
+
+    # 2. Gambar setiap deteksi kendaraan & plat
+    dets = [detections] if isinstance(detections, dict) else (detections or [])
+    for det in dets:
+        if not isinstance(det, dict):
+            continue
+        v_box = det.get("bbox")
+        if v_box and len(v_box) == 4:
+            vx1, vy1, vx2, vy2 = map(int, v_box)
+            vx1, vy1 = max(0, min(iw - 1, vx1)), max(0, min(ih - 1, vy1))
+            vx2, vy2 = max(0, min(iw, vx2)), max(0, min(ih, vy2))
+            is_lost = det.get("lost_interest", False)
+            v_color = (128, 128, 128) if is_lost else (0, 255, 0)
+            cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), v_color, 2)
+
+            v_type = det.get("body_style") or det.get("vehicle_type") or "vehicle"
+            v_conf = det.get("vehicle_confidence")
+            tid = det.get("track_id")
+            v_label = f"#{tid} {v_type.upper()}" if tid is not None else v_type.upper()
+            if v_conf:
+                v_label += f" {int(v_conf*100)}%"
+
+            (tw, th), _ = cv2.getTextSize(v_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            lbl_y1 = max(0, vy1 - th - 8)
+            cv2.rectangle(annotated, (vx1, lbl_y1), (vx1 + tw + 8, lbl_y1 + th + 8), v_color, -1)
+            cv2.putText(annotated, v_label, (vx1 + 4, lbl_y1 + th + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+        p_box = det.get("plate_bbox")
+        if p_box and len(p_box) == 4:
+            px1, py1, px2, py2 = map(int, p_box)
+            px1, py1 = max(0, min(iw - 1, px1)), max(0, min(ih - 1, py1))
+            px2, py2 = max(0, min(iw, px2)), max(0, min(ih, py2))
+            p_color = (0, 255, 255)
+            cv2.rectangle(annotated, (px1, py1), (px2, py2), p_color, 2)
+
+            plate_txt = det.get("license_plate")
+            ocr_conf = det.get("ocr_confidence") or det.get("plate_confidence")
+            if plate_txt:
+                p_label = f"{plate_txt}"
+                if ocr_conf:
+                    p_label += f" ({int(ocr_conf*100)}%)"
+                (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                plbl_y1 = max(0, py1 - pth - 6)
+                cv2.rectangle(annotated, (px1, plbl_y1), (px1 + ptw + 8, plbl_y1 + pth + 6), p_color, -1)
+                cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    return annotated
+
+
 def save_parking_record(det, source_img=None, source_img_path=None):
     """
     Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms).
@@ -284,19 +363,29 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     snapshot_filename = f"{file_ts}_{safe_plate}.jpg"
     dest_path = os.path.join(CAPTURES_DIR, snapshot_filename)
 
-    def _async_write_snapshot(dst, img_data, img_path):
+    def _async_write_snapshot(dst, img_data, img_path, det_info):
         try:
             if img_data is not None:
-                cv2.imwrite(dst, img_data, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                ann_img = draw_annotations_on_image(img_data, det_info, interest_area=INTEREST_AREA)
+                cv2.imwrite(dst, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                latest_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
+                cv2.imwrite(latest_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             elif img_path and os.path.exists(img_path):
-                shutil.copyfile(img_path, dst)
+                raw = cv2.imread(img_path)
+                if raw is not None:
+                    ann_img = draw_annotations_on_image(raw, det_info, interest_area=INTEREST_AREA)
+                    cv2.imwrite(dst, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    latest_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
+                    cv2.imwrite(latest_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                else:
+                    shutil.copyfile(img_path, dst)
         except Exception as e:
             print(f"[WARN] Async snapshot save error: {e}")
 
     if source_img is not None:
-        ai_pool.submit(_async_write_snapshot, dest_path, source_img.copy(), None)
+        ai_pool.submit(_async_write_snapshot, dest_path, source_img.copy(), None, det.copy() if isinstance(det, dict) else det)
     elif source_img_path and os.path.exists(source_img_path):
-        ai_pool.submit(_async_write_snapshot, dest_path, None, source_img_path)
+        ai_pool.submit(_async_write_snapshot, dest_path, None, source_img_path, det.copy() if isinstance(det, dict) else det)
 
     timing_data = det.get("timing") or {}
     proc_ms = det.get("processing_ms") or det.get("latency_ms")
@@ -2463,79 +2552,10 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None)
 
     try:
         t_draw_0 = time.time()
-        annotated = img.copy()
+        annotated = draw_annotations_on_image(img, detections, interest_area=interest_area)
         ih, iw = annotated.shape[:2]
 
-        roi_cfg = interest_area or INTEREST_AREA
-        # 1. Gambar ROI Polygon
-        if roi_cfg and "points" in roi_cfg and isinstance(roi_cfg["points"], list) and len(roi_cfg["points"]) >= 3:
-            pts = np.array([[int(p[0] * iw), int(p[1] * ih)] for p in roi_cfg["points"]], np.int32)
-            pts = pts.reshape((-1, 1, 2))
-            cv2.polylines(annotated, [pts], isClosed=True, color=(255, 230, 0), thickness=2)
-            min_pt = np.min(pts, axis=0)[0]
-            cv2.putText(annotated, "DETECTION AREA", (max(10, int(min_pt[0])), max(20, int(min_pt[1]) - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
-        elif roi_cfg and "x_min" in roi_cfg:
-            rx1 = int(roi_cfg.get("x_min", 0.0) * iw)
-            ry1 = int(roi_cfg.get("y_min", 0.0) * ih)
-            rx2 = int(roi_cfg.get("x_max", 1.0) * iw)
-            ry2 = int(roi_cfg.get("y_max", 1.0) * ih)
-            cv2.rectangle(annotated, (rx1, ry1), (rx2, ry2), (255, 230, 0), 2)
-            cv2.putText(annotated, "DETECTION AREA", (rx1 + 8, max(20, ry1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 230, 0), 2)
-
-        # 2. Gambar setiap deteksi kendaraan & plat
-        for det in (detections or []):
-            if not isinstance(det, dict):
-                continue
-            v_box = det.get("bbox")
-            if v_box and len(v_box) == 4:
-                vx1, vy1, vx2, vy2 = map(int, v_box)
-                vx1, vy1 = max(0, min(iw - 1, vx1)), max(0, min(ih - 1, vy1))
-                vx2, vy2 = max(0, min(iw, vx2)), max(0, min(ih, vy2))
-                is_lost = det.get("lost_interest", False)
-                v_color = (128, 128, 128) if is_lost else (0, 255, 0)
-                # BBox Kendaraan
-                cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), v_color, 2)
-
-                # Label Kendaraan
-                v_type = det.get("body_style") or det.get("vehicle_type") or "vehicle"
-                v_conf = det.get("vehicle_confidence")
-                tid = det.get("track_id")
-                v_label = f"#{tid} {v_type.upper()}" if tid is not None else v_type.upper()
-                if v_conf:
-                    v_label += f" {int(v_conf*100)}%"
-
-                # Background badge untuk teks kendaraan
-                (tw, th), _ = cv2.getTextSize(v_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
-                lbl_y1 = max(0, vy1 - th - 8)
-                cv2.rectangle(annotated, (vx1, lbl_y1), (vx1 + tw + 8, lbl_y1 + th + 8), v_color, -1)
-                cv2.putText(annotated, v_label, (vx1 + 4, lbl_y1 + th + 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
-
-            # BBox Plat Nomor
-            p_box = det.get("plate_bbox")
-            if p_box and len(p_box) == 4:
-                px1, py1, px2, py2 = map(int, p_box)
-                px1, py1 = max(0, min(iw - 1, px1)), max(0, min(ih - 1, py1))
-                px2, py2 = max(0, min(iw, px2)), max(0, min(ih, py2))
-                p_color = (0, 255, 255) # Yellow/Gold
-                cv2.rectangle(annotated, (px1, py1), (px2, py2), p_color, 2)
-
-                # Label Plat & OCR
-                plate_txt = det.get("license_plate")
-                ocr_conf = det.get("ocr_confidence") or det.get("plate_confidence")
-                if plate_txt:
-                    p_label = f"{plate_txt}"
-                    if ocr_conf:
-                        p_label += f" ({int(ocr_conf*100)}%)"
-                    (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    plbl_y1 = max(0, py1 - pth - 6)
-                    cv2.rectangle(annotated, (px1, plbl_y1), (px1 + ptw + 8, plbl_y1 + pth + 6), p_color, -1)
-                    cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-        # 3. Encode JPEG dengan verifikasi integritas
+        # Encode JPEG dengan verifikasi integritas
         ret, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ret or buf is None or len(buf) == 0:
             print(f"[RESULT_IMAGE_ERROR] cv2.imencode failed for frame_id={frame_id}", flush=True)
