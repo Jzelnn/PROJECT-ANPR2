@@ -835,12 +835,14 @@ def is_valid_plate_box(box, img_w, img_h):
     w_ratio = w / float(img_w)
     h_ratio = h / float(img_h)
     area_ratio = (w * h) / float(img_w * img_h)
-    # Plat nomor Indonesia: rasio aspek ~ 1.15 - 6.2 (mendukung plat kotak TNI/Polri 1.2 - 1.5 & motor), lebar <= 45% frame, luas <= 10% frame
-    if aspect < 1.15 or aspect > 6.2:
+    # Plat nomor Indonesia: rasio aspek ~ 1.05 - 7.0 (mendukung plat kotak TNI/Polri 1.1 - 1.5, plat motor, & plat panjang), lebar <= 50% frame, luas <= 15% frame
+    if aspect < 1.05 or aspect > 7.0:
         return False
-    if w_ratio > 0.45 or h_ratio > 0.28:
+    if w_ratio > 0.50 or h_ratio > 0.35:
         return False
-    if area_ratio > 0.10:
+    if area_ratio > 0.15:
+        return False
+    if w < 12 or h < 6:
         return False
     return True
 
@@ -1467,6 +1469,7 @@ class VehicleTrack:
         self.last_bbox = None
         self.last_plate_bbox = None
         self.last_plate_conf = 0.0
+        self.rel_plate_bbox = None  # [rel_x1, rel_y1, rel_x2, rel_y2] relative to vehicle bbox
         
         # Controlled Tracking & ROI State
         is_inside = initial_det.get("inside_interest_area", False) if initial_det else False
@@ -1964,6 +1967,36 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
                 counts[b] = counts.get(b, 0) + 1
         return round(max(counts.values()) / len(self.frames), 2) if counts else 1.0
 
+    def update_plate_bbox(self, abs_box, v_bbox=None):
+        """Memperbarui posisi absolut plat dan menghitung offset relatif terhadap bodi kendaraan."""
+        self.last_plate_bbox = abs_box
+        if abs_box and v_bbox:
+            vx1, vy1, vx2, vy2 = v_bbox
+            vw = max(1.0, float(vx2 - vx1))
+            vh = max(1.0, float(vy2 - vy1))
+            self.rel_plate_bbox = [
+                (abs_box[0] - vx1) / vw,
+                (abs_box[1] - vy1) / vh,
+                (abs_box[2] - vx1) / vw,
+                (abs_box[3] - vy1) / vh
+            ]
+
+    def get_current_plate_bbox(self, cur_vbbox=None):
+        """Mengembalikan posisi plat yang disesuaikan secara real-time dengan pergerakan bodi kendaraan."""
+        if not self.last_plate_bbox:
+            return None
+        if not self.rel_plate_bbox or not cur_vbbox:
+            return self.last_plate_bbox
+        vx1, vy1, vx2, vy2 = cur_vbbox
+        vw = max(1.0, float(vx2 - vx1))
+        vh = max(1.0, float(vy2 - vy1))
+        r0, r1, r2, r3 = self.rel_plate_bbox
+        px1 = max(0, int(round(vx1 + r0 * vw)))
+        py1 = max(0, int(round(vy1 + r1 * vh)))
+        px2 = max(px1 + 10, int(round(vx1 + r2 * vw)))
+        py2 = max(py1 + 5, int(round(vy1 + r3 * vh)))
+        return [px1, py1, px2, py2]
+
 
 class VehicleConfirmationManager:
     """
@@ -2321,51 +2354,83 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 return
 
         vx1, vy1, vx2, vy2 = v_bbox
+        vw = max(1, vx2 - vx1)
         vh = max(1, vy2 - vy1)
         plate_conf_val = None
         abs_plate_bbox = None
         plate_crop = np.array([])
+        valid_crops = []
 
-        if vehicle_crop.size > 0:
-            pdet_crop = plate_detector.predict(vehicle_crop, conf=0.08, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
-            valid_crops = []
+        # 1. Padded Crop Detection (Contextual Bumper Padding)
+        pad_x = int(vw * 0.06)
+        pad_y_top = int(vh * 0.04)
+        pad_y_bot = int(vh * 0.10)
+        cx1 = max(0, vx1 - pad_x)
+        cy1 = max(0, vy1 - pad_y_top)
+        cx2 = min(iw, vx2 + pad_x)
+        cy2 = min(ih, vy2 + pad_y_bot)
+        padded_crop = full_img[cy1:cy2, cx1:cx2] if full_img is not None and getattr(full_img, 'size', 0) > 0 else vehicle_crop
+
+        if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+            pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
             for b in pdet_crop.boxes:
                 cls_id = int(b.cls[0])
                 cname = plate_detector.names.get(cls_id, "")
                 if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
                     continue
                 cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
-                abs_box = [vx1 + cpx1, vy1 + cpy1, vx1 + cpx2, vy1 + cpy2]
+                abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
                 if is_valid_plate_box(abs_box, iw, ih):
                     p_conf = float(b.conf[0])
-                    rel_y = (cpy1 + cpy2) / (2.0 * vh)
-                    # Filter out hood/windshield false positives for cars/trucks (rel_y < 0.32)
-                    if initial_vtype != "motorcycle" and rel_y < 0.32:
+                    rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                    # Filter out hood/windshield false positives for cars/trucks
+                    if initial_vtype != "motorcycle" and rel_y < 0.25:
                         continue
-                    # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.60): plat bumper mendapat bobot 2.4x
-                    y_factor = 2.4 if rel_y >= 0.60 else (1.1 if rel_y >= 0.48 else 0.5)
+                    # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.55): plat bumper mendapat bobot 2.4x
+                    y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and vehicle_crop.size > 0:
-                pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=0.06, device=DEVICE, verbose=False)[0]
+            if not valid_crops:
+                pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
                     cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
-                    abs_box = [vx1 + cpx1, vy1 + cpy1, vx1 + cpx2, vy1 + cpy2]
+                    abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
                     if is_valid_plate_box(abs_box, iw, ih):
                         p_conf = float(b.conf[0])
-                        rel_y = (cpy1 + cpy2) / (2.0 * vh)
-                        if initial_vtype != "motorcycle" and rel_y < 0.32:
+                        rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                        if initial_vtype != "motorcycle" and rel_y < 0.25:
                             continue
-                        y_factor = 2.4 if rel_y >= 0.60 else (1.1 if rel_y >= 0.48 else 0.5)
+                        y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                         score = p_conf * y_factor
                         valid_crops.append((abs_box, p_conf, score))
 
-            if valid_crops:
-                valid_crops.sort(key=lambda x: -x[2])
-                abs_plate_bbox, plate_conf_val, _ = valid_crops[0]
-                plate_crop = crop_plate_with_padding(full_img, abs_plate_bbox[0], abs_plate_bbox[1],
-                                                     abs_plate_bbox[2], abs_plate_bbox[3])
+        # 2. Fallback: Full Frame / ROI Plate Detection if crop missed
+        if not valid_crops and full_img is not None and getattr(full_img, 'size', 0) > 0:
+            pdet_full = plate_detector.predict(full_img, conf=0.04, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+            for b in pdet_full.boxes:
+                cls_id = int(b.cls[0])
+                cname = plate_detector.names.get(cls_id, "")
+                if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
+                    continue
+                fx1, fy1, fx2, fy2 = map(int, b.xyxy[0].tolist())
+                abs_box = [max(0, fx1), max(0, fy1), min(iw, fx2), min(ih, fy2)]
+                plate_cx = (abs_box[0] + abs_box[2]) / 2.0
+                plate_cy = (abs_box[1] + abs_box[3]) / 2.0
+                if (vx1 - 35 <= plate_cx <= vx2 + 35) and (vy1 - 20 <= plate_cy <= vy2 + 45):
+                    if is_valid_plate_box(abs_box, iw, ih):
+                        p_conf = float(b.conf[0])
+                        rel_y = (plate_cy - vy1) / float(vh)
+                        if initial_vtype != "motorcycle" and rel_y < 0.25:
+                            continue
+                        y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
+                        valid_crops.append((abs_box, p_conf, p_conf * y_factor))
+
+        if valid_crops:
+            valid_crops.sort(key=lambda x: -x[2])
+            abs_plate_bbox, plate_conf_val, _ = valid_crops[0]
+            plate_crop = crop_plate_with_padding(full_img, abs_plate_bbox[0], abs_plate_bbox[1],
+                                                 abs_plate_bbox[2], abs_plate_bbox[3])
 
         t_plate_end = time.time()
         plate_duration_ms = (t_plate_end - t_plate_start) * 1000.0
@@ -2379,7 +2444,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 return
             track.plate_infer_ms = plate_duration_ms
             if abs_plate_bbox is not None:
-                track.last_plate_bbox = abs_plate_bbox
+                track.update_plate_bbox(abs_plate_bbox, v_bbox)
                 track.last_plate_conf = plate_conf_val
                 track.last_plate_update_time = time.time()
                 track.plate_detected = True
@@ -2830,7 +2895,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 vehicle_type = existing_trk.cached_vtype or initial_vtype
                 body_style = existing_trk.cached_body_style
                 body_style_conf = existing_trk.cached_body_conf
-                abs_plate_bbox = existing_trk.last_plate_bbox
+                abs_plate_bbox = existing_trk.get_current_plate_bbox([x1, y1, x2, y2])
                 plate_conf_val = existing_trk.last_plate_conf
 
                 if existing_trk.is_locked or existing_trk.history_saved:
@@ -2875,39 +2940,58 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 plate_conf_val = None
                 abs_plate_bbox = None
                 plate_crop = np.array([])
+                valid_crops = []
 
-                if vehicle_crop.size > 0:
-                    vh = max(1, y2 - y1)
-                    pdet_crop = plate_detector.predict(vehicle_crop, conf=0.08, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
-                    valid_crops = []
+                # Contextual Padded Crop for Bumper Plates
+                vw = max(1, x2 - x1)
+                vh = max(1, y2 - y1)
+                pad_x = int(vw * 0.06)
+                pad_y_top = int(vh * 0.04)
+                pad_y_bot = int(vh * 0.10)
+                cx1 = max(0, x1 - pad_x)
+                cy1 = max(0, y1 - pad_y_top)
+                cx2 = min(iw, x2 + pad_x)
+                cy2 = min(ih, y2 + pad_y_bot)
+                padded_crop = img[cy1:cy2, cx1:cx2]
+
+                if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+                    pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                     for b in pdet_crop.boxes:
                         cls_id = int(b.cls[0])
                         cname = plate_detector.names.get(cls_id, "")
                         if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
                             continue
                         cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
-                        abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
+                        abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
                         if is_valid_plate_box(abs_box, iw, ih):
                             p_conf = float(b.conf[0])
-                            rel_y = (cpy1 + cpy2) / (2.0 * vh)
-                            if initial_vtype != "motorcycle" and rel_y < 0.32:
+                            rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - y1) / float(vh)
+                            if initial_vtype != "motorcycle" and rel_y < 0.25:
                                 continue
-                            y_factor = 2.4 if rel_y >= 0.60 else (1.1 if rel_y >= 0.48 else 0.5)
+                            y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                             score = p_conf * y_factor
                             valid_crops.append((abs_box, p_conf, score))
+
                     if not valid_crops:
-                        pdet_legacy = plate_model_legacy.predict(vehicle_crop, conf=0.06, device=DEVICE, verbose=False)[0]
+                        pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, device=DEVICE, verbose=False)[0]
                         for b in pdet_legacy.boxes:
                             cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
-                            abs_box = [x1 + cpx1, y1 + cpy1, x1 + cpx2, y1 + cpy2]
+                            abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
                             if is_valid_plate_box(abs_box, iw, ih):
                                 p_conf = float(b.conf[0])
-                                rel_y = (cpy1 + cpy2) / (2.0 * vh)
-                                if initial_vtype != "motorcycle" and rel_y < 0.32:
+                                rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - y1) / float(vh)
+                                if initial_vtype != "motorcycle" and rel_y < 0.25:
                                     continue
-                                y_factor = 2.4 if rel_y >= 0.60 else (1.1 if rel_y >= 0.48 else 0.5)
+                                y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                                 score = p_conf * y_factor
                                 valid_crops.append((abs_box, p_conf, score))
+
+                    if not valid_crops and global_plates:
+                        for gp in global_plates:
+                            gbox = gp["box"]
+                            if (x1 - 35 <= (gbox[0] + gbox[2]) / 2.0 <= x2 + 35) and (y1 - 20 <= (gbox[1] + gbox[3]) / 2.0 <= y2 + 45):
+                                valid_crops.append((gbox, gp["conf"], gp["conf"] * 2.0))
+
                     if valid_crops:
                         valid_crops.sort(key=lambda x: -x[2])
                         abs_plate_bbox, plate_conf_val, _ = valid_crops[0]

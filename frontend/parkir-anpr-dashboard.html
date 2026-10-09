@@ -1491,6 +1491,23 @@ function handleDetectionResult(data, silent=false){
     if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
       clearBoxes();
+    } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
+      // Retain plate & OCR knowledge across fast detection frames for the SAME track
+      if (!activeDet.plate_bbox && lastDetectionData.plate_bbox) {
+        activeDet.plate_bbox = lastDetectionData.plate_bbox;
+        activeDet.plate_confidence = lastDetectionData.plate_confidence;
+        activeDet.plate_detected = lastDetectionData.plate_detected;
+      }
+      if (!activeDet.license_plate && lastDetectionData.license_plate) {
+        activeDet.license_plate = lastDetectionData.license_plate;
+        activeDet.ocr_text = lastDetectionData.ocr_text;
+        activeDet.ocr_confidence = lastDetectionData.ocr_confidence;
+        activeDet.candidate_matches = lastDetectionData.candidate_matches;
+      }
+      if (!activeDet.body_style && lastDetectionData.body_style) {
+        activeDet.body_style = lastDetectionData.body_style;
+        activeDet.body_style_confidence = lastDetectionData.body_style_confidence;
+      }
     }
     lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
