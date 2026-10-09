@@ -1813,13 +1813,19 @@ function drawBoxes(det){
       boxVeh.style.height = Math.round((y2 - y1) * scale) + 'px';
 
       const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
-      const trackPrefix = det.track_id ? `[#${det.track_id}] ` : '';
-      const baseLabel = det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type;
+      const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
+      const bStyle = det.body_style;
+      let baseLabel = vName;
+      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
+        baseLabel = `${vName} • ${bStyle}`;
+      } else if (bStyle) {
+        baseLabel = bStyle;
+      }
       const vehConf = det.vehicle_confidence ? ` (${Math.round(det.vehicle_confidence * 100)}%)` : '';
 
       const labelElem = boxVeh.querySelector('.det-label');
       boxVeh.className = 'det-box';
-      const labelText = `${trackPrefix}${baseLabel}${vehConf}`;
+      const labelText = `${baseLabel}${vehConf}`;
       labelElem.textContent = labelText;
       if (isConfirmed) {
         boxVeh.style.borderColor = '#10b981';
@@ -2454,10 +2460,16 @@ function handleWsMessage(msg){
     updateResultCard(lastDetectionData);
     const vLabel = document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
-      const trackPrefix = `[#${lastDetectionData.track_id}] `;
-      const baseLabel = lastDetectionData.body_style || typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type;
+      const vName = typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle';
+      const bStyle = lastDetectionData.body_style;
+      let baseLabel = vName;
+      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
+        baseLabel = `${vName} • ${bStyle}`;
+      } else if (bStyle) {
+        baseLabel = bStyle;
+      }
       const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
-      vLabel.textContent = `${trackPrefix}${baseLabel}${vehConf}`;
+      vLabel.textContent = `${baseLabel}${vehConf}`;
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History

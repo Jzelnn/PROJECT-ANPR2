@@ -285,10 +285,19 @@ def draw_annotations_on_image(img, detections, interest_area=None):
             v_color = (128, 128, 128) if is_lost else (0, 255, 0)
             cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), v_color, 2)
 
-            v_type = det.get("body_style") or det.get("vehicle_type") or "vehicle"
+            v_type_raw = str(det.get("vehicle_type") or "").strip()
+            b_style_raw = str(det.get("body_style") or "").strip()
+
+            if b_style_raw and v_type_raw and b_style_raw.lower() != v_type_raw.lower():
+                v_label = f"{v_type_raw.upper()} • {b_style_raw.upper()}"
+            elif b_style_raw:
+                v_label = b_style_raw.upper()
+            elif v_type_raw:
+                v_label = v_type_raw.upper()
+            else:
+                v_label = "VEHICLE"
+
             v_conf = det.get("vehicle_confidence")
-            tid = det.get("track_id")
-            v_label = f"#{tid} {v_type.upper()}" if tid is not None else v_type.upper()
             if v_conf:
                 v_label += f" {int(v_conf*100)}%"
 
@@ -312,11 +321,14 @@ def draw_annotations_on_image(img, detections, interest_area=None):
                 p_label = f"{plate_txt}"
                 if ocr_conf:
                     p_label += f" ({int(ocr_conf*100)}%)"
-                (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                plbl_y1 = max(0, py1 - pth - 6)
-                cv2.rectangle(annotated, (px1, plbl_y1), (px1 + ptw + 8, plbl_y1 + pth + 6), p_color, -1)
-                cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            else:
+                p_label = "PLATE DETECTED"
+
+            (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            plbl_y1 = max(0, py1 - pth - 6)
+            cv2.rectangle(annotated, (px1, plbl_y1), (px1 + ptw + 8, plbl_y1 + pth + 6), p_color, -1)
+            cv2.putText(annotated, p_label, (px1 + 4, plbl_y1 + pth + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
     return annotated
 
