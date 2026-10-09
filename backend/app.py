@@ -1201,21 +1201,34 @@ def ensemble_plate_reading(plate_crop):
     paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(plate_crop)
     paddle_raw = paddle_raw.upper()
 
+    # Fast Path: Jika PaddleOCR menghasilkan plat nomor berstruktur valid dengan confidence >= 0.65, langsung selesaikan (<35ms)!
+    is_p_valid, _ = is_valid_indonesian_plate_structure(paddle_raw)
+    if is_p_valid and paddle_conf >= 0.65:
+        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+        if final_formatted:
+            return {
+                "final": final_formatted,
+                "char_raw": "",
+                "char_conf": 0.0,
+                "paddle_raw": paddle_raw,
+                "paddle_conf": paddle_conf,
+                "confidence": paddle_conf,
+                "method": "fast_paddle_direct"
+            }
+
     # 2. Pembacaan via Character Model (Corroborating Fast YOLO)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.20)
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.18)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
-    # 2b. Fallback Deskew hanya jika pembacaan PaddleOCR dan Char Model belum mendapatkan plat valid
-    if not is_valid_indonesian_plate_structure(paddle_raw)[0] and (char_conf < 0.45 or len(c_clean) < 4):
+    # 2b. Fallback Deskew hanya jika kedua metode belum mendapatkan plat valid
+    is_c_valid, _ = is_valid_indonesian_plate_structure(char_raw)
+    if not is_p_valid and not is_c_valid and (char_conf < 0.40 or len(c_clean) < 4):
         deskewed_crop, skew_angle = deskew_plate(plate_crop)
-        if abs(skew_angle) >= 3.0:
+        if abs(skew_angle) >= 3.5:
             d_paddle, d_pconf, d_all_p = read_plate_with_paddleocr(deskewed_crop)
             if d_pconf > paddle_conf:
                 paddle_raw, paddle_conf, all_paddle = d_paddle, d_pconf, d_all_p
-            d_raw, d_conf, d_chars = read_plate_with_char_model(deskewed_crop, conf=0.20)
-            if d_conf > char_conf:
-                char_raw, char_conf = d_raw, d_conf
 
     final_formatted = refine_indonesian_plate(char_raw, paddle_raw, all_paddle)
     final_conf = max(paddle_conf, char_conf) if final_formatted else 0.0
@@ -1726,7 +1739,7 @@ timestamp={self.first_good_ocr_time:.3f}""")
         is_struct, p_type = is_valid_indonesian_plate_structure(text)
         p_clean = re.sub(r'[^A-Z0-9]', '', text.upper()) if text else ""
 
-        if is_struct and conf >= 0.50:
+        if is_struct and conf >= 0.40:
             if self.first_good_ocr_time is None:
                 self.first_good_ocr_time = now
                 self.first_good_ocr_text = text
@@ -1812,8 +1825,8 @@ timestamp={self.first_good_ocr_time:.3f}""")
                 is_struct = best_obs["struct"]
                 p_type = best_obs["type"]
 
-                can_finalize = (is_struct and best_count >= 2 and best_conf >= 0.70) or \
-                               (is_struct and best_conf >= 0.85 and (len(best_cln) >= 5 or p_type == "military"))
+                can_finalize = (is_struct and best_count >= 2 and best_conf >= 0.55) or \
+                               (is_struct and best_conf >= 0.65 and (len(best_cln) >= 4 or p_type == "military"))
 
                 if can_finalize:
                     reason = f"LOST_INTEREST_FINALIZED (count={best_count}, conf={best_conf:.2f})"
@@ -1852,30 +1865,27 @@ timestamp={self.first_good_ocr_time:.3f}""")
         reason = None
 
         # ============================================================
-        # PATH A — HIGH CONFIDENCE FAST CONFIRMATION
+        # FAST EVIDENCE-BASED CONFIRMATION (< 250ms)
         # ============================================================
-        # A1: Single observation with >=80% confidence and valid Samsat plate structure (min 5 chars)
-        if is_struct and best_conf >= 0.80 and (len(best_cln) >= 5 or p_type == "military"):
+        # 1. Instant Fast Confirmation: Valid Samsat plate structure with confidence >= 0.65
+        if is_struct and best_conf >= 0.65 and (len(best_cln) >= 4 or p_type == "military"):
             confirmed = True
-            reason = f"PATH_A_STRONG_EVIDENCE (conf={best_conf:.2f})"
+            reason = f"FAST_STRONG_STRUCTURE (conf={best_conf:.2f})"
 
-        # A2: 70-79% confidence requiring >= 2 matching observations (min 5 chars)
-        elif is_struct and best_count >= 2 and best_conf >= 0.70 and (len(best_cln) >= 5 or p_type == "military"):
+        # 2. Fast Two-Frame Match: Valid Samsat plate structure with confidence >= 0.55 and count >= 2
+        elif is_struct and best_count >= 2 and best_conf >= 0.55 and (len(best_cln) >= 4 or p_type == "military"):
             confirmed = True
-            reason = f"PATH_A_TWO_FRAME_MATCH (count={best_count}, conf={best_conf:.2f})"
+            reason = f"FAST_TWO_FRAME_MATCH (count={best_count}, conf={best_conf:.2f})"
 
-        # ============================================================
-        # PATH B — TEMPORAL CONSENSUS FOR <70% OBSERVATIONS
-        # ============================================================
-        # B1: Consecutive streak >= 3 with confidence >= 0.65 (min 5 chars)
-        elif self.consecutive_count >= 3 and self.consecutive_plate == best_cln and best_conf >= 0.65 and (len(best_cln) >= 5 or p_type == "military"):
+        # 3. Fast Consecutive Match: 2 consecutive frames matching same plate
+        elif self.consecutive_count >= 2 and self.consecutive_plate == best_cln and best_conf >= 0.50 and (len(best_cln) >= 4 or p_type == "military"):
             confirmed = True
-            reason = f"PATH_B_CONSECUTIVE_STREAK (streak={self.consecutive_count}, conf={best_conf:.2f})"
+            reason = f"FAST_CONSECUTIVE_MATCH (streak={self.consecutive_count}, conf={best_conf:.2f})"
 
-        # B2: Temporal consensus: >= 3 matching occurrences in observations with confidence >= 0.65 (min 5 chars)
-        elif is_struct and best_count >= 3 and best_conf >= 0.65 and (len(best_cln) >= 5 or p_type == "military"):
+        # 4. Consensus for lower-confidence degraded plates
+        elif is_struct and best_count >= 3 and best_conf >= 0.40:
             confirmed = True
-            reason = f"PATH_B_TEMPORAL_CONSENSUS (matches={best_count}, conf={best_conf:.2f})"
+            reason = f"TEMPORAL_CONSENSUS (matches={best_count}, conf={best_conf:.2f})"
 
         if confirmed:
             self.confirmation_time = now
@@ -2886,7 +2896,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             )
 
                     # 2. Asynchronous OCR refinement jika plat sudah terdeteksi
-                    if existing_trk.last_plate_bbox and (time.time() - (existing_trk.last_ocr_time or 0) > 0.15 or existing_trk.best_candidate is None):
+                    if existing_trk.last_plate_bbox and (time.time() - (existing_trk.last_ocr_time or 0) > 0.05 or existing_trk.best_candidate is None):
                         p_crop = crop_plate_with_padding(img, existing_trk.last_plate_bbox[0], existing_trk.last_plate_bbox[1],
                                                          existing_trk.last_plate_bbox[2], existing_trk.last_plate_bbox[3])
                         crop_q = compute_crop_quality(p_crop, existing_trk.last_plate_conf)
