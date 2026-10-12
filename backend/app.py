@@ -234,10 +234,83 @@ class WebSocketBroadcaster:
 ws_broadcaster = WebSocketBroadcaster()
 
 # ============================================================
-# PURE IN-MEMORY STORAGE (RAM)
-# Seluruh riwayat kendaraan disimpan langsung di memori RAM (0 ms, bebas lag disk)
+# HIGH-SPEED IN-MEMORY STORAGE (RAM) WITH PERSISTENT DISK CACHE
+# Riwayat kendaraan disimpan langsung di memori RAM (0 ms, bebas lag)
+# dan disinkronkan ke file JSON agar riwayat tidak hilang saat server di-restart.
 # ============================================================
-LATEST_RECORDS = deque(maxlen=300)
+HISTORY_FILE = os.path.join(config.OUTPUT_DIR, "parking_history.json")
+
+def load_initial_history():
+    """Memuat riwayat parkir tersimpan atau merekonstruksi dari snapshot di storage."""
+    records = []
+    seen_snaps = set()
+
+    # 1. Muat dari file json jika ada
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for r in data:
+                        snap = r.get("snapshot_url") or str(r.get("id"))
+                        if snap and snap not in seen_snaps:
+                            records.append(r)
+                            seen_snaps.add(snap)
+        except Exception as e:
+            print(f"[WARN] Gagal membaca {HISTORY_FILE}: {e}")
+
+    # 2. Rekonstruksi dari foto-foto yang ada di folder screenshots jika ada yang belum tercatat
+    if os.path.exists(CAPTURES_DIR):
+        try:
+            for fname in sorted(os.listdir(CAPTURES_DIR), reverse=True):
+                if not fname.lower().endswith(('.jpg', '.jpeg', '.png')) or fname in ('latest_result.jpg', 'rtsp_test.jpg'):
+                    continue
+                snap_url = f"/captures/{fname}"
+                if snap_url in seen_snaps:
+                    continue
+
+                # Pattern: YYYYMMDD_HHMMSS_fff_PLATE.jpg
+                m = re.match(r'^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_\d+_(.+)\.(?:jpg|jpeg|png)$', fname, re.IGNORECASE)
+                if m:
+                    y, mo, d, h, mi, s, raw_plate = m.groups()
+                    dt_str = f"{y}-{mo}-{d} {h}:{mi}:{s}"
+                    # Format plat Indonesia: B 1452 HOS
+                    m_p = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', raw_plate.upper())
+                    fmt_plate = f"{m_p.group(1)} {m_p.group(2)} {m_p.group(3)}" if m_p else raw_plate.upper()
+                    try:
+                        ts_val = time.mktime(datetime.datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").timetuple())
+                    except Exception:
+                        ts_val = time.time()
+
+                    rec = {
+                        "id": int(ts_val * 1000) % 1000000,
+                        "track_id": None,
+                        "timestamp": dt_str,
+                        "license_plate": fmt_plate,
+                        "vehicle_type": "car",
+                        "body_style": None,
+                        "confidence": 0.90,
+                        "consistency": 1.0,
+                        "status": "CONFIRMED",
+                        "latency_ms": None,
+                        "processing_ms": 150,
+                        "timing": {},
+                        "snapshot_url": snap_url
+                    }
+                    records.append(rec)
+                    seen_snaps.add(snap_url)
+        except Exception as e:
+            print(f"[WARN] Error scanning screenshots directory: {e}")
+
+    records.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(records[:500], f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return deque(records[:300], maxlen=300)
+
+LATEST_RECORDS = load_initial_history()
 LAST_RECORDED_PLATES = {}  # {safe_plate: {"time": float, "rec": dict}}
 GATE_COOLDOWN_SEC = 15.0
 
@@ -459,6 +532,23 @@ def save_parking_record(det, source_img=None, source_img_path=None):
         "type": "entry_confirmed",
         "record": rec
     })
+
+    def _async_append_history_to_file(r):
+        try:
+            items = []
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+            seen = {x.get("snapshot_url") or x.get("id") for x in items}
+            r_key = r.get("snapshot_url") or r.get("id")
+            if r_key not in seen:
+                items.insert(0, r)
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(items[:500], f, indent=2, ensure_ascii=False)
+        except Exception as ex:
+            print(f"[WARN] Async history save error: {ex}")
+
+    ai_pool.submit(_async_append_history_to_file, rec.copy())
 
     conf_time = det.get("confirmation_time")
     dt_conf_to_hist = ((now_epoch - conf_time) * 1000.0) if conf_time else 0.0
@@ -1993,6 +2083,8 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             "confirmation_reason": reason,
             "confirmation_time": self.confirmation_time,
             "processing_ms": int(round(total_proc_ms)),
+            "status": "CONFIRMED",
+            "is_newly_confirmed": True,
             "timing": {
                 "vehicle_ms": v_ms,
                 "plate_ms": p_ms,
@@ -3633,9 +3725,14 @@ def export_history():
 
 @app.route("/api/clear_history", methods=["POST"])
 def clear_history():
-    """Membersihkan seluruh catatan riwayat parkir di memory RAM seketika."""
+    """Membersihkan seluruh catatan riwayat parkir di memory RAM dan disk."""
     LATEST_RECORDS.clear()
-    return jsonify({"status": "ok", "message": "Riwayat parkir di memory berhasil dibersihkan", "total": 0})
+    try:
+        if os.path.exists(HISTORY_FILE):
+            os.remove(HISTORY_FILE)
+    except Exception:
+        pass
+    return jsonify({"status": "ok", "message": "Riwayat parkir di memory dan disk berhasil dibersihkan", "total": 0})
 
 
 @app.route("/captures/<path:filename>")

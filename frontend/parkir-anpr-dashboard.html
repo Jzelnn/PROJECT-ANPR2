@@ -2151,15 +2151,46 @@ function updateTelemetry(det){
 // PERSISTENT ENTRY HISTORY (LOAD & SAVE)
 // ============================================================
 function addLogRow(det, isInit=false){
-  if (!isInit && det.track_id) {
-    const existing = document.querySelector(`.log-row[data-track-id="${det.track_id}"]`);
-    if (existing) return;
+  if (!det) return;
+  const plateText = (det.license_plate || det.ocr_candidate || '').trim();
+  if (!plateText || plateText === '-' || plateText === 'TIDAK_TERBACA' || plateText === 'UNKNOWN') return;
+
+  const logList = document.getElementById('logList');
+  if (!logList) return;
+
+  // Hapus placeholder "No vehicle records yet" jika ada
+  const placeholder = logList.querySelector('.log-empty-msg') || (logList.children.length === 1 && !logList.children[0].classList.contains('log-row') ? logList.children[0] : null);
+  if (placeholder) {
+    placeholder.remove();
   }
+
+  // Cek apakah entri untuk track ini atau plat ini sudah ada di daftar
+  const existingByTrack = det.track_id ? logList.querySelector(`.log-row[data-track-id="${det.track_id}"]`) : null;
+  const existingByPlate = plateText ? logList.querySelector(`.log-row[data-plate="${plateText}"]`) : null;
+  const existing = existingByTrack || existingByPlate;
+
+  if (existing && !isInit) {
+    // Perbarui entri jika nomor plat atau tipe bodi lebih lengkap
+    const plateEl = existing.querySelector('.log-plate');
+    if (plateEl && (plateEl.textContent.includes('-') || !plateEl.textContent.includes(plateText))) {
+      const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';
+      plateEl.innerHTML = `${trackPrefix}${plateText}`;
+    }
+    return;
+  }
+
   const now = new Date();
-  const timeStr = det.timestamp ? det.timestamp.slice(11, 16) : now.toTimeString().slice(0,5);
+  const timeStr = det.timestamp ? (det.timestamp.length >= 16 ? det.timestamp.slice(11, 16) : det.timestamp) : now.toTimeString().slice(0,5);
   const row = document.createElement('div');
   row.className = 'log-row';
   if (det.track_id) row.setAttribute('data-track-id', det.track_id);
+  row.setAttribute('data-plate', plateText);
+  
+  if (det.snapshot_url) {
+    row.style.cursor = 'pointer';
+    row.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
+    row.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+  }
   
   const procMs = det.processing_ms != null ? det.processing_ms : det.latency_ms;
   let timingTooltip = '';
@@ -2176,13 +2207,12 @@ function addLogRow(det, isInit=false){
   
   row.innerHTML = `
     <span class="log-time">${timeStr}</span>
-    <span class="log-plate">${trackPrefix}${det.license_plate || '-'}</span>
+    <span class="log-plate">${trackPrefix}${plateText}</span>
     <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
       <span>${(det.body_style || typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle')}${confScore}</span>
       ${procDisplay}
     </span>
   `;
-  const logList = document.getElementById('logList');
   if (isInit) {
     logList.appendChild(row);
   } else {
@@ -2197,11 +2227,12 @@ async function loadHistoryFromBackend(){
     if (!resp.ok) return;
     const data = await resp.json();
     const logList = document.getElementById('logList');
-    logList.innerHTML = '';
+    if (!logList) return;
     if (data.records && data.records.length > 0){
+      logList.innerHTML = '';
       data.records.forEach(r => addLogRow(r, true));
     } else {
-      logList.innerHTML = '<div style="padding:18px;font-size:12px;color:var(--text-dim);text-align:center;">No vehicle records yet</div>';
+      logList.innerHTML = '<div class="log-empty-msg" style="padding:18px;font-size:12px;color:var(--text-dim);text-align:center;">No vehicle records yet</div>';
     }
   } catch(e){
     console.warn("Could not load initial history:", e);
@@ -2367,7 +2398,7 @@ function handleWsMessage(msg){
     // Pre-populate Entry History from WS init payload (no extra REST call needed)
     if (msg.history && Array.isArray(msg.history) && msg.history.length > 0){
       const logList = document.getElementById('logList');
-      if (logList && logList.children.length === 0){
+      if (logList && !logList.querySelector('.log-row')){
         logList.innerHTML = '';
         msg.history.forEach(r => addLogRow(r, true));
       }

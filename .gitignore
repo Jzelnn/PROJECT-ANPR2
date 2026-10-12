@@ -17,6 +17,7 @@ output/results/*
 !output/results/.gitkeep
 output/logs/*
 !output/logs/.gitkeep
+output/parking_history.json
 
 # Bobot model (besar). File yang sudah dilacak git tetap dilacak.
 models/**/*.pt
