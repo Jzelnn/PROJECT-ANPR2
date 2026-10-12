@@ -146,9 +146,45 @@ def test_track_isolation():
     assert trk_b.is_locked is False, "Vehicle B inherited locked state"
     print("[PASS] Track isolation verified successfully!")
 
+def test_plate_bbox_in_snapshot():
+    print("Testing plate_bbox resolution in save_parking_record & confirmation...")
+    from app import VehicleConfirmationManager, save_parking_record, confirmation_manager
+    import time
+    
+    # Test 1: Track confirmation preserves last_plate_bbox even if best_f had None
+    tid, trk = confirmation_manager.get_or_create_track(99, [100, 100, 400, 400], 1920, 1080, frame_id=1)
+    trk.last_plate_bbox = [180, 250, 320, 300]
+    trk.add_frame({
+        "vehicle_type": "car",
+        "vehicle_confidence": 0.95,
+        "body_style": "MPV",
+        "body_style_confidence": 0.90,
+        "bbox": [100, 100, 400, 400],
+        "plate_bbox": None,
+        "inside_interest_area": True
+    })
+    trk._finalize_confirmation("B 1452 HOS", 0.92, 2, reason="TEST_CONFIRM")
+    assert trk.confirmed_data is not None, "confirmed_data is None"
+    assert trk.confirmed_data.get("plate_bbox") == [180, 250, 320, 300], f"Expected plate_bbox resolved, got: {trk.confirmed_data.get('plate_bbox')}"
+    
+    # Test 2: save_parking_record fills plate_bbox from track if missing
+    dummy_det = {
+        "track_id": 99,
+        "license_plate": "B 1452 HOS",
+        "plate_confidence": 0.92,
+        "status": "CONFIRMED",
+        "bbox": [100, 100, 400, 400],
+        "plate_bbox": None
+    }
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    rec = save_parking_record(dummy_det, source_img=dummy_frame)
+    assert dummy_det.get("plate_bbox") == [180, 250, 320, 300], f"Expected save_parking_record to populate plate_bbox, got {dummy_det.get('plate_bbox')}"
+    print("[PASS] Plate bbox resolution in snapshot verified successfully!")
+
 if __name__ == "__main__":
     test_annotated_image()
     test_websocket_thread_safety()
     test_plate_refinement()
     test_track_isolation()
+    test_plate_bbox_in_snapshot()
     print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")

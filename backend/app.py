@@ -366,6 +366,16 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
     track_id = det.get("track_id")
 
+    # Pastikan plate_bbox selalu terisi dari track jika masih kosong di det
+    if not det.get("plate_bbox") and track_id is not None and 'confirmation_manager' in globals():
+        try:
+            with confirmation_manager.lock:
+                trk = confirmation_manager.tracks.get(track_id)
+                if trk and trk.last_plate_bbox:
+                    det["plate_bbox"] = list(trk.last_plate_bbox)
+        except Exception:
+            pass
+
     # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 15 detik lalu, gunakan record yang ada
     if safe_plate in LAST_RECORDED_PLATES:
         last_entry = LAST_RECORDED_PLATES[safe_plate]
@@ -377,20 +387,40 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
     def _async_write_snapshot(dst, img_data, img_path, det_info):
         try:
+            target_img = None
             if img_data is not None:
-                ann_img = draw_annotations_on_image(img_data, det_info, interest_area=INTEREST_AREA)
+                target_img = img_data
+            elif img_path and os.path.exists(img_path):
+                target_img = cv2.imread(img_path)
+
+            if target_img is not None:
+                # Ultimate fallback: jika plate_bbox masih kosong, cari langsung dari crop kendaraan di target_img
+                if not det_info.get("plate_bbox") and 'plate_detector' in globals() and plate_detector is not None:
+                    try:
+                        v_b = det_info.get("bbox")
+                        ih, iw = target_img.shape[:2]
+                        if v_b and len(v_b) == 4:
+                            vx1, vy1, vx2, vy2 = map(int, v_b)
+                            vx1, vy1 = max(0, min(iw - 1, vx1)), max(0, min(ih - 1, vy1))
+                            vx2, vy2 = max(0, min(iw, vx2)), max(0, min(ih, vy2))
+                            vcrop = target_img[vy1:vy2, vx1:vx2]
+                            if vcrop.size > 0:
+                                preds = plate_detector.predict(vcrop, conf=0.04, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                                if preds.boxes and len(preds.boxes) > 0:
+                                    pb = preds.boxes[0].xyxy[0].tolist()
+                                    det_info["plate_bbox"] = [
+                                        int(vx1 + pb[0]), int(vy1 + pb[1]),
+                                        int(vx1 + pb[2]), int(vy1 + pb[3])
+                                    ]
+                    except Exception as pe:
+                        print(f"[WARN] Snapshot plate_bbox recovery error: {pe}")
+
+                ann_img = draw_annotations_on_image(target_img, det_info, interest_area=INTEREST_AREA)
                 cv2.imwrite(dst, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
                 latest_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
                 cv2.imwrite(latest_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             elif img_path and os.path.exists(img_path):
-                raw = cv2.imread(img_path)
-                if raw is not None:
-                    ann_img = draw_annotations_on_image(raw, det_info, interest_area=INTEREST_AREA)
-                    cv2.imwrite(dst, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                    latest_path = os.path.join(CAPTURES_DIR, "latest_result.jpg")
-                    cv2.imwrite(latest_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                else:
-                    shutil.copyfile(img_path, dst)
+                shutil.copyfile(img_path, dst)
         except Exception as e:
             print(f"[WARN] Async snapshot save error: {e}")
 
@@ -1930,8 +1960,15 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             type_weights[vt] = type_weights.get(vt, 0.0) + w
         best_type = max(type_weights, key=type_weights.get) if type_weights else self.frames[-1]["vehicle_type"]
 
-        # Frame terbaik untuk snapshot / bounding box
-        best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
+        # Frame terbaik untuk snapshot / bounding box (prioritaskan frame dengan plate_bbox valid)
+        frames_with_plate = [f for f in self.frames if f.get("plate_bbox")]
+        if frames_with_plate:
+            best_f = max(frames_with_plate, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
+        else:
+            best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
+
+        resolved_plate_bbox = best_f.get("plate_bbox") or self.last_plate_bbox
+        resolved_vehicle_bbox = best_f.get("bbox") or self.last_bbox
 
         now_ts = time.time()
         conf_t = self.confirmation_time or now_ts
@@ -1950,8 +1987,8 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             "license_plate": stable_plate,
             "plate_confidence": round(stable_conf, 3),
             "consistency": round(consistency_score, 2),
-            "bbox": best_f["bbox"],
-            "plate_bbox": best_f["plate_bbox"],
+            "bbox": resolved_vehicle_bbox,
+            "plate_bbox": resolved_plate_bbox,
             "ocr_method": best_f.get("ocr_method") or "fast_path",
             "confirmation_reason": reason,
             "confirmation_time": self.confirmation_time,
@@ -2460,6 +2497,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 track.last_plate_conf = plate_conf_val
                 track.last_plate_update_time = time.time()
                 track.plate_detected = True
+                if track.confirmed_data and not track.confirmed_data.get("plate_bbox"):
+                    track.confirmed_data["plate_bbox"] = list(abs_plate_bbox)
 
                 # Queue or prepare OCR job if valid crop exists and track is not locked
                 if plate_crop.size > 0 and not track.is_locked:
