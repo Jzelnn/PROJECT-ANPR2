@@ -2488,9 +2488,10 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         trk.lifecycle_state = "EXITING"
                         print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
 
-            # Primary Track Switching Tracking
+            # Primary Track Switching Tracking: prioritaskan mobil yang sedang ANALYZING (mobil antre baru), baru kemudian mobil yang sudah CONFIRMED
             active_candidates = [d for d in updated_detections if d.get("inside_interest_area") and not d.get("lost_interest") and d.get("status") != "OUTSIDE_ROI"]
-            new_primary_id = active_candidates[0].get("track_id") if active_candidates else None
+            unconfirmed = [d for d in active_candidates if d.get("status") == "ANALYZING"]
+            new_primary_id = (unconfirmed[0].get("track_id") if unconfirmed else (active_candidates[0].get("track_id") if active_candidates else None))
             if new_primary_id != self.primary_track_id:
                 print(f"[PRIMARY_SWITCH]\nold_track_id={self.primary_track_id}\nnew_track_id={new_primary_id}", flush=True)
                 self.primary_track_id = new_primary_id
@@ -2503,8 +2504,8 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
     try:
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or track.cached_body_style:
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_CACHED", flush=True)
                 return
 
         vehicle_type, body_style, body_style_conf = classify_vehicle_indonesian(
@@ -2550,8 +2551,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
     try:
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or track.is_locked or track.status in ('CONFIRMED', 'HISTORY_SAVED'):
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_LOCKED", flush=True)
                 return
 
         vx1, vy1, vx2, vy2 = v_bbox
@@ -2713,8 +2714,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
     try:
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
-                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
+            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or track.is_locked or track.status in ('CONFIRMED', 'HISTORY_SAVED'):
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_LOCKED", flush=True)
                 return
 
         # Simpan debug crop untuk evaluasi visual
@@ -2926,8 +2927,18 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 scored_candidates.append(c)
 
         # PRIORITAS TINGGI: Kendaraan yang berada DI DALAM AREA DETEKTOR selalu di urutan terdepan (index 0)!
-        # Jika ada beberapa kendaraan di ROI, prioritaskan yang paling depan/dekat ke palang gate
-        scored_candidates.sort(key=lambda c: (-int(c.get("_inside_roi", False)), -c.get("front_score", 0.0)))
+        # Prioritaskan kendaraan yang belum terkonfirmasi (mobil antre baru), lalu yang paling depan,
+        # sehingga Mobil B langsung dianalisis seketika tanpa menunggu Mobil A meninggalkan frame.
+        def _cand_sort_key(c):
+            t_id = c.get("track_id")
+            trk = confirmation_manager.tracks.get(t_id) if t_id else None
+            is_done = bool(trk and (trk.is_locked or trk.status in ("CONFIRMED", "HISTORY_SAVED")))
+            inside = -int(c.get("_inside_roi", False))
+            done_pri = 1 if is_done else 0
+            f_score = -c.get("front_score", 0.0)
+            return (inside, done_pri, f_score)
+
+        scored_candidates.sort(key=_cand_sort_key)
 
         if single_vehicle_mode and not is_stream:
             candidates = [scored_candidates[0]] if scored_candidates else []

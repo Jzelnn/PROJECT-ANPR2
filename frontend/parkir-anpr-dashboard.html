@@ -1480,8 +1480,9 @@ function handleDetectionResult(data, silent=false){
 
   let activeDet = null;
   if (data.detections && data.detections.length > 0){
-    // Prioritaskan kendaraan yang sedang AKTIF di dalam Detection Area (ROI)
-    activeDet = data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI');
+    // Prioritaskan kendaraan yang sedang di-ANALYZING (mobil antre baru di ROI), baru mobil yang sudah CONFIRMED
+    const unconfirmed = data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status === 'ANALYZING');
+    activeDet = unconfirmed || data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI');
   }
 
   if (activeDet){
@@ -1491,6 +1492,7 @@ function handleDetectionResult(data, silent=false){
     if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
       clearBoxes();
+      lastDetectionData = null; // Reset total data mobil sebelumnya agar tidak bocor ke mobil baru
     } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
       // Retain plate & OCR knowledge across fast detection frames for the SAME track
       if (!activeDet.plate_bbox && lastDetectionData.plate_bbox) {
@@ -2473,13 +2475,7 @@ function handleWsMessage(msg){
     updateAiIndicator(true, "AI ACTIVE (WS)");
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
-    if (!lastDetectionData) return;
-    // Accept if matching track, matching last active track, or if current active track has no plate bbox yet
-    const isMatchingTrack = (lastDetectionData.track_id === msg.track_id) || (lastActiveTrackId === msg.track_id);
-    if (!isMatchingTrack && lastDetectionData.plate_bbox) {
-      console.log(`[STALE_RESULT_DISCARDED] type=plate msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
-      return;
-    }
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
     lastDetectionData.plate_bbox = msg.plate_bbox;
     lastDetectionData.plate_confidence = msg.plate_confidence;
     lastDetectionData.plate_detected = true;
@@ -2488,12 +2484,7 @@ function handleWsMessage(msg){
     drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
-    if (!lastDetectionData) return;
-    const isMatchingTrack = (lastDetectionData.track_id === msg.track_id) || (lastActiveTrackId === msg.track_id);
-    if (!isMatchingTrack && lastDetectionData.license_plate) {
-      console.log(`[STALE_RESULT_DISCARDED] type=ocr msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
-      return;
-    }
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
     lastDetectionData.ocr_text = msg.license_plate;
     lastDetectionData.license_plate = msg.license_plate;
     lastDetectionData.ocr_confidence = msg.ocr_confidence;
@@ -2508,8 +2499,7 @@ function handleWsMessage(msg){
     }
   } else if (msg.type === "body_update"){
     // STALE ASYNC BODY RESULT PROTECTION:
-    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
-      console.log(`[STALE_RESULT_DISCARDED] type=body msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id){
       return;
     }
     lastDetectionData.vehicle_type = msg.vehicle_type || lastDetectionData.vehicle_type;
