@@ -110,13 +110,27 @@ def test_plate_refinement():
     # Check that '225 BK' is not converted to 'Z 225 BK'
     res = refine_indonesian_plate("225 BK")
     print(f"refine_indonesian_plate('225 BK') -> '{res}'")
-    assert "Z 225 BK" not in res, f"Expected no 'Z' prefix hallucination, got {res}"
+    assert "Z 225 BK" not in res and res == "", f"Expected empty / no 'Z' prefix hallucination, got '{res}'"
     
     # Check standard plate
     res_b = refine_indonesian_plate("B 1958 RZH")
     print(f"refine_indonesian_plate('B 1958 RZH') -> '{res_b}'")
     assert res_b == "B 1958 RZH", f"Expected B 1958 RZH, got {res_b}"
-    print("[PASS] refine_indonesian_plate verified successfully!")
+    
+    # Check smart disambiguation & partition search cases
+    cases = [
+        ("B14S2HOS", "B 1452 HOS"),
+        ("B141300F", "B 1413 OOF"),
+        ("B2437BR5", "B 2437 BRS"),
+        ("DK1234AB", "DK 1234 AB"),
+        ("82489PZH", "B 2489 PZH"),
+        ("B 2049 88K", "B 2049 BBK"),
+    ]
+    for inp, expected in cases:
+        out = refine_indonesian_plate(inp)
+        print(f"refine_indonesian_plate('{inp}') -> '{out}'")
+        assert out == expected, f"Failed for '{inp}': expected '{expected}', got '{out}'"
+    print("[PASS] refine_indonesian_plate verified successfully with all disambiguation cases!")
 
 def test_track_isolation():
     print("Testing track lifecycle & isolation...")

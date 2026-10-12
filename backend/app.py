@@ -912,16 +912,21 @@ def is_tax_date(text):
     """Mendeteksi tanggal pajak / bulan-tahun pada plat nomor (e.g. '09-25', '02.28', '11.44', '1328')"""
     if not text:
         return False
-    raw = str(text).strip()
+    raw = str(text).strip().upper()
+    # Plat nomor kendaraan mengandung huruf prefix & suffix; tanggal pajak tidak memiliki >= 2 huruf
+    letters = re.findall(r'[A-Z]', raw)
+    if len(letters) >= 2 or len(raw) > 7:
+        return False
+
     clean = re.sub(r'[^0-9\.\-]', '', raw)
     if re.match(r'^(0[1-9]|1[0-2])[\.\-](2[0-9]|3[0-9])$', clean):
         return True
-    if len(clean) == 4 and clean.isdigit():
+    if len(clean) == 4 and clean.isdigit() and len(re.sub(r'[^0-9]', '', raw)) == len(raw):
         mm = int(clean[:2])
         yy = int(clean[2:])
         if 1 <= mm <= 12 and 20 <= yy <= 39:
             return True
-    if re.match(r'^[A-Z0-9]{2}[\.\-][0-9]{2}$', raw.upper()):
+    if re.match(r'^[0-9]{2}[\.\-][0-9]{2}$', raw):
         return True
     return False
 
@@ -1160,28 +1165,57 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
 
 
 def read_plate_with_paddleocr(plate_crop):
-    """Membaca teks plat nomor menggunakan PaddleOCR dengan penanganan multi-token & eliminasi tanggal pajak."""
+    """
+    Membaca teks plat nomor menggunakan PaddleOCR dengan:
+    1. Normalisasi ukuran cerdas (height ~64px optimal untuk model recognition).
+    2. Multi-pass adaptive visual enhancement (inverse untuk plat hitam dan CLAHE untuk kontras bayangan).
+    3. Eliminasi tanggal pajak dan penyusunan multi-token.
+    """
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
         return "", 0.0, []
 
-    if h < 45:
-        scale = 60.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 60), interpolation=cv2.INTER_LINEAR)
-    elif h > 140:
-        scale = 90.0 / h
-        proc_crop = cv2.resize(plate_crop, (int(w * scale), 90), interpolation=cv2.INTER_AREA)
-    else:
-        proc_crop = plate_crop
+    target_h = 64
+    scale = target_h / float(h)
+    proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_LINEAR if h < 64 else cv2.INTER_AREA)
 
     items = paddle_engine.run(proc_crop)
-    if not items:
+
+    # Cek apakah hasil awal sudah menghasilkan plat nomor valid
+    has_valid_init = False
+    if items:
+        for it in items:
+            t = str(it.get("text", "")).strip()
+            if not is_tax_date(t):
+                p_test = refine_indonesian_plate("", t)
+                if p_test and is_valid_indonesian_plate_structure(p_test)[0]:
+                    has_valid_init = True
+                    break
+
+    # Jika belum ada plat valid, lakukan multi-pass visual enhancement
+    if not has_valid_init:
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
-        if float(gray.mean()) < 90.0:
+        mean_brightness = float(gray.mean())
+
+        # Pass 2: Inverted image (sangat efektif untuk plat hitam huruf putih Indonesia)
+        if mean_brightness < 130.0:
             inv = cv2.bitwise_not(proc_crop)
-            items = paddle_engine.run(inv)
+            inv_items = paddle_engine.run(inv)
+            if inv_items:
+                items.extend(inv_items)
+
+        # Pass 3: CLAHE contrast enhancement (efektif untuk bayangan dan silau)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l2 = clahe.apply(l)
+        enhanced = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
+        clahe_items = paddle_engine.run(enhanced)
+        if clahe_items:
+            items.extend(clahe_items)
 
     non_date_items = []
+    seen_texts = set()
     for item in items:
         text = str(item.get("text", "")).strip()
         conf = float(item.get("conf", 0.0) or 0.0)
@@ -1189,7 +1223,9 @@ def read_plate_with_paddleocr(plate_crop):
             continue
         if is_tax_date(text):
             continue
-        non_date_items.append((text, conf))
+        if text not in seen_texts:
+            non_date_items.append((text, conf))
+            seen_texts.add(text)
 
     if not non_date_items:
         return "", 0.0, []
@@ -1204,6 +1240,8 @@ def read_plate_with_paddleocr(plate_crop):
         joined = " ".join([t for t, _ in non_date_items])
         avg_c = float(np.mean([c for _, c in non_date_items]))
         candidates.append((joined, avg_c))
+        joined_no_space = "".join([t for t, _ in non_date_items])
+        candidates.append((joined_no_space, avg_c))
 
     valid_cand = []
     for t, c in candidates:
@@ -1223,7 +1261,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     """
     Menyelaraskan hasil pembacaan plat nomor sesuai regulasi Korlantas Polri Indonesia:
     1. Kode Wilayah (Prefix): 1-2 Huruf (dicocokkan dengan SAMSAT_PREFIXES)
-    2. Nomor Polisi (Digits): 1-4 Angka
+    2. Nomor Polisi (Digits): 1-4 Angka (dengan disambiguasi cerdas berbasis penalti)
     3. Seri Akhir (Suffix): 1-3 Huruf (Tanpa huruf 'Q')
     Disambiguasi akurat tanpa halusinasi dari string numerik murni.
     """
@@ -1240,50 +1278,64 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 3 <= len(parts[0]) <= 5 and len(parts[1]) == 2:
                 return f"{parts[0]}-{parts[1]}"
 
-    pref_map = {'8': 'B'}
-    suff_map = {'8': 'B', '0': 'O', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A', '6': 'G'}
-    digit_map = {'O': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8', 'Q': '0'}
+    pref_map = {'8': 'B', '13': 'B', '0': 'D', '6': 'G'}
+    suff_map = {'8': 'B', '0': 'O', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A', '6': 'G', '7': 'Z', '9': 'P'}
+    digit_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8'}
 
     def _parse_candidate_text(raw_text):
         if not raw_text or is_tax_date(raw_text):
             return ""
         raw = str(raw_text).strip().upper()
 
-        # A. 3 Token Terpisah (misal "B" "2175" "BJH" atau "B" "2049" "88K")
         tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', raw).split() if t]
-        if len(tokens) == 3:
-            p_raw, d_raw, s_raw = tokens[0], tokens[1], tokens[2]
-            p_tok = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_raw])
-            d_tok = ''.join([ch if ch.isdigit() else digit_map.get(ch, '') for ch in d_raw])
-            if any(ch.isalpha() for ch in s_raw):
-                s_tok = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_raw])
-                s_tok = re.sub(r'[^A-Z]', '', s_tok)
-                if p_tok in SAMSAT_PREFIXES and 1 <= len(d_tok) <= 4 and d_tok.isdigit() and 1 <= len(s_tok) <= 3 and s_tok.isalpha():
-                    return f"{p_tok} {d_tok} {s_tok}"
 
-        # B. Teks Gabungan (misal "B2175BJH", "82489PZH", "W6035DK", "B9301TBD")
+        # A. 3 Token Terpisah (misal "B" "2175" "BJH" atau "B" "2049" "88K")
+        if len(tokens) == 3:
+            p_tok, d_tok, s_tok = tokens[0], tokens[1], tokens[2]
+            p_cand = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_tok])
+            d_cand = ''.join([digit_map.get(ch, ch) if not ch.isdigit() else ch for ch in d_tok])
+            s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_tok])
+            if p_cand in SAMSAT_PREFIXES and d_cand.isdigit() and 1 <= len(d_cand) <= 4 and s_cand.isalpha() and 1 <= len(s_cand) <= 3 and 'Q' not in s_cand:
+                return f"{p_cand} {d_cand} {s_cand}"
+
+        # B. Teks Gabungan / Partisi Otomatis (misal "B2175BJH", "82489PZH", "B14S2HOS", "DK1234AB")
         clean = re.sub(r'[^A-Z0-9]', '', raw)
         if not clean or len(clean) < 4:
             return ""
 
-        if clean[0] == '8' and len(clean) >= 5 and (clean[1].isdigit() or clean[1] == 'B'):
+        if clean.startswith('8') and len(clean) >= 5 and (clean[1].isdigit() or clean[1] == 'B'):
             clean = 'B' + clean[1:]
 
+        scored_candidates = []
         for p_len in [2, 1]:
             if len(clean) >= p_len + 2:
-                p_cand = clean[:p_len]
-                p_cand_clean = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_cand])
-                if p_cand_clean in SAMSAT_PREFIXES:
-                    rem = clean[p_len:]
-                    m = re.match(r'^(\d{1,4})([A-Z0-9]{1,3})$', rem)
-                    if m:
-                        d_cand = m.group(1)
-                        s_raw = m.group(2)
-                        if any(ch.isalpha() for ch in s_raw):
-                            s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_raw])
-                            s_cand = re.sub(r'[^A-Z]', '', s_cand)
-                            if 1 <= len(s_cand) <= 3 and s_cand.isalpha():
-                                return f"{p_cand_clean} {d_cand} {s_cand}"
+                p_sub = clean[:p_len]
+                p_cand = pref_map.get(p_sub, p_sub)
+                if p_cand not in SAMSAT_PREFIXES:
+                    continue
+                rem = clean[p_len:]
+                n = len(rem)
+                if n < 2 or n > 7:
+                    continue
+
+                for d_len in range(max(1, n - 3), min(5, n)):
+                    s_len = n - d_len
+                    if not (1 <= s_len <= 3):
+                        continue
+                    d_raw = rem[:d_len]
+                    s_raw = rem[d_len:]
+
+                    penalty = sum(1 for ch in d_raw if not ch.isdigit()) + sum(1 for ch in s_raw if not ch.isalpha())
+                    d_mapped = ''.join([digit_map.get(ch, ch) for ch in d_raw])
+                    s_mapped = ''.join([suff_map.get(ch, ch) for ch in s_raw])
+
+                    if d_mapped.isdigit() and s_mapped.isalpha() and 'Q' not in s_mapped:
+                        len_pref = 0 if 2 <= len(d_mapped) <= 4 else 1
+                        scored_candidates.append((penalty, len_pref, f"{p_cand} {d_mapped} {s_mapped}"))
+
+        if scored_candidates:
+            scored_candidates.sort(key=lambda x: (x[0], x[1]))
+            return scored_candidates[0][2]
 
         return ""
 
@@ -1295,6 +1347,14 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             candidates_to_try.append(ext)
     if c_raw and c_raw not in candidates_to_try and not is_tax_date(c_raw):
         candidates_to_try.append(c_raw)
+
+    if len(all_paddle_texts) > 1:
+        j_space = " ".join([str(x).strip() for x in all_paddle_texts if x and not is_tax_date(x)])
+        if j_space and j_space not in candidates_to_try:
+            candidates_to_try.append(j_space)
+        j_nospace = "".join([str(x).strip() for x in all_paddle_texts if x and not is_tax_date(x)])
+        if j_nospace and j_nospace not in candidates_to_try:
+            candidates_to_try.append(j_nospace)
 
     for cand in candidates_to_try:
         parsed = _parse_candidate_text(cand)
