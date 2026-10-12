@@ -2164,29 +2164,52 @@ function addLogRow(det, isInit=false){
     placeholder.remove();
   }
 
-  // Cek apakah entri untuk track ini atau plat ini sudah ada di daftar
-  const existingByTrack = det.track_id ? logList.querySelector(`.log-row[data-track-id="${det.track_id}"]`) : null;
-  const existingByPlate = plateText ? logList.querySelector(`.log-row[data-plate="${plateText}"]`) : null;
-  const existing = existingByTrack || existingByPlate;
+  // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList
+  if (det.id && logList.querySelector(`.log-row[data-id="${det.id}"]`)) return;
+  if (det.snapshot_url && logList.querySelector(`.log-row[data-snapshot="${det.snapshot_url}"]`)) return;
 
-  if (existing && !isInit) {
-    // Perbarui entri jika nomor plat atau tipe bodi lebih lengkap
-    const plateEl = existing.querySelector('.log-plate');
-    if (plateEl && (plateEl.textContent.includes('-') || !plateEl.textContent.includes(plateText))) {
-      const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';
-      plateEl.innerHTML = `${trackPrefix}${plateText}`;
+  // 2. Cek apakah baris teratas (paling baru) mewakili kendaraan/track aktif yang baru saja masuk (< 15 detik)
+  // JANGAN cari ke seluruh riwayat lama, karena ByteTrack me-reuse track_id untuk mobil baru di sesi berikutnya!
+  const topRow = logList.firstElementChild;
+  if (topRow && topRow.classList && topRow.classList.contains('log-row') && !isInit) {
+    const topTrack = topRow.getAttribute('data-track-id');
+    const topPlate = topRow.getAttribute('data-plate');
+    const topTime = parseInt(topRow.getAttribute('data-created-epoch') || '0', 10);
+    const nowEpoch = Math.floor(Date.now() / 1000);
+
+    const isSameRecentTrack = (det.track_id && topTrack && String(topTrack) === String(det.track_id) && (nowEpoch - topTime < 15));
+    const isSameRecentPlate = (plateText && topPlate && topPlate === plateText && (nowEpoch - topTime < 15));
+
+    if (isSameRecentTrack || isSameRecentPlate) {
+      // Perbarui baris teratas jika nomor plat atau body style lebih lengkap
+      const plateEl = topRow.querySelector('.log-plate');
+      if (plateEl && (plateEl.textContent.includes('-') || !plateEl.textContent.includes(plateText))) {
+        const trackPrefix = det.track_id ? `<span style="font-weight:700; color:#2f6fed; margin-right:4px;">#${det.track_id}</span>` : '';
+        plateEl.innerHTML = `${trackPrefix}${plateText}`;
+        topRow.setAttribute('data-plate', plateText);
+      }
+      if (det.id) topRow.setAttribute('data-id', det.id);
+      if (det.snapshot_url) {
+        topRow.setAttribute('data-snapshot', det.snapshot_url);
+        topRow.style.cursor = 'pointer';
+        topRow.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
+        topRow.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+      }
+      return;
     }
-    return;
   }
 
   const now = new Date();
   const timeStr = det.timestamp ? (det.timestamp.length >= 16 ? det.timestamp.slice(11, 16) : det.timestamp) : now.toTimeString().slice(0,5);
   const row = document.createElement('div');
   row.className = 'log-row';
+  if (det.id) row.setAttribute('data-id', det.id);
   if (det.track_id) row.setAttribute('data-track-id', det.track_id);
   row.setAttribute('data-plate', plateText);
+  row.setAttribute('data-created-epoch', Math.floor(Date.now() / 1000));
   
   if (det.snapshot_url) {
+    row.setAttribute('data-snapshot', det.snapshot_url);
     row.style.cursor = 'pointer';
     row.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
     row.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
@@ -2217,6 +2240,9 @@ function addLogRow(det, isInit=false){
     logList.appendChild(row);
   } else {
     logList.insertBefore(row, logList.firstChild);
+    while (logList.children.length > 100) {
+      logList.removeChild(logList.lastChild);
+    }
   }
 }
 
