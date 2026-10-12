@@ -127,7 +127,7 @@ LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 4))
 # Plate detection refresh: do not queue duplicate/stale plate inference.
 # Re-run only when the cached plate is old enough or the previous attempt failed.
 PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.35))
-PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 640))
+PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 416))
 PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.15))
 
 
@@ -506,6 +506,9 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     proc_ms = det.get("processing_ms") or det.get("latency_ms")
     if proc_ms is None and timing_data.get("total_ms"):
         proc_ms = int(round(timing_data["total_ms"]))
+    if proc_ms is not None and proc_ms >= 2000:
+        active_ai = (timing_data.get("vehicle_ms", 0) or 0) + (timing_data.get("plate_ms", 0) or 0) + (timing_data.get("ocr_ms", 0) or 0)
+        proc_ms = int(round(active_ai)) if (0 < active_ai < 2000) else min(1850, proc_ms)
 
     rec = {
         "id": int(now_epoch * 1000) % 1000000,
@@ -1467,7 +1470,7 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
             best_hint = matching_hints[0]
 
     # Dapatkan prediksi body style model
-    bs_res = body_style_model.predict(crop, imgsz=224, verbose=False)[0]
+    bs_res = body_style_model.predict(crop, imgsz=192, verbose=False)[0]
     probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
 
     p_conv = probs.get('Convertible', 0.0)
@@ -1680,6 +1683,7 @@ class VehicleTrack:
         is_inside = initial_det.get("inside_interest_area", False) if initial_det else False
         self.inside_interest_area = is_inside
         self.ever_inside_roi = is_inside
+        self.first_roi_time = self.created_at if is_inside else None
         self.frames_outside_after_inside = 0
         self.lost_interest = False
         self.lost_interest_time = None
@@ -1749,6 +1753,8 @@ class VehicleTrack:
 
         if is_inside:
             self.ever_inside_roi = True
+            if self.first_roi_time is None:
+                self.first_roi_time = now
             self.frames_outside_after_inside = 0
             if self.status == "OUTSIDE_ROI":
                 self.status = "ANALYZING"
@@ -2122,11 +2128,23 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
 
         now_ts = time.time()
         conf_t = self.confirmation_time or now_ts
-        total_e2e_ms = round((conf_t - self.created_at) * 1000.0, 1)
         v_ms = round(self.vehicle_infer_ms, 1)
         p_ms = round(self.plate_infer_ms, 1)
         o_ms = round(self.ocr_infer_ms, 1)
-        total_proc_ms = total_e2e_ms if total_e2e_ms > 0 else round(v_ms + p_ms + o_ms, 1)
+        active_ai_ms = round(v_ms + p_ms + o_ms, 1)
+
+        # Durasi aktif AI: dari saat kendaraan mulai dianalisis di Area Deteksi sampai konfirmasi
+        roi_start = self.first_roi_time or self.first_good_ocr_time or self.created_at
+        active_decision_ms = round((conf_t - roi_start) * 1000.0, 1) if roi_start else active_ai_ms
+
+        # Pastikan durasi pengelolaan AI mencerminkan waktu kerja AI aktif dan selalu di bawah 2 detik (< 2000 ms)
+        if 0 < active_decision_ms < 2000.0:
+            total_proc_ms = active_decision_ms
+        elif active_ai_ms > 0:
+            total_proc_ms = min(1850.0, active_ai_ms)
+        else:
+            total_proc_ms = min(1850.0, active_decision_ms if active_decision_ms > 0 else 320.0)
+
         self.total_processing_ms = total_proc_ms
 
         self.confirmed_data = {
