@@ -160,8 +160,8 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
         cy = (float(y1) + float(y2)) / 2.0
         center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
 
-        # Aktif seketika jika center masuk atau minimal 15% bodi menyentuh area deteksi
-        if center_in or overlap_ratio >= 0.15:
+        # Aktif seketika begitu bagian depan / bumper kendaraan menyentuh area deteksi
+        if center_in or overlap_ratio >= 0.04 or inter_area >= 600:
             return True, overlap_ratio
 
     return False, 0.0
@@ -2029,12 +2029,14 @@ class VehicleConfirmationManager:
     def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080, frame_id=None):
         """Ambil atau buat track sebelum plate/OCR agar job asinkron tidak kehilangan target."""
         with self.lock:
-            if raw_tid is not None:
+            if raw_tid is not None and raw_tid in self.tracks:
                 tid = raw_tid
             else:
                 matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h)
                 if matched_id is not None:
                     tid = matched_id
+                elif raw_tid is not None:
+                    tid = raw_tid
                 else:
                     tid = self.next_fallback_id
                     self.next_fallback_id += 1

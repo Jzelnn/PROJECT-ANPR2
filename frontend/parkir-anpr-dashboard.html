@@ -2416,9 +2416,10 @@ function handleWsMessage(msg){
     updateAiIndicator(true, "AI ACTIVE (WS)");
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
-    // STALE ASYNC RESULT PROTECTION:
-    // Validate that msg.track_id matches currently active track
-    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
+    if (!lastDetectionData) return;
+    // Accept if matching track, matching last active track, or if current active track has no plate bbox yet
+    const isMatchingTrack = (lastDetectionData.track_id === msg.track_id) || (lastActiveTrackId === msg.track_id);
+    if (!isMatchingTrack && lastDetectionData.plate_bbox) {
       console.log(`[STALE_RESULT_DISCARDED] type=plate msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
       return;
     }
@@ -2427,12 +2428,12 @@ function handleWsMessage(msg){
     lastDetectionData.plate_detected = true;
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
-    drawPlateBoxOnly(lastDetectionData);
+    drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
-    // STALE ASYNC OCR RESULT PROTECTION:
-    // Validate that msg.track_id matches currently active track
-    if (!lastDetectionData || lastDetectionData.track_id !== msg.track_id || lastActiveTrackId !== msg.track_id){
+    if (!lastDetectionData) return;
+    const isMatchingTrack = (lastDetectionData.track_id === msg.track_id) || (lastActiveTrackId === msg.track_id);
+    if (!isMatchingTrack && lastDetectionData.license_plate) {
       console.log(`[STALE_RESULT_DISCARDED] type=ocr msg_track=${msg.track_id} active_track=${lastActiveTrackId}`);
       return;
     }
