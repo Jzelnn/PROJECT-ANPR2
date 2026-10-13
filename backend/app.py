@@ -1778,6 +1778,7 @@ class VehicleTrack:
 
         # Performance Breakdown Timings (ms)
         self.vehicle_infer_ms = 0.0
+        self.vehicle_lock_wait_ms = 0.0
         self.plate_infer_ms = 0.0
         self.ocr_infer_ms = 0.0
         self.total_processing_ms = 0.0
@@ -3122,16 +3123,22 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo_0 = time.time()
     print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
     infer_conf = min(v_conf_thresh, m_conf_thresh)
+    t_lock_start = time.time()
     with vehicle_infer_lock:
+        t_pure_start = time.time()
+        lock_wait_ms = (t_pure_start - t_lock_start) * 1000.0
         if is_stream:
             vdet = vehicle_model.track(img, persist=True, tracker="bytetrack.yaml",
                                        conf=infer_conf, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
         else:
             vdet = vehicle_model.predict(img, conf=infer_conf,
                                          imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+        t_pure_end = time.time()
+        pure_infer_ms = (t_pure_end - t_pure_start) * 1000.0
     t_yolo_end = time.time()
     t_yolo = t_yolo_end - t_yolo_0
-    print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo*1000:.1f}", flush=True)
+    t_yolo_duration_ms = t_yolo * 1000.0
+    print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
     # 2. EKSTRAKSI KANDIDAT KENDARAAN
     candidates = []
@@ -3258,9 +3265,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 cand_track_id, [x1, y1, x2, y2], img_w=iw, img_h=ih, frame_id=frame_id
             )
             cand_track_id = tid
-            t_yolo_ms = (t_yolo_end - t_yolo_0) * 1000.0
-            existing_trk.vehicle_infer_ms = t_yolo_ms
-            print(f"[PERF_VEHICLE] frame_id={frame_id} track_id={tid} duration_ms={t_yolo_ms:.1f}", flush=True)
+            existing_trk.vehicle_infer_ms = pure_infer_ms
+            existing_trk.vehicle_lock_wait_ms = lock_wait_ms
+            print(f"[PERF_VEHICLE] frame_id={frame_id} track_id={tid} duration_ms={t_yolo_duration_ms:.1f} infer_ms={pure_infer_ms:.1f} lock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
             # Cek apakah ada deteksi 'bus' di area kendaraan ini
             has_bus_det = any(
@@ -3524,6 +3531,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "raw_base64_image": raw_b64,
         "perf_breakdown": {
             "yolo_ms": round(t_yolo * 1000, 1),
+            "yolo_infer_ms": round(pure_infer_ms, 1),
+            "yolo_lock_wait_ms": round(lock_wait_ms, 1),
             "track_ms": round(t_track * 1000, 1),
             "body_ms": round(t_body_total * 1000, 1),
             "ocr_ms": round(t_ocr_total * 1000, 1),
