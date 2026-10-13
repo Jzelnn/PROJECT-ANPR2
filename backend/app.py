@@ -1775,6 +1775,7 @@ class VehicleTrack:
         self.ocr_pending = False
         self.pending_ocr_job = None      # (job_id, track_id, plate_crop, crop_q, full_img, submit_time, frame_id, capture_ts)
         self.body_pending = False
+        self.pending_body_data = None
         self.last_ocr_job_id = 0
         self.last_processed_ocr_job_id = 0
         self.last_ocr_text = None
@@ -2642,6 +2643,32 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
             return updated_detections
 
 
+def trigger_deferred_body_task(trk):
+    """Memicu inferensi tipe bodi tertunda saat kendaraan terkonfirmasi atau keluar ROI."""
+    if not trk:
+        return
+    with confirmation_manager.lock:
+        if trk.cached_body_style or trk.body_pending:
+            return
+        bdata = getattr(trk, 'pending_body_data', None)
+        if not bdata:
+            return
+        trk.body_pending = True
+        body_executor.submit(
+            _async_body_task,
+            trk.track_id,
+            bdata["full_img"],
+            bdata["bbox"],
+            bdata["initial_vtype"],
+            bdata["v_conf"],
+            bdata["has_bus_det"],
+            bdata["body_hints"],
+            bdata["frame_id"],
+            bdata["capture_timestamp"],
+            time.time()
+        )
+
+
 def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_det, body_hints, frame_id=None, capture_timestamp=None, submit_time=None):
     """Worker task untuk asynchronous vehicle body classification di background thread pool."""
     t_body_start = time.time()
@@ -2661,8 +2688,8 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
                     return
             busy = bool(track and (track.plate_pending or track.ocr_pending))
 
-        # Prioritaskan deteksi plat nomor dan OCR terlebih dahulu (maks 1.5 detik)
-        if busy:
+        # Prioritaskan deteksi plat nomor dan OCR terlebih dahulu jika kendaraan belum terkonfirmasi
+        if busy and not is_confirmed_trk:
             for _ in range(30):
                 time.sleep(0.05)
                 with confirmation_manager.lock:
@@ -3044,6 +3071,10 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
 
         if is_newly_confirmed and confirmed_data:
             rec = save_parking_record(confirmed_data, source_img=full_img)
+            with confirmation_manager.lock:
+                trk = confirmation_manager.tracks.get(track_id)
+                if trk:
+                    trigger_deferred_body_task(trk)
     except Exception as e:
         print(f"[ASYNC OCR ERROR] Track {track_id} job {job_id}: {e}")
     finally:
@@ -3375,9 +3406,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             )
 
                 if not existing_trk.cached_body_style and not existing_trk.body_pending and not existing_trk.lost_interest:
-                    existing_trk.body_pending = True
-                    body_executor.submit(_async_body_task, cand_track_id, img.copy(), [x1, y1, x2, y2],
-                                         initial_vtype, v_conf, has_bus_det, body_hints, frame_id, capture_timestamp, time.time())
+                    # Defer body classification ke saat konfirmasi plat atau track exit agar tidak bersaing CPU dengan OCR
+                    existing_trk.pending_body_data = {
+                        "full_img": img.copy(),
+                        "bbox": [x1, y1, x2, y2],
+                        "initial_vtype": initial_vtype,
+                        "v_conf": v_conf,
+                        "has_bus_det": has_bus_det,
+                        "body_hints": body_hints,
+                        "frame_id": frame_id,
+                        "capture_timestamp": capture_timestamp
+                    }
+                    if existing_trk.is_locked or existing_trk.status in ("CONFIRMED", "HISTORY_SAVED"):
+                        trigger_deferred_body_task(existing_trk)
 
                 vehicle_type = existing_trk.cached_vtype or initial_vtype
                 body_style = existing_trk.cached_body_style
@@ -3639,6 +3680,7 @@ class StreamInferenceWorker:
                         rec = save_parking_record(trk.confirmed_data, source_img=frame)
                         trk.history_saved = True
                         trk.status = "HISTORY_SAVED"
+                    trigger_deferred_body_task(trk)
 
                 detections = result.get("detections", [])
                 det_ids = [d.get("track_id") for d in detections if d.get("track_id") is not None]
@@ -3758,6 +3800,7 @@ def live_ws(ws):
                                         rec = save_parking_record(trk.confirmed_data, source_img=frame)
                                         trk.history_saved = True
                                         trk.status = "HISTORY_SAVED"
+                                    trigger_deferred_body_task(trk)
 
                                 detections = res.get("detections", [])
                                 det_ids = [d.get("track_id") for d in detections if d.get("track_id") is not None]
