@@ -2981,6 +2981,7 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
     print(f"[OCR_START]\ntrack_id={track_id}\nframe_id={frame_id}\nqueue_wait_ms={queue_wait_ms:.1f}", flush=True)
     try:
         with confirmation_manager.lock:
+            track = confirmation_manager.tracks.get(track_id)
             is_dead = (
                 not track or
                 getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or
