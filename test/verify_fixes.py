@@ -195,10 +195,112 @@ def test_plate_bbox_in_snapshot():
     assert dummy_det.get("plate_bbox") == [180, 250, 320, 300], f"Expected save_parking_record to populate plate_bbox, got {dummy_det.get('plate_bbox')}"
     print("[PASS] Plate bbox resolution in snapshot verified successfully!")
 
+def test_plate_bbox_projection_and_stale_rejection():
+    print("Testing plate_bbox relative projection and stale frame_id rejection...")
+    from app import VehicleTrack
+
+    trk = VehicleTrack(77)
+    trk.last_bbox = [267, 163, 660, 484]
+    # 1. Before any plate detection, get_current_plate_bbox returns None
+    assert trk.get_current_plate_bbox([267, 163, 660, 484]) is None
+
+    # 2. Plate detected on frame 14: [477, 377, 561, 422] inside vehicle [267, 163, 660, 484]
+    ok14 = trk.update_plate_bbox([477, 377, 561, 422], [267, 163, 660, 484], frame_id=14)
+    assert ok14 is True
+    assert trk.last_plate_frame_id == 14
+    assert trk.rel_plate_bbox is not None
+
+    # 3. Vehicle moves forward on frame 16 to [280, 164, 709, 517]
+    proj16 = trk.get_current_plate_bbox([280, 164, 709, 517])
+    assert proj16 is not None
+    # Since vehicle moved right (+13..+49 px) and down (+1..+33 px), projected plate must move right and down too!
+    assert proj16[0] > 477 and proj16[1] > 377, f"Expected projected plate to follow vehicle movement, got {proj16}"
+
+    # 4. Newer plate detection on frame 16 updates the track
+    ok16 = trk.update_plate_bbox([505, 412, 598, 460], [280, 164, 709, 517], frame_id=16)
+    assert ok16 is True
+    assert trk.last_plate_frame_id == 16
+
+    # 5. Late/stale plate detection from frame 15 arrives out-of-order -> MUST BE REJECTED
+    ok15_stale = trk.update_plate_bbox([497, 405, 591, 455], [279, 167, 695, 508], frame_id=15)
+    assert ok15_stale is False, "Expected stale frame 15 plate update to be rejected after frame 16"
+    assert trk.last_plate_frame_id == 16
+    assert trk.last_plate_bbox == [505, 412, 598, 460], "Stale frame 15 overwrote frame 16 plate_bbox!"
+
+    # 6. Fallback when rel_plate_bbox is None -> returns last_plate_bbox without inventing position
+    trk.rel_plate_bbox = None
+    assert trk.get_current_plate_bbox([300, 180, 720, 530]) == [505, 412, 598, 460]
+    print("[PASS] Plate bbox relative projection and stale frame_id rejection verified successfully!")
+
+def test_entry_history_body_style_flow():
+    print("Testing Entry History body_style flow (pending state & async body_update resolution)...")
+    from app import confirmation_manager, save_parking_record, _async_body_task, LATEST_RECORDS, ws_broadcaster
+
+    class MockWS:
+        def __init__(self):
+            self.messages = []
+        def send(self, data):
+            self.messages.append(json.loads(data))
+
+    mock_ws = MockWS()
+    ws_broadcaster.register(mock_ws)
+    try:
+        tid, trk = confirmation_manager.get_or_create_track(55, [267, 163, 660, 484], 1280, 674, frame_id=14)
+        trk.body_pending = True
+        trk.last_plate_bbox = [477, 377, 561, 422]
+        trk.add_frame({
+            "frame_id": 14,
+            "vehicle_type": "car",
+            "vehicle_confidence": 0.94,
+            "body_style": None,
+            "body_style_confidence": 0.0,
+            "bbox": [267, 163, 660, 484],
+            "plate_bbox": [477, 377, 561, 422],
+            "inside_interest_area": True
+        })
+        # 1. Confirm plate BEFORE async body task finishes
+        trk._finalize_confirmation("G 2360 GRS", 0.88, 1, reason="FAST_STRONG_STRUCTURE")
+        assert trk.confirmed_data["body_style"] is None
+        assert trk.confirmed_data["body_pending"] is True
+
+        dummy_img = np.zeros((674, 1280, 3), dtype=np.uint8)
+        rec = save_parking_record(dict(trk.confirmed_data), source_img=dummy_img)
+        assert rec is not None
+        assert rec["body_style"] is None
+        assert rec["body_pending"] is True
+
+        # 2. Simulate track starting to exit ROI before _async_body_task finishes
+        trk.lifecycle_state = "EXITING"
+
+        # 3. Run _async_body_task with a strong Sedan hint -> must update confirmed_data, LATEST_RECORDS, and broadcast body_update with record_id
+        _async_body_task(
+            55, dummy_img, [267, 163, 660, 484], "car", 0.94, False,
+            body_hints=[{"name": "Sedan", "conf": 0.91, "box": [267, 163, 660, 484]}],
+            frame_id=14, submit_time=time.time()
+        )
+        assert trk.cached_body_style == "Sedan", f"Expected Sedan, got {trk.cached_body_style}"
+        assert trk.confirmed_data["body_style"] == "Sedan", f"Expected confirmed_data body_style='Sedan', got {trk.confirmed_data['body_style']}"
+        assert trk.confirmed_data["body_pending"] is False
+
+        saved_rec = next((r for r in LATEST_RECORDS if r.get("id") == rec["id"]), None)
+        assert saved_rec is not None
+        assert saved_rec["body_style"] == "Sedan", f"Expected LATEST_RECORDS body_style='Sedan', got {saved_rec['body_style']}"
+        assert saved_rec["body_pending"] is False
+
+        body_msgs = [m for m in mock_ws.messages if m.get("type") == "body_update" and m.get("track_id") == 55]
+        assert len(body_msgs) == 1, f"Expected 1 body_update WS message, got {len(body_msgs)}"
+        assert body_msgs[0]["body_style"] == "Sedan"
+        assert body_msgs[0]["record_id"] == rec["id"]
+        print("[PASS] Entry History body_style flow verified successfully!")
+    finally:
+        ws_broadcaster.unregister(mock_ws)
+
 if __name__ == "__main__":
     test_annotated_image()
     test_websocket_thread_safety()
     test_plate_refinement()
     test_track_isolation()
     test_plate_bbox_in_snapshot()
+    test_plate_bbox_projection_and_stale_rejection()
+    test_entry_history_body_style_flow()
     print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")
