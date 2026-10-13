@@ -2459,7 +2459,8 @@ class VehicleConfirmationManager:
                     print(f"[PRIMARY_SWITCH]\nold_track_id={self.primary_track_id}\nnew_track_id=None", flush=True)
                     self.primary_track_id = None
                 for tid, trk in self.tracks.items():
-                    if trk.lifecycle_state == "ACTIVE":
+                    trk.frames_missing = getattr(trk, 'frames_missing', 0) + 1
+                    if trk.frames_missing > 3 and trk.lifecycle_state == "ACTIVE":
                         trk.lifecycle_state = "EXITING"
                         print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
                 return []
@@ -2621,11 +2622,11 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                 det.pop("plate_crop", None)
                 updated_detections.append(det)
 
-            # Tandai track yang tidak terdeteksi di frame ini sebagai EXITING
+            # Tandai track yang tidak terdeteksi di frame ini sebagai EXITING hanya jika hilang > 3 frame berturut-turut (toleransi 1-frame tracking flicker)
             for tid, trk in self.tracks.items():
                 if tid not in visible_tids:
                     trk.frames_missing = getattr(trk, 'frames_missing', 0) + 1
-                    if trk.lifecycle_state == "ACTIVE":
+                    if trk.frames_missing > 3 and trk.lifecycle_state == "ACTIVE":
                         trk.lifecycle_state = "EXITING"
                         print(f"[TRACK_EXITING]\ntrack_id={tid}", flush=True)
 
@@ -2654,7 +2655,7 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
             if track and track.cached_body_style and not has_pending_rec:
                 return
             if track and not is_confirmed_trk and not has_pending_rec:
-                if getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+                if getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3):
                     print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_CACHED", flush=True)
                     return
             busy = bool(track and (track.plate_pending or track.ocr_pending))
@@ -2756,8 +2757,15 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
     print(f"[PLATE_INFER_START]\ntrack_id={track_id}\nframe_id={frame_id}\nqueue_wait_ms={queue_wait_ms:.1f}", flush=True)
     try:
         with confirmation_manager.lock:
-            track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or track.is_locked or track.status in ('CONFIRMED', 'HISTORY_SAVED'):
+            is_dead = (
+                not track or
+                getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or
+                track.lost_interest or
+                (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3) or
+                track.is_locked or
+                track.status in ('CONFIRMED', 'HISTORY_SAVED')
+            )
+            if is_dead:
                 print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_LOCKED", flush=True)
                 return
             attempt_count = track.plate_attempt_count
@@ -2919,7 +2927,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if track:
-                if track.is_locked or track.lost_interest or getattr(track, 'lifecycle_state', '') != 'ACTIVE':
+                is_dead = track.is_locked or track.lost_interest or getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3)
+                if is_dead:
                     track.pending_plate_frame = None
                     track.plate_pending = False
                 elif track.ocr_pending:
@@ -2943,8 +2952,15 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
     print(f"[OCR_START]\ntrack_id={track_id}\nframe_id={frame_id}\nqueue_wait_ms={queue_wait_ms:.1f}", flush=True)
     try:
         with confirmation_manager.lock:
-            track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest or track.is_locked or track.status in ('CONFIRMED', 'HISTORY_SAVED'):
+            is_dead = (
+                not track or
+                getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or
+                track.lost_interest or
+                (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3) or
+                track.is_locked or
+                track.status in ('CONFIRMED', 'HISTORY_SAVED')
+            )
+            if is_dead:
                 print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_LOCKED", flush=True)
                 return
 
@@ -2974,7 +2990,13 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
 
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
-            if not track or getattr(track, 'lifecycle_state', '') in ('EXITING', 'LOST', 'EXPIRED', 'DISCARDED') or track.lost_interest:
+            is_dead = (
+                not track or
+                getattr(track, 'lifecycle_state', '') in ('LOST', 'EXPIRED', 'DISCARDED') or
+                track.lost_interest or
+                (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3)
+            )
+            if is_dead:
                 print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
                 return
             track.ocr_infer_ms = ocr_duration_ms
@@ -3030,7 +3052,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
         with confirmation_manager.lock:
             track = confirmation_manager.tracks.get(track_id)
             if track:
-                if not track.lost_interest and not track.is_locked and getattr(track, 'lifecycle_state', '') == 'ACTIVE' and track.status not in ("CONFIRMED", "HISTORY_SAVED"):
+                is_alive = not track.lost_interest and not track.is_locked and (getattr(track, 'lifecycle_state', '') == 'ACTIVE' or getattr(track, 'frames_missing', 0) <= 3) and track.status not in ("CONFIRMED", "HISTORY_SAVED")
+                if is_alive:
                     if track.pending_plate_frame is not None and not track.plate_pending:
                         next_plate_job = track.pending_plate_frame
                         track.pending_plate_frame = None

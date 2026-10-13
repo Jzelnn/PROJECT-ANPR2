@@ -295,6 +295,34 @@ def test_entry_history_body_style_flow():
     finally:
         ws_broadcaster.unregister(mock_ws)
 
+def test_flicker_tolerance_in_async_ocr():
+    print("Testing 1-frame tracking flicker tolerance for async OCR results...")
+    from app import VehicleConfirmationManager, confirmation_manager
+    
+    # 1. Vehicle enters and is active
+    tid, trk = confirmation_manager.get_or_create_track(88, [100, 100, 400, 400], 1920, 1080, frame_id=10)
+    trk.lifecycle_state = "ACTIVE"
+    trk.frames_missing = 0
+    trk.ever_inside_roi = True
+    trk.inside_interest_area = True
+
+    # 2. Simulate 1-frame tracking miss (flicker)
+    confirmation_manager.update([], is_stream=True)
+    assert trk.frames_missing == 1
+    assert trk.lifecycle_state == "ACTIVE", f"Expected ACTIVE during 1-frame flicker, got {trk.lifecycle_state}"
+
+    # 3. Add OCR result while vehicle is in 1-frame flicker -> must NOT be discarded
+    update_info = trk.add_ocr_result(job_id=1, text="B 2162 BRK", conf=0.88, crop_q=1.2, ocr_method="test")
+    assert update_info is not None, "Expected OCR result accepted during 1-frame flicker"
+    assert trk.best_candidate == "B2162BRK"
+
+    # 4. Simulate > 3 frames missing -> now it should transition to EXITING
+    for _ in range(4):
+        confirmation_manager.update([], is_stream=True)
+    assert trk.frames_missing >= 4
+    assert trk.lifecycle_state == "EXITING", f"Expected EXITING after >3 frames missing, got {trk.lifecycle_state}"
+    print("[PASS] 1-frame tracking flicker tolerance verified successfully!")
+
 if __name__ == "__main__":
     test_annotated_image()
     test_websocket_thread_safety()
@@ -303,4 +331,5 @@ if __name__ == "__main__":
     test_plate_bbox_in_snapshot()
     test_plate_bbox_projection_and_stale_rejection()
     test_entry_history_body_style_flow()
+    test_flicker_tolerance_in_async_ocr()
     print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")
