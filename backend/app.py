@@ -1196,7 +1196,7 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     return raw_text, avg_conf, line1_chars
 
 
-def read_plate_with_paddleocr(plate_crop):
+def read_plate_with_paddleocr(plate_crop, allow_multipass=True):
     """
     Membaca teks plat nomor menggunakan PaddleOCR dengan:
     1. Normalisasi ukuran cerdas (height ~64px optimal untuk model recognition).
@@ -1245,8 +1245,8 @@ def read_plate_with_paddleocr(plate_crop):
         for it in items
     )
 
-    # Jika Pass 1 belum menghasilkan plat lengkap, jalankan Pass 2 & Pass 3 (kecuali pada crop jauh yang terlalu kecil h < 35 tanpa teks bermakna)
-    if not has_valid_init and (h >= 35 or has_meaningful_pass1):
+    # Jika Pass 1 belum menghasilkan plat lengkap dan multipass diizinkan, jalankan Pass 2 (inverse) & Pass 3 (CLAHE)
+    if allow_multipass and not has_valid_init and (h >= 35 or has_meaningful_pass1):
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
 
@@ -1257,15 +1257,16 @@ def read_plate_with_paddleocr(plate_crop):
             if inv_items:
                 items.extend(inv_items)
 
-        # Pass 3: CLAHE contrast enhancement (mengatasi silau lampu/matahari & bayangan bumper)
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        l2 = clahe.apply(l)
-        enhanced = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
-        clahe_items = paddle_engine.run(enhanced)
-        if clahe_items:
-            items.extend(clahe_items)
+        # Pass 3: CLAHE contrast enhancement hanya jika Pass 1 & Pass 2 belum menemukan plat berstruktur lengkap
+        if not _has_valid_complete_plate(items):
+            clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+            lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l2 = clahe.apply(l)
+            enhanced = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
+            clahe_items = paddle_engine.run(enhanced)
+            if clahe_items:
+                items.extend(clahe_items)
 
     non_date_items = []
     seen_texts = set()
@@ -1479,7 +1480,7 @@ def ensemble_plate_reading(plate_crop):
     if not is_p_valid and not is_c_valid and (char_conf < 0.40 or len(c_clean) < 4):
         deskewed_crop, skew_angle = deskew_plate(plate_crop)
         if abs(skew_angle) >= 4.0:
-            d_paddle, d_pconf, d_all_p = read_plate_with_paddleocr(deskewed_crop)
+            d_paddle, d_pconf, d_all_p = read_plate_with_paddleocr(deskewed_crop, allow_multipass=False)
             if d_pconf > paddle_conf:
                 paddle_raw, paddle_conf, all_paddle = d_paddle, d_pconf, d_all_p
 
