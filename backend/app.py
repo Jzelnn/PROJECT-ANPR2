@@ -33,6 +33,10 @@ if not hasattr(np, 'sctypes'):
 try:
     import torch
     HAS_CUDA = torch.cuda.is_available()
+    if not HAS_CUDA:
+        # Batasi PyTorch CPU threads agar tidak oversubscribe CPU cores (mencegah spike 5s-8s)
+        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
+        torch.set_num_threads(torch_threads)
 except ImportError:
     HAS_CUDA = False
 
