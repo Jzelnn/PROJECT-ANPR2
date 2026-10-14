@@ -16,6 +16,8 @@ import json
 from urllib.parse import urlparse
 import numpy as np
 import cv2
+# Batasi thread pool internal OpenCV agar tidak oversubscribe CPU cores bersama PyTorch & PaddleOCR
+cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "2")))
 from flask import Flask, request, jsonify, Response, send_from_directory, send_file
 from flask_cors import CORS
 from flask_sock import Sock
@@ -1245,8 +1247,8 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True):
         for it in items
     )
 
-    # Jika Pass 1 belum menghasilkan plat lengkap dan multipass diizinkan, jalankan Pass 2 (inverse) & Pass 3 (CLAHE)
-    if allow_multipass and not has_valid_init and (h >= 35 or has_meaningful_pass1):
+    # Jika Pass 1 belum menghasilkan plat lengkap dan multipass diizinkan (crop h >= 32px), jalankan Pass 2 (inverse) & Pass 3 (CLAHE)
+    if allow_multipass and not has_valid_init and h >= 32 and (h >= 35 or has_meaningful_pass1):
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
 
@@ -1435,11 +1437,17 @@ def ensemble_plate_reading(plate_crop):
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
+    # Adaptive OCR multi-pass gating:
+    # Untuk crop kecil (h < 32px), gunakan single-pass cepat agar tidak membuang waktu CPU di frame jauh,
+    # dan biarkan frame berikutnya yang lebih dekat & besar diproses secara multi-pass.
+    h = plate_crop.shape[0]
+    allow_multi = bool(h >= 32)
+
     # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
     plate_crop = enhance_moving_plate_crop(plate_crop)
 
     # 1. Pembacaan via PaddleOCR (Akurasi tertinggi)
-    paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(plate_crop)
+    paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(plate_crop, allow_multipass=allow_multi)
     paddle_raw = paddle_raw.upper()
 
     # Fast Path: Jika PaddleOCR menghasilkan plat nomor berstruktur valid dengan confidence >= 0.65, langsung selesaikan (<35ms)!

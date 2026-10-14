@@ -258,8 +258,9 @@
   }
 
   .det-box{
-    position:absolute;border:2px solid var(--blue);border-radius:3px;
+    position:absolute;border:3px solid var(--blue);border-radius:4px;
     pointer-events:none;z-index:15;
+    box-shadow: 0 0 8px rgba(47, 111, 237, 0.4);
     transition: left 0.08s ease-out, top 0.08s ease-out, width 0.08s ease-out, height 0.08s ease-out;
   }
   .det-box.plate-box{border-color:#f2c94c;border-width:2.5px;box-shadow: 0 0 10px rgba(242, 201, 76, 0.45);}
@@ -272,10 +273,11 @@
     color: #fff !important;
   }
   .det-label{
-    position:absolute;top:-22px;left:-2px;
+    position:absolute;top:-24px;left:-3px;
     background:var(--blue);color:#fff;
-    font-size:11px;font-weight:600;
-    padding:2px 6px;border-radius:4px;white-space:nowrap;
+    font-size:12px;font-weight:700;
+    padding:3px 8px;border-radius:4px;white-space:nowrap;
+    box-shadow:0 2px 6px rgba(0,0,0,0.3);
   }
   @keyframes box-pop{from{opacity:0;transform:scale(0.98);}to{opacity:1;transform:scale(1);}}
 
@@ -1885,11 +1887,12 @@ function drawBoxes(det){
         boxVeh.appendChild(label);
         wrap.appendChild(boxVeh);
       }
+      const vPad = 4;
       boxVeh.style.display = 'block';
-      boxVeh.style.left = Math.round(offsetX + x1 * scaleX) + 'px';
-      boxVeh.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
-      boxVeh.style.width = Math.round((x2 - x1) * scaleX) + 'px';
-      boxVeh.style.height = Math.round((y2 - y1) * scaleY) + 'px';
+      boxVeh.style.left = Math.max(0, Math.round(offsetX + x1 * scaleX - vPad)) + 'px';
+      boxVeh.style.top = Math.max(0, Math.round(offsetY + y1 * scaleY - vPad)) + 'px';
+      boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
+      boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
       const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
       const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
@@ -1908,9 +1911,11 @@ function drawBoxes(det){
       labelElem.textContent = labelText;
       if (isConfirmed) {
         boxVeh.style.borderColor = '#10b981';
+        boxVeh.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
         labelElem.style.background = '#10b981';
       } else {
         boxVeh.style.borderColor = '#2f6fed';
+        boxVeh.style.boxShadow = '0 0 8px rgba(47, 111, 237, 0.4)';
         labelElem.style.background = '#2f6fed';
       }
     } else if (boxVeh){
