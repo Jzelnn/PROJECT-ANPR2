@@ -227,9 +227,10 @@ def test_plate_bbox_projection_and_stale_rejection():
     assert trk.last_plate_frame_id == 16
     assert trk.last_plate_bbox == [505, 412, 598, 460], "Stale frame 15 overwrote frame 16 plate_bbox!"
 
-    # 6. Fallback when rel_plate_bbox is None -> returns last_plate_bbox without inventing position
+    # 6. Fallback when rel_plate_bbox is None -> returns None when moving vehicle given to prevent stale freezing
     trk.rel_plate_bbox = None
-    assert trk.get_current_plate_bbox([300, 180, 720, 530]) == [505, 412, 598, 460]
+    assert trk.get_current_plate_bbox([300, 180, 720, 530]) is None, "Expected None instead of frozen stale coordinates for moving vehicle"
+    assert trk.get_current_plate_bbox(None) == [505, 412, 598, 460], "Expected last_plate_bbox when cur_vbbox is None and fresh"
     print("[PASS] Plate bbox relative projection and stale frame_id rejection verified successfully!")
 
 def test_entry_history_body_style_flow():
@@ -323,6 +324,44 @@ def test_flicker_tolerance_in_async_ocr():
     assert trk.lifecycle_state == "EXITING", f"Expected EXITING after >3 frames missing, got {trk.lifecycle_state}"
     print("[PASS] 1-frame tracking flicker tolerance verified successfully!")
 
+def test_periodic_plate_alignment_when_locked():
+    print("Testing periodic plate alignment for locked tracks without triggering OCR...")
+    from app import confirmation_manager, _async_plate_task, ocr_executor
+
+    confirmation_manager.reset()
+    tid, trk = confirmation_manager.get_or_create_track(88, [200, 200, 600, 500], 1920, 1080, frame_id=1)
+    trk.is_locked = True
+    trk.status = "CONFIRMED"
+    trk.best_candidate = "B1234ABC"
+    trk.best_candidate_display = "B 1234 ABC"
+    trk.confirmed_data = {"license_plate": "B 1234 ABC", "plate_bbox": [300, 400, 500, 450]}
+
+    # Dummy full image with vehicle crop
+    dummy_img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    dummy_crop = dummy_img[200:500, 200:600]
+
+    # Run _async_plate_task with alignment_only=True
+    initial_ocr_pending = trk.ocr_pending
+    _async_plate_task(
+        tid,
+        dummy_crop,
+        [200, 200, 600, 500],
+        dummy_img,
+        1920,
+        1080,
+        time.time(),
+        initial_vtype="car",
+        frame_id=2,
+        alignment_only=True
+    )
+
+    # Verify that OCR was NOT queued and no pending OCR job was created
+    assert trk.ocr_pending == initial_ocr_pending, "alignment_only must NOT set ocr_pending"
+    assert trk.pending_ocr_job is None, "alignment_only must NOT queue pending_ocr_job"
+    assert trk.is_locked is True, "Track lock must remain intact"
+    assert trk.best_candidate == "B1234ABC", "OCR candidate must not be modified by alignment task"
+    print("[PASS] Periodic plate alignment without OCR verified successfully!")
+
 if __name__ == "__main__":
     test_annotated_image()
     test_websocket_thread_safety()
@@ -332,4 +371,5 @@ if __name__ == "__main__":
     test_plate_bbox_projection_and_stale_rejection()
     test_entry_history_body_style_flow()
     test_flicker_tolerance_in_async_ocr()
+    test_periodic_plate_alignment_when_locked()
     print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")

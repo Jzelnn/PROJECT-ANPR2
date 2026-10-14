@@ -712,7 +712,7 @@ let inFlightFrameId = null;
 let inFlightFrameTime = 0;
 let liveWs = null;
 let wsReconnectTimer = null;
-let currentRoi = { x_min: 0.265, y_min: 0.20, x_max: 0.60, y_max: 0.71, points: [[0.265,0.20],[0.60,0.20],[0.60,0.71],[0.265,0.71]] };
+let currentRoi = { x_min: 0.24, y_min: 0.20, x_max: 0.58, y_max: 0.80, points: [[0.24,0.20],[0.58,0.20],[0.58,0.80],[0.24,0.80]] };
 
 // ============================================================
 // SWITCH CAMERA SOURCE (RPi ALPR Kit vs RPi Stream vs Webcam)
@@ -1381,6 +1381,9 @@ function stopContinuousAutoDetect(){
   updateFrameAgeIndicator(null);
   latestRenderedFrameId = -1;
   latestRenderedCaptureTime = 0.0;
+  consecutiveEmptyCycles = 0;
+  lastActiveTrackId = null;
+  lastDetectionData = null;
   clearBoxes();
 }
 
@@ -1585,21 +1588,33 @@ function handleDetectionResult(data, silent=false){
       showToast(`${trackText}${plateShow} - ${statusText}${timeMs}`);
     }
   } else {
-    // Begitu kendaraan keluar dari area deteksi, langsung bersihkan active track dan bounding box seketika
-    if (lastActiveTrackId !== null) {
-      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
-    }
-    lastActiveTrackId = null;
-    clearBoxes();
-    if (!usingBackendAnnotatedImage) {
-      drawRoiBox(currentRoi);
-    }
-    lastDetectionData = null;
-    updateResultCard(null, 0);
-    updateTelemetry(null);
-    if (!silent){
-      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-      showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
+    consecutiveEmptyCycles++;
+    // 2-frame persistence buffer: allow up to 2 momentary missed frames without flickering boxes off
+    const hasActiveBufferedTrack = (consecutiveEmptyCycles <= 2 && lastActiveTrackId !== null && lastDetectionData !== null);
+
+    if (hasActiveBufferedTrack) {
+      // Keep displaying the last known bounding boxes on screen to avoid 1-frame visual flash/disappearance.
+      // Do NOT trigger any OCR call, do NOT add Entry History rows, do NOT increase confidence.
+      if (!usingBackendAnnotatedImage) {
+        drawBoxes(lastDetectionData);
+      }
+    } else {
+      // Exceeded persistence buffer (vehicle genuinely left ROI) or no prior track: clear immediately
+      if (lastActiveTrackId !== null) {
+        console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId} after ${consecutiveEmptyCycles} empty cycles`);
+      }
+      lastActiveTrackId = null;
+      clearBoxes();
+      if (!usingBackendAnnotatedImage) {
+        drawRoiBox(currentRoi);
+      }
+      lastDetectionData = null;
+      updateResultCard(null, 0);
+      updateTelemetry(null);
+      if (!silent){
+        const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
+        showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
+      }
     }
   }
 }
@@ -2646,16 +2661,21 @@ function handleWsMessage(msg){
     if (msg.rel_plate_bbox) {
       lastDetectionData.rel_plate_bbox = msg.rel_plate_bbox;
     }
-    // Prevent older frame's absolute plate coordinates from moving the plate box backward on a newer rendered frame
-    if (msg.frame_id != null && latestRenderedFrameId > 0 && msg.frame_id < latestRenderedFrameId) {
-      const projected = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
-      if (projected) {
-        lastDetectionData.plate_bbox = projected;
-      } else if (msg.projected_plate_bbox && Array.isArray(msg.projected_plate_bbox) && msg.projected_plate_bbox.length === 4 && (!lastDetectionData.plate_bbox)) {
-        lastDetectionData.plate_bbox = msg.projected_plate_bbox;
+    // Synchronize WebSocket updates: prioritize projecting against the current vehicle bbox
+    // so older frame plate detections never pull or jump the plate box backward.
+    let resolvedPlateBox = null;
+    if (lastDetectionData.bbox && lastDetectionData.rel_plate_bbox) {
+      resolvedPlateBox = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
+    }
+    if (!resolvedPlateBox) {
+      if (msg.frame_id == null || latestRenderedFrameId <= 0 || msg.frame_id >= latestRenderedFrameId) {
+        resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
+      } else {
+        resolvedPlateBox = msg.projected_plate_bbox || null;
       }
-    } else {
-      lastDetectionData.plate_bbox = msg.plate_bbox;
+    }
+    if (resolvedPlateBox) {
+      lastDetectionData.plate_bbox = resolvedPlateBox;
     }
     lastDetectionData.plate_confidence = msg.plate_confidence;
     lastDetectionData.plate_detected = true;
