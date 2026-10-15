@@ -261,7 +261,7 @@
     position:absolute;border:3px solid var(--blue);border-radius:4px;
     pointer-events:none;z-index:15;
     box-shadow: 0 0 8px rgba(47, 111, 237, 0.4);
-    transition: left 0.08s ease-out, top 0.08s ease-out, width 0.08s ease-out, height 0.08s ease-out;
+    transition: none;
   }
   .det-box.plate-box{border-color:#f2c94c;border-width:2.5px;box-shadow: 0 0 10px rgba(242, 201, 76, 0.45);}
   .det-box.outside-roi{
@@ -502,6 +502,10 @@
         <label class="auto-scan-wrap" id="autoScanWrap" style="display:none;">
           <input type="checkbox" id="chkAutoScan" onchange="toggleAutoScan()">
           <span>Auto-Scan</span>
+        </label>
+        <label class="auto-scan-wrap" id="motionExtrapWrap" title="Compensate for AI inference delay using linear motion extrapolation">
+          <input type="checkbox" id="chkMotionExtrap" checked onchange="toggleMotionExtrapolation(this.checked)">
+          <span>Motion Sync</span>
         </label>
 
         <!-- Upload File Buttons -->
@@ -1347,6 +1351,20 @@ function startContinuousAutoDetect(){
   runContinuousDetectLoop();
 }
 
+// ============================================================
+// MOTION EXTRAPOLATION FEATURE FLAG & CONTROLS
+// Compensates for AI inference roundtrip latency on moving vehicles
+// ============================================================
+let ENABLE_MOTION_EXTRAPOLATION = true;
+
+function toggleMotionExtrapolation(enable){
+  ENABLE_MOTION_EXTRAPOLATION = Boolean(enable);
+  const chk = document.getElementById('chkMotionExtrap');
+  if (chk) chk.checked = ENABLE_MOTION_EXTRAPOLATION;
+  if (lastDetectionData) drawBoxes(lastDetectionData);
+  showToast(`Motion Sync: ${ENABLE_MOTION_EXTRAPOLATION ? 'ON' : 'OFF'}`);
+}
+
 function isBackendAnnotatedVisible(){
   const feedImg = document.getElementById('feedImg');
   if (feedImg && feedImg.dataset.backendAnnotated === 'true') return true;
@@ -1889,10 +1907,88 @@ function drawBoxes(det){
     const scaleX = renderW / refW;
     const scaleY = renderH / refH;
 
+    // ------------------------------------------------------------
+    // MOTION EXTRAPOLATION WITH SAFEGUARDS (Feature Flag: ENABLE_MOTION_EXTRAPOLATION)
+    // Synchronizes 1.5 FPS AI bounding boxes with 25/30 FPS real-time moving video
+    // ------------------------------------------------------------
+    let effVxBox = det.bbox;
+    let effPlateBox = det.plate_bbox;
+
+    if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
+      const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
+      const isConfGood = (det.vehicle_confidence || 0) >= 0.40;
+
+      if (isTrackActive && isConfGood) {
+        // Frame age calculation with matching timestamps
+        let frameAgeSec = 0;
+        if (det.capture_timestamp && det.capture_timestamp > 0) {
+          const nowSec = Date.now() / 1000.0;
+          frameAgeSec = Math.max(0, nowSec - det.capture_timestamp);
+        } else if (det.frame_age_ms != null && det.frame_age_ms > 0) {
+          frameAgeSec = det.frame_age_ms / 1000.0;
+        }
+
+        // Safeguard 1: Clamp prediction horizon (max 0.70s = 700ms)
+        const MAX_HORIZON_SEC = 0.70;
+        const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
+
+        if (horizon > 0.05) { // Only extrapolate when latency is noticeable (>50ms)
+          let vx = 0, vy = 0;
+          if (det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
+            vx = det.velocity[0];
+            vy = det.velocity[1];
+          } else if (lastDetectionData && lastDetectionData.track_id === det.track_id && lastDetectionData.bbox) {
+            const dt = (det.capture_timestamp && lastDetectionData.capture_timestamp)
+              ? (det.capture_timestamp - lastDetectionData.capture_timestamp)
+              : 0;
+            if (dt > 0.05 && dt < 1.5) {
+              const prevCx = (lastDetectionData.bbox[0] + lastDetectionData.bbox[2]) / 2.0;
+              const prevCy = (lastDetectionData.bbox[1] + lastDetectionData.bbox[3]) / 2.0;
+              const curCx = (det.bbox[0] + det.bbox[2]) / 2.0;
+              const curCy = (det.bbox[1] + det.bbox[3]) / 2.0;
+              vx = (curCx - prevCx) / dt;
+              vy = (curCy - prevCy) / dt;
+            }
+          }
+
+          if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
+            let dx = vx * horizon;
+            let dy = vy * horizon;
+
+            // Safeguard 2: Clamp maximum displacement (max 12% frame dimension or 75% bbox dimension)
+            const [bx1, by1, bx2, by2] = det.bbox;
+            const bw = bx2 - bx1;
+            const bh = by2 - by1;
+            const maxDx = Math.min(refW * 0.12, bw * 0.75);
+            const maxDy = Math.min(refH * 0.12, bh * 0.75);
+            dx = Math.max(-maxDx, Math.min(maxDx, dx));
+            dy = Math.max(-maxDy, Math.min(maxDy, dy));
+
+            // Apply displacement clamped within image boundaries
+            const nx1 = Math.max(0, Math.min(refW - bw, bx1 + dx));
+            const ny1 = Math.max(0, Math.min(refH - bh, by1 + dy));
+            effVxBox = [nx1, ny1, nx1 + bw, ny1 + bh];
+
+            // Synchronized plate bounding box extrapolation (anchored rigidly to vehicle bumper)
+            if (det.rel_plate_bbox) {
+              const projected = projectPlateBbox(effVxBox, det.rel_plate_bbox);
+              if (projected) effPlateBox = projected;
+            } else if (det.plate_bbox) {
+              const pw = det.plate_bbox[2] - det.plate_bbox[0];
+              const ph = det.plate_bbox[3] - det.plate_bbox[1];
+              const px1 = Math.max(0, Math.min(refW - pw, det.plate_bbox[0] + dx));
+              const py1 = Math.max(0, Math.min(refH - ph, det.plate_bbox[1] + dy));
+              effPlateBox = [px1, py1, px1 + pw, py1 + ph];
+            }
+          }
+        }
+      }
+    }
+
     // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
     let boxVeh = wrap.querySelector('#detBoxVehicle');
-    if (det.bbox){
-      const [x1,y1,x2,y2] = det.bbox;
+    if (effVxBox){
+      const [x1,y1,x2,y2] = effVxBox;
       if (!boxVeh){
         boxVeh = document.createElement('div');
         boxVeh.id = 'detBoxVehicle';
@@ -1939,8 +2035,8 @@ function drawBoxes(det){
 
     // 2. Kotak Bounding Box Plat Nomor (Kuning) - Hanya jika dideteksi dan di dalam ROI
     let boxPlate = wrap.querySelector('#detBoxPlate');
-    if (det.plate_bbox){
-      const [x1,y1,x2,y2] = det.plate_bbox;
+    if (effPlateBox){
+      const [x1,y1,x2,y2] = effPlateBox;
       if (!boxPlate){
         boxPlate = document.createElement('div');
         boxPlate.id = 'detBoxPlate';

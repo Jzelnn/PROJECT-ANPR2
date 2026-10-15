@@ -1,4 +1,14 @@
 import os
+
+# Konfigurasi thread pool CPU sebelum library native C/C++ (OpenMP, MKL, PyTorch, PaddleOCR) diimpor
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+os.environ.setdefault("TORCH_NUM_THREADS", "4")
+os.environ.setdefault("OPENCV_NUM_THREADS", "2")
+
 import re
 import time
 import datetime
@@ -88,8 +98,9 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 # Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for reliable small plate detection
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.38))
-MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.25))
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
+VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.18))
+MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.22))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
@@ -1789,6 +1800,9 @@ class VehicleTrack:
         self.last_plate_attempt_time = 0.0
         self.last_plate_update_time = 0.0
         self.plate_attempt_count = 0
+        self.frames_since_plate_det = 0
+        self.velocity = [0.0, 0.0]
+        self.track_confidence = 0.0
         self.plate_detected = False
         self.ocr_pending = False
         self.pending_ocr_job = None      # (job_id, track_id, plate_crop, crop_q, full_img, submit_time, frame_id, capture_ts)
@@ -1841,9 +1855,35 @@ class VehicleTrack:
     def add_frame(self, det):
         now = time.time()
         self.last_seen = now
+        self.frames_since_plate_det += 1
         self.last_bbox = det.get("bbox")
         is_inside = det.get("inside_interest_area", False)
         self.inside_interest_area = is_inside
+
+        # Update vehicle velocity for latency-compensated bounding box projection
+        v_bbox = det.get("bbox")
+        ts = det.get("capture_timestamp") or now
+        v_conf = det.get("vehicle_confidence", 0.0) or 0.0
+        self.track_confidence = v_conf if self.track_confidence == 0.0 else (0.7 * self.track_confidence + 0.3 * v_conf)
+        if v_bbox and len(v_bbox) == 4 and len(self.frames) > 0:
+            prev_f = self.frames[-1]
+            prev_bbox = prev_f.get("bbox")
+            prev_ts = prev_f.get("time") or prev_f.get("capture_timestamp")
+            if prev_bbox and prev_ts and ts > prev_ts:
+                dt = ts - prev_ts
+                if 0.02 <= dt <= 1.5:
+                    cur_cx = (v_bbox[0] + v_bbox[2]) / 2.0
+                    cur_cy = (v_bbox[1] + v_bbox[3]) / 2.0
+                    prev_cx = (prev_bbox[0] + prev_bbox[2]) / 2.0
+                    prev_cy = (prev_bbox[1] + prev_bbox[3]) / 2.0
+                    inst_vx = (cur_cx - prev_cx) / dt
+                    inst_vy = (cur_cy - prev_cy) / dt
+                    if abs(inst_vx) < 1500 and abs(inst_vy) < 1500:
+                        alpha = 0.40
+                        self.velocity = [
+                            (1.0 - alpha) * self.velocity[0] + alpha * inst_vx,
+                            (1.0 - alpha) * self.velocity[1] + alpha * inst_vy
+                        ]
 
         if is_inside:
             self.ever_inside_roi = True
@@ -2320,7 +2360,6 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         if frame_id is not None:
             self.last_plate_frame_id = frame_id
         self.last_plate_bbox = list(abs_box) if abs_box else None
-        self.last_plate_update_time = time.time()
         if v_bbox and len(v_bbox) == 4:
             self.last_plate_vbbox = list(v_bbox)
         if abs_box and v_bbox and len(abs_box) == 4 and len(v_bbox) == 4:
@@ -2332,7 +2371,42 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             rx2 = (abs_box[2] - vx1) / vw
             ry2 = (abs_box[3] - vy1) / vh
             if -0.25 <= rx1 < rx2 <= 1.25 and -0.25 <= ry1 < ry2 <= 1.25:
-                self.rel_plate_bbox = [rx1, ry1, rx2, ry2]
+                cand_cx = (rx1 + rx2) / 2.0
+                cand_cy = (ry1 + ry2) / 2.0
+                cand_w = rx2 - rx1
+                cand_h = ry2 - ry1
+
+                # Spatial consistency check: if track is locked/confirmed or already has established rel_plate_bbox
+                if self.rel_plate_bbox is not None and (self.is_locked or self.status in ("CONFIRMED", "HISTORY_SAVED")):
+                    prev_rx1, prev_ry1, prev_rx2, prev_ry2 = self.rel_plate_bbox
+                    prev_cx = (prev_rx1 + prev_rx2) / 2.0
+                    prev_cy = (prev_ry1 + prev_ry2) / 2.0
+                    prev_w = max(1e-4, prev_rx2 - prev_rx1)
+                    prev_h = max(1e-4, prev_ry2 - prev_ry1)
+
+                    delta_y = abs(cand_cy - prev_cy)
+                    delta_x = abs(cand_cx - prev_cx)
+                    ratio_w = cand_w / prev_w
+                    ratio_h = cand_h / prev_h
+
+                    # Spatial outlier rejection: vertical jump > 0.08, horizontal jump > 0.12, or extreme box size change
+                    if delta_y > 0.08 or delta_x > 0.12 or ratio_w < 0.45 or ratio_w > 2.2 or ratio_h < 0.45 or ratio_h > 2.2:
+                        print(f"[PLATE_ALIGNMENT_OUTLIER_REJECTED] track_id={self.track_id} frame_id={frame_id} dy={delta_y:.3f} dx={delta_x:.3f} rw={ratio_w:.2f}", flush=True)
+                        return False
+
+                    # Valid update: smooth coordinates via EMA (alpha=0.25) to follow perspective changes smoothly without jumping
+                    alpha = 0.25
+                    smooth_rx1 = (1.0 - alpha) * prev_rx1 + alpha * rx1
+                    smooth_ry1 = (1.0 - alpha) * prev_ry1 + alpha * ry1
+                    smooth_rx2 = (1.0 - alpha) * prev_rx2 + alpha * rx2
+                    smooth_ry2 = (1.0 - alpha) * prev_ry2 + alpha * ry2
+                    self.rel_plate_bbox = [smooth_rx1, smooth_ry1, smooth_rx2, smooth_ry2]
+                else:
+                    self.rel_plate_bbox = [rx1, ry1, rx2, ry2]
+
+        self.last_plate_bbox = list(abs_box) if abs_box else None
+        self.last_plate_update_time = time.time()
+        self.frames_since_plate_det = 0
         if abs_box and frame_id is not None:
             for f in reversed(self.frames):
                 if f.get("frame_id") == frame_id:
@@ -2343,8 +2417,22 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
     def get_current_plate_bbox(self, cur_vbbox=None):
         """Mengembalikan posisi plat absolut yang disinkronkan dengan posisi kendaraan saat ini menggunakan rel_plate_bbox."""
         now = time.time()
-        # Jika plat sudah tidak pernah terdeteksi / diperbarui selama > 2.5 detik, jangan tampilkan kotak usang
-        if self.last_plate_update_time > 0 and (now - self.last_plate_update_time) > 2.5:
+        
+        # Validasi status track kendaraan: hanya tampilkan plat jika track masih aktif dan di dalam ROI
+        if self.lost_interest or self.status in ('DISCARDED', 'LOST') or self.frames_missing > 2:
+            return None
+        if not self.inside_interest_area:
+            return None
+
+        # Validasi keaktifan plat:
+        # Jika plat belum terkonfirmasi (ANALYZING), jangan pertahankan posisi plat jika kendaraan
+        # sudah lewat > 8 frame deteksi berturut-turut tanpa ada pembaruan plat sama sekali.
+        if not self.is_locked and self.status not in ("CONFIRMED", "HISTORY_SAVED"):
+            if self.frames_since_plate_det > 8:
+                return None
+
+        # Batas pengaman: jika kendaraan sudah tidak terdeteksi > 2.0 detik (video pause / stop), jangan tampilkan
+        if self.last_seen > 0 and (now - self.last_seen) > 2.0:
             return None
 
         if cur_vbbox and len(cur_vbbox) == 4 and self.rel_plate_bbox and len(self.rel_plate_bbox) == 4:
@@ -2352,16 +2440,19 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             vw = max(1.0, float(vx2 - vx1))
             vh = max(1.0, float(vy2 - vy1))
             rx1, ry1, rx2, ry2 = self.rel_plate_bbox
+            # Validasi geometri plat relatif terhadap bodi kendaraan
             if -0.25 <= rx1 < rx2 <= 1.25 and -0.25 <= ry1 < ry2 <= 1.25:
-                px1 = int(round(vx1 + rx1 * vw))
-                py1 = int(round(vy1 + ry1 * vh))
-                px2 = int(round(vx1 + rx2 * vw))
-                py2 = int(round(vy1 + ry2 * vh))
-                if px2 > px1 and py2 > py1:
-                    return [px1, py1, px2, py2]
+                pw_ratio = rx2 - rx1
+                ph_ratio = ry2 - ry1
+                # Rasio dimensi fisik plat mobil normal (lebar 4%-85%, tinggi 2%-40% dari bodi)
+                if 0.04 <= pw_ratio <= 0.85 and 0.02 <= ph_ratio <= 0.40:
+                    px1 = int(round(vx1 + rx1 * vw))
+                    py1 = int(round(vy1 + ry1 * vh))
+                    px2 = int(round(vx1 + rx2 * vw))
+                    py2 = int(round(vy1 + ry2 * vh))
+                    if px2 > px1 and py2 > py1:
+                        return [px1, py1, px2, py2]
 
-        # Jangan mengembalikan koordinat absolut lama jika cur_vbbox telah diberikan namun rel_plate_bbox tidak valid,
-        # karena koordinat absolut lama akan membeku (freeze) di latar belakang saat mobil bergerak maju.
         # Fallback last_plate_bbox HANYA digunakan jika cur_vbbox tidak ada dan data masih segar (<= 0.5 detik).
         if cur_vbbox is None and self.last_plate_bbox and self.last_plate_update_time > 0 and (now - self.last_plate_update_time) <= 0.5:
             return self.last_plate_bbox
@@ -2585,6 +2676,8 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                 det["candidate_confidence"] = round(track.best_candidate_conf, 3) if track.best_candidate_conf else None
                 det["candidate_matches"] = track.candidate_counts.get(track.best_candidate, 0) if track.best_candidate else 0
                 det["plate_detected"] = bool(det.get("plate_bbox") or det.get("plate_detected"))
+                det["velocity"] = [round(track.velocity[0], 1), round(track.velocity[1], 1)] if track.velocity else None
+                det["track_confidence"] = round(track.track_confidence, 2)
 
                 if track.lost_interest:
                     det["status"] = track.status if track.status in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
@@ -2851,6 +2944,9 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE_OR_LOCKED", flush=True)
                 return
             attempt_count = track.plate_attempt_count
+            est_rel = list(track.rel_plate_bbox) if track.rel_plate_bbox else None
+            anchor_cy = (est_rel[1] + est_rel[3]) / 2.0 if est_rel else None
+            anchor_cx = (est_rel[0] + est_rel[2]) / 2.0 if est_rel else None
 
         vx1, vy1, vx2, vy2 = v_bbox
         vw = max(1, vx2 - vx1)
@@ -2886,6 +2982,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     # Filter out hood/windshield false positives for cars/trucks
                     if initial_vtype != "motorcycle" and rel_y < 0.25:
                         continue
+                    if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
+                        continue
                     # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.55): plat bumper mendapat bobot 2.4x
                     y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                     score = p_conf * y_factor
@@ -2901,6 +2999,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         p_conf = float(b.conf[0])
                         rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
                         if initial_vtype != "motorcycle" and rel_y < 0.25:
+                            continue
+                        if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
                             continue
                         y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                         score = p_conf * y_factor
@@ -2930,6 +3030,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         p_conf = float(b.conf[0])
                         rel_y = (plate_cy - vy1) / float(vh)
                         if initial_vtype != "motorcycle" and rel_y < 0.35:
+                            continue
+                        if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
                             continue
                         y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                         valid_crops.append((abs_box, p_conf, p_conf * y_factor))
@@ -2969,7 +3071,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     if not alignment_only and not track.is_locked and track.status not in ('CONFIRMED', 'HISTORY_SAVED'):
                         crop_w = abs_plate_bbox[2] - abs_plate_bbox[0]
                         crop_h = abs_plate_bbox[3] - abs_plate_bbox[1]
-                        if plate_crop.size > 0 and crop_w >= 50 and crop_h >= 24:
+                        # Skip heavy OCR processing on non-plate texture crops (<0.16 conf) to prevent CPU starvation
+                        if plate_crop.size > 0 and crop_w >= 45 and crop_h >= 18 and (plate_conf_val is None or plate_conf_val >= 0.16):
                             crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                             if not track.ocr_pending:
                                 job_id = get_next_ocr_job_id()
@@ -3242,7 +3345,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     # 1. YOLO VEHICLE INFERENCE (plate detection is gated by interest area)
     t_yolo_0 = time.time()
     print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
-    infer_conf = min(v_conf_thresh, m_conf_thresh)
+    infer_conf = min(v_conf_thresh, m_conf_thresh, VEHICLE_TRACK_CONTINUE_CONF)
     t_lock_start = time.time()
     with vehicle_infer_lock:
         t_pure_start = time.time()
@@ -3260,14 +3363,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo_duration_ms = t_yolo * 1000.0
     print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
-    # 2. EKSTRAKSI KANDIDAT KENDARAAN
+    # 2. EKSTRAKSI KANDIDAT KENDARAAN (Two-Tier Confidence: 0.25 for new tracks, 0.18 for active tracks)
     candidates = []
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
         v_conf = float(box.conf[0])
         track_id = int(box.id[0]) if (box.id is not None) else None
         vehicle_type = map_vehicle_class_name(v_cls, vehicle_model)
-        threshold = m_conf_thresh if vehicle_type == "motorcycle" else v_conf_thresh
+        is_existing_track = bool(track_id is not None and track_id in confirmation_manager.tracks)
+        threshold = VEHICLE_TRACK_CONTINUE_CONF if is_existing_track else (m_conf_thresh if vehicle_type == "motorcycle" else v_conf_thresh)
         if v_conf < threshold:
             continue
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
