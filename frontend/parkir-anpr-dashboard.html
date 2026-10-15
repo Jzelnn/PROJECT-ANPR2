@@ -1577,6 +1577,23 @@ function handleDetectionResult(data, silent=false){
         activeDet.body_style = lastDetectionData.body_style;
         activeDet.body_style_confidence = lastDetectionData.body_style_confidence;
       }
+      // Retain locked confirmed status across fast detection frames for the SAME track
+      const isPrevConfirmed = (
+        lastDetectionData.status === 'CONFIRMED' ||
+        lastDetectionData.status === 'HISTORY_SAVED' ||
+        lastDetectionData.confirmation_status === 'CONFIRMED' ||
+        lastDetectionData.confirmation_status === 'HISTORY_SAVED'
+      );
+      if (isPrevConfirmed && activeDet.status !== 'CONFIRMED' && activeDet.status !== 'HISTORY_SAVED') {
+        activeDet.status = lastDetectionData.status;
+        activeDet.confirmation_status = lastDetectionData.confirmation_status || lastDetectionData.status;
+        activeDet.ocr_status = 'CONFIRMED';
+        if (lastDetectionData.license_plate) {
+          activeDet.license_plate = lastDetectionData.license_plate;
+          activeDet.ocr_text = lastDetectionData.ocr_text || lastDetectionData.license_plate;
+          activeDet.ocr_confidence = lastDetectionData.ocr_confidence;
+        }
+      }
     }
     lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
@@ -2781,19 +2798,50 @@ function handleWsMessage(msg){
     updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
-    if (msg.frame_id != null && lastDetectionData._last_ocr_frame_id != null && msg.frame_id < lastDetectionData._last_ocr_frame_id && msg.status !== 'CONFIRMED'){
+
+    // Issue 2 Guard: Check if the active track is already locked in a confirmed state
+    const isCurrentTrackConfirmed = (
+      lastDetectionData.status === 'CONFIRMED' ||
+      lastDetectionData.status === 'HISTORY_SAVED' ||
+      lastDetectionData.confirmation_status === 'CONFIRMED' ||
+      lastDetectionData.confirmation_status === 'HISTORY_SAVED'
+    );
+    const isIncomingConfirmed = (
+      msg.status === 'CONFIRMED' ||
+      msg.status === 'HISTORY_SAVED' ||
+      msg.ocr_status === 'CONFIRMED' ||
+      msg.ocr_status === 'HISTORY_SAVED'
+    );
+
+    // Reject stale unconfirmed OCR updates if the track is already confirmed
+    if (isCurrentTrackConfirmed && !isIncomingConfirmed) {
+      console.warn(`[STALE_OCR_UPDATE_DISCARDED] track_id=${msg.track_id} is already confirmed, rejecting unconfirmed status=${msg.status} ocr_status=${msg.ocr_status}`);
+      return;
+    }
+
+    // Frame ordering safeguard for unconfirmed updates
+    if (msg.frame_id != null && lastDetectionData._last_ocr_frame_id != null && msg.frame_id < lastDetectionData._last_ocr_frame_id && !isIncomingConfirmed){
       console.warn(`[STALE_OCR_UPDATE_DISCARDED] frame_id=${msg.frame_id} < last=${lastDetectionData._last_ocr_frame_id}`);
       return;
     }
     if (msg.frame_id != null) {
       lastDetectionData._last_ocr_frame_id = msg.frame_id;
     }
+
+    // If incoming message is confirmed, lock confirmation status on lastDetectionData
+    if (isIncomingConfirmed) {
+      lastDetectionData.status = msg.status || 'CONFIRMED';
+      lastDetectionData.confirmation_status = 'CONFIRMED';
+      lastDetectionData.ocr_status = 'CONFIRMED';
+    } else {
+      lastDetectionData.status = msg.status || lastDetectionData.status;
+      lastDetectionData.ocr_status = msg.ocr_status || lastDetectionData.ocr_status;
+    }
+
     lastDetectionData.ocr_text = msg.license_plate;
     lastDetectionData.license_plate = msg.license_plate;
     lastDetectionData.ocr_confidence = msg.ocr_confidence;
     lastDetectionData.candidate_matches = msg.candidate_matches;
-    lastDetectionData.ocr_status = msg.ocr_status;
-    lastDetectionData.status = msg.status || lastDetectionData.status;
 
     updateResultCard(lastDetectionData);
     const pLabel = document.querySelector('#detBoxPlate .det-label');
@@ -2830,9 +2878,22 @@ function handleWsMessage(msg){
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
     if (msg.record){
-      if (!msg.record.body_style && lastDetectionData && lastDetectionData.track_id === msg.record.track_id && lastDetectionData.body_style) {
-        msg.record.body_style = lastDetectionData.body_style;
-        msg.record.body_pending = false;
+      if (lastDetectionData && lastDetectionData.track_id === msg.record.track_id) {
+        lastDetectionData.status = 'CONFIRMED';
+        lastDetectionData.confirmation_status = 'CONFIRMED';
+        lastDetectionData.ocr_status = 'CONFIRMED';
+        if (msg.record.license_plate) {
+          lastDetectionData.license_plate = msg.record.license_plate;
+          lastDetectionData.ocr_text = msg.record.license_plate;
+        }
+        if (msg.record.ocr_confidence) {
+          lastDetectionData.ocr_confidence = msg.record.ocr_confidence;
+        }
+        if (!msg.record.body_style && lastDetectionData.body_style) {
+          msg.record.body_style = lastDetectionData.body_style;
+          msg.record.body_pending = false;
+        }
+        updateResultCard(lastDetectionData);
       }
       addLogRow(msg.record);
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);
