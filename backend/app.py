@@ -1,14 +1,4 @@
 import os
-
-# Konfigurasi thread pool CPU sebelum library native C/C++ (OpenMP, MKL, PyTorch, PaddleOCR) diimpor
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-os.environ.setdefault("MKL_NUM_THREADS", "4")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "4")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
-os.environ.setdefault("TORCH_NUM_THREADS", "4")
-os.environ.setdefault("OPENCV_NUM_THREADS", "2")
-
 import re
 import time
 import datetime
@@ -135,12 +125,12 @@ DEFAULT_INTEREST_AREA = {
 INTEREST_AREA = dict(DEFAULT_INTEREST_AREA)
 
 # Lost Interest parameters
-LOST_INTEREST_TIMEOUT_SEC = float(os.environ.get("ANPR_LOST_TIMEOUT", 2.0))
+LOST_INTEREST_TIMEOUT_SEC = float(os.environ.get("ANPR_LOST_TIMEOUT", 3.5))
 LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 4))
 # Plate detection refresh: do not queue duplicate/stale plate inference.
 # Re-run only when the cached plate is old enough or the previous attempt failed.
 PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.35))
-PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 416))
+PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 320))
 PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.15))
 
 
@@ -1148,10 +1138,10 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     if h == 0 or w == 0:
         return "", 0.0, []
 
-    # Upscale jika ukuran plat kecil agar deteksi karakter individual akurat
+    # Upscale jika ukuran plat kecil agar deteksi karakter individual jauh lebih tajam
     scale = 1.0
-    if h < 90:
-        scale = 120.0 / h
+    if h < 120:
+        scale = 160.0 / h
         proc_img = cv2.resize(plate_crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
     else:
         proc_img = plate_crop
@@ -1253,7 +1243,7 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
 
     target_h = 64
     scale = target_h / float(h)
-    proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_LINEAR if h < 64 else cv2.INTER_AREA)
+    proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_CUBIC if h < target_h else cv2.INTER_AREA)
 
     items = paddle_engine.run(proc_crop)
 
@@ -1289,20 +1279,23 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
         for it in items
     )
 
-    # Jika Pass 1 belum menghasilkan plat lengkap dan multipass diizinkan (crop h >= 42px), jalankan Pass 2 (inverse) & Pass 3 (CLAHE)
+    # Di mode stream real-time (should_skip_fallbacks is not None), hindari multi-pass berat kecuali plat sangat gelap (malam/hitam pekat)
+    # agar mobil berkecepatan tinggi tidak tertahan oleh 3x pemanggilan PaddleOCR beruntun.
+    is_realtime_stream = should_skip_fallbacks is not None
     if allow_multipass and not has_valid_init and h >= 42 and has_meaningful_pass1 and not (should_skip_fallbacks and should_skip_fallbacks()):
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
 
-        # Pass 2: Inverted image (sangat efektif untuk plat hitam huruf putih Indonesia)
-        if mean_brightness < 130.0:
+        # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau < 130 di mode foto statis)
+        inv_thresh = 75.0 if is_realtime_stream else 130.0
+        if mean_brightness < inv_thresh:
             inv = cv2.bitwise_not(proc_crop)
             inv_items = paddle_engine.run(inv)
             if inv_items:
                 items.extend(inv_items)
 
-        # Pass 3: CLAHE contrast enhancement hanya jika Pass 1 & Pass 2 belum menemukan plat berstruktur lengkap dan h >= 48
-        if h >= 48 and not _has_valid_complete_plate(items) and not (should_skip_fallbacks and should_skip_fallbacks()):
+        # Pass 3: CLAHE contrast enhancement hanya untuk foto statis (bukan stream real-time)
+        if not is_realtime_stream and h >= 48 and not _has_valid_complete_plate(items):
             clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
             lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
@@ -1477,11 +1470,21 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     if c_raw and c_raw not in candidates_to_try and not is_tax_date(c_raw):
         candidates_to_try.append(c_raw)
 
+    c_parsed = _parse_candidate_text(c_raw) if c_raw else ""
+    c_parts = c_parsed.split() if (c_parsed and is_valid_indonesian_plate_structure(c_parsed)[0]) else []
+
     for cand in candidates_to_try:
         parsed = _parse_candidate_text(cand)
         if parsed:
             is_valid, _ = is_valid_indonesian_plate_structure(parsed)
             if is_valid:
+                # Jika PaddleOCR dan Character Model memiliki angka tengah yang identik namun huruf terakhir PaddleOCR adalah N/W/H
+                # sedangkan Character Model membaca huruf terakhir sebagai M (misal PBN/PBW/PEH vs PBM), gunakan seri akhir Character Model!
+                p_parts = parsed.split()
+                if len(p_parts) == 3 and len(c_parts) == 3:
+                    if p_parts[0] == c_parts[0] and p_parts[1] == c_parts[1] and len(p_parts[2]) == len(c_parts[2]) >= 2:
+                        if p_parts[2][-1] in ('N', 'W', 'H') and c_parts[2][-1] == 'M' and p_parts[2][0] == c_parts[2][0]:
+                            return f"{p_parts[0]} {p_parts[1]} {c_parts[2]}"
                 return parsed
 
     return ""
@@ -1496,10 +1499,10 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
     # Adaptive OCR multi-pass gating:
-    # Untuk crop kecil (h < 32px), gunakan single-pass cepat agar tidak membuang waktu CPU di frame jauh,
+    # Untuk crop kecil (h < 38px), gunakan single-pass cepat agar tidak membuang waktu CPU di frame jauh,
     # dan biarkan frame berikutnya yang lebih dekat & besar diproses secara multi-pass.
     h = plate_crop.shape[0]
-    allow_multi = bool(h >= 32)
+    allow_multi = bool(h >= 38)
 
     # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
     plate_crop = enhance_moving_plate_crop(plate_crop)
@@ -1510,7 +1513,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     )
     paddle_raw = paddle_raw.upper()
 
-    # Fast Path: Jika PaddleOCR menghasilkan plat nomor berstruktur valid dengan confidence >= 0.65, langsung selesaikan (<35ms)!
+    # Fast Path: Jika PaddleOCR menghasilkan plat nomor berstruktur valid dengan confidence >= 0.65, langsung selesaikan!
     is_p_valid, _ = is_valid_indonesian_plate_structure(paddle_raw)
     if is_p_valid and paddle_conf >= 0.65:
         final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
@@ -1524,19 +1527,6 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
                 "confidence": paddle_conf,
                 "method": "fast_paddle_direct"
             }
-
-    # Jika crop terlalu kecil/jauh (h < 35) dan PaddleOCR belum menemukan plat valid, segera kembalikan agar frame lebih dekat langsung diproses
-    if plate_crop.shape[0] < 35 and not is_p_valid:
-        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
-        return {
-            "final": final_formatted,
-            "char_raw": "",
-            "char_conf": 0.0,
-            "paddle_raw": paddle_raw,
-            "paddle_conf": paddle_conf,
-            "confidence": paddle_conf if final_formatted else 0.0,
-            "method": "fast_small_crop_skip"
-        }
 
     # Jika crop yang lebih baru dengan kualitas setara/lebih baik sudah siap di antrean (atau track sudah tidak aktif),
     # lewati fallback berat (Character YOLO & Deskew) agar crop baru segera diproses.
@@ -1552,14 +1542,29 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             "method": "fast_preempted_by_better_crop"
         }
 
+    # Di mode stream real-time (should_skip_fallbacks is not None), jika PaddleOCR belum menemukan minimal 3 digit angka (atau crop kecil h < 38),
+    # langsung kembalikan tanpa char_model. Namun jika sudah ada >= 3 digit (misal '2866 PBW' kehilangan huruf depan 'B'), jalankan char_model (~80ms) untuk melengkapi!
+    p_digits_count = sum(c.isdigit() for c in paddle_raw)
+    if plate_crop.shape[0] < 38 or (should_skip_fallbacks is not None and p_digits_count < 3):
+        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+        return {
+            "final": final_formatted,
+            "char_raw": "",
+            "char_conf": 0.0,
+            "paddle_raw": paddle_raw,
+            "paddle_conf": paddle_conf,
+            "confidence": paddle_conf if final_formatted else 0.0,
+            "method": "fast_small_crop_skip"
+        }
+
     # 2. Pembacaan via Character Model (Corroborating Fast YOLO)
     char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.18)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
-    # 2b. Fallback Deskew hanya jika kedua metode belum mendapatkan plat valid dan belum ada crop baru yang lebih baik
+    # 2b. Fallback Deskew hanya untuk mode foto statis (should_skip_fallbacks is None)
     is_c_valid, _ = is_valid_indonesian_plate_structure(char_raw)
-    if not is_p_valid and not is_c_valid and (char_conf < 0.40 or len(c_clean) < 4) and not (should_skip_fallbacks and should_skip_fallbacks()):
+    if should_skip_fallbacks is None and not is_p_valid and not is_c_valid and (char_conf < 0.40 or len(c_clean) < 4):
         deskewed_crop, skew_angle = deskew_plate(plate_crop)
         if abs(skew_angle) >= 4.0:
             d_paddle, d_pconf, d_all_p = read_plate_with_paddleocr(deskewed_crop, allow_multipass=False)
@@ -1567,7 +1572,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
                 paddle_raw, paddle_conf, all_paddle = d_paddle, d_pconf, d_all_p
 
     paddle_only_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
-    final_formatted = paddle_only_formatted or refine_indonesian_plate(char_raw, paddle_raw, all_paddle)
+    final_formatted = refine_indonesian_plate(char_raw, paddle_raw, all_paddle) or paddle_only_formatted
     if not final_formatted:
         final_conf = 0.0
     elif paddle_only_formatted:
@@ -2216,8 +2221,10 @@ timestamp={self.first_good_ocr_time:.3f}""")
                 is_struct = best_obs["struct"]
                 p_type = best_obs["type"]
 
+                best_parts = best_obs.get("text", "").split()
+                has_full_suffix = (len(best_parts) == 3 and len(best_parts[2]) >= 2) or p_type == "military"
                 can_finalize = (is_struct and best_count >= 2 and best_conf >= 0.55) or \
-                               (is_struct and best_conf >= 0.65 and (len(best_cln) >= 4 or p_type == "military"))
+                               (is_struct and has_full_suffix and best_conf >= 0.65 and (len(best_cln) >= 5 or p_type == "military"))
 
                 if can_finalize:
                     reason = f"LOST_INTEREST_FINALIZED (count={best_count}, conf={best_conf:.2f})"
@@ -2280,10 +2287,10 @@ timestamp={self.first_good_ocr_time:.3f}""")
         # 1. Instant Fast Confirmation: Valid Samsat plate structure with confidence >= 0.70, direct paddle detection, complete suffix (>= 2 letters), and close/sharp crop (crop_q >= 20.0)
         best_parts = best_plate.split() if best_plate else []
         has_full_suffix = (len(best_parts) == 3 and len(best_parts[2]) >= 2) or p_type == "military"
-        is_direct_paddle = best_obs.get("method") == "fast_paddle_direct"
+        is_direct_paddle = best_obs.get("method") in ("fast_paddle_direct", "ensemble_paddle_primary")
         has_std_digits = len(best_parts) == 3 and (3 <= len(best_parts[1]) <= 4)
         best_crop_q = float(best_obs.get("crop_q") or 0.0)
-        if is_struct and is_direct_paddle and (has_full_suffix and has_std_digits) and best_conf >= 0.70 and best_crop_q >= 20.0:
+        if is_struct and is_direct_paddle and (has_full_suffix and has_std_digits) and best_conf >= 0.70 and best_crop_q >= 21.0:
             confirmed = True
             reason = f"FAST_STRONG_STRUCTURE (conf={best_conf:.2f}, crop_q={best_crop_q:.1f})"
 
@@ -2552,7 +2559,7 @@ class VehicleConfirmationManager:
             if raw_tid is not None and raw_tid in self.tracks:
                 tid = raw_tid
             else:
-                matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h)
+                matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h, iou_thresh=0.20)
                 if matched_id is not None:
                     tid = matched_id
                 elif raw_tid is not None:
@@ -2565,6 +2572,10 @@ class VehicleConfirmationManager:
                 if bbox:
                     self.tracks[tid].last_bbox = bbox
                 print(f"[TRACK_CREATED]\ntrack_id={tid}\nframe_id={frame_id}", flush=True)
+            else:
+                self.tracks[tid].last_seen = time.time()
+                if bbox:
+                    self.tracks[tid].last_bbox = bbox
             return tid, self.tracks[tid]
 
     def check_lost_tracks(self):
@@ -2610,8 +2621,8 @@ class VehicleConfirmationManager:
         best_iou = -1.0
 
         for tid, trk in self.tracks.items():
-            # Cocokkan dengan track yang aktif dalam 2.5 detik terakhir dan TIDAK expired/discarded
-            if (now - trk.last_seen) > 2.5 or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
+            # Cocokkan dengan track yang aktif dalam LOST_INTEREST_TIMEOUT_SEC detik terakhir dan TIDAK expired/discarded
+            if (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
                 continue
 
             if trk.last_bbox:
@@ -3058,7 +3069,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and not alignment_only:
+            if not valid_crops and not alignment_only and (vw < 180 or vh < 180):
                 with plate_infer_lock:
                     pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
@@ -3075,10 +3086,10 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         score = p_conf * y_factor
                         valid_crops.append((abs_box, p_conf, score))
 
-        # 2. Fallback: Full Frame / ROI Plate Detection only if crop is too small or clipped at bottom edge
+        # 2. Fallback: Full Frame / ROI Plate Detection only if crop is very small
         need_full_fallback = (
             padded_crop is None or getattr(padded_crop, 'size', 0) == 0 or
-            vw < 140 or vh < 140 or vy2 >= ih - 15
+            vw < 120 or vh < 120
         )
         if not valid_crops and not alignment_only and need_full_fallback and full_img is not None and getattr(full_img, 'size', 0) > 0:
             with plate_infer_lock:
@@ -3139,10 +3150,12 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
 
                     # Queue or prepare OCR job ONLY if NOT alignment_only and track is not locked
                     if not alignment_only and not track.is_locked and track.status not in ('CONFIRMED', 'HISTORY_SAVED'):
-                        crop_w = abs_plate_bbox[2] - abs_plate_bbox[0]
-                        crop_h = abs_plate_bbox[3] - abs_plate_bbox[1]
-                        # Skip heavy OCR processing on non-plate texture crops (<0.16 conf) to prevent CPU starvation
-                        if plate_crop.size > 0 and crop_w >= 45 and crop_h >= 18 and (plate_conf_val is None or plate_conf_val >= 0.16):
+                        crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
+                        min_crop_w = 108 if full_img.shape[1] >= 1100 else (80 if full_img.shape[1] >= 800 else 36)
+                        min_crop_h = 58 if full_img.shape[1] >= 1100 else (43 if full_img.shape[1] >= 800 else 18)
+                        # Hanya jalankan OCR jika ukuran plat sudah cukup dekat & terbaca jelas
+                        # sehingga CPU tidak terbuang membaca plat buram saat mobil masih jauh
+                        if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
                             crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                             if not track.ocr_pending:
                                 job_id = get_next_ocr_job_id()

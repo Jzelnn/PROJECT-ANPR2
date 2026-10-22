@@ -1410,12 +1410,12 @@ async function runContinuousDetectLoop(){
     return;
   }
 
-  // Webcam / video_file sources: WebSocket stream is not active, use HTTP polling
+  // Webcam / video_file sources: WebSocket stream is not active, use fast loop
   while (isCameraConnected && isContinuousDetectActive){
     if (!isScanning){
       await performDetectCycle(true);
     }
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => setTimeout(r, 20));
   }
 }
 
@@ -1431,8 +1431,8 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 2000ms, release it
-    if (nowMs - inFlightFrameTime > 2000) {
+    // Watchdog: If frame in flight took > 1500ms, release it
+    if (nowMs - inFlightFrameTime > 1500) {
       console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
@@ -1449,7 +1449,7 @@ async function performDetectCycle(silent=true){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
-        // Cap resolusi maksimum ke 1280px agar transfer JPEG kilat (<20ms) dengan detail plat tetap tajam
+        // Cap resolusi maksimum ke 1280px agar detail karakter plat (seperti M vs H/N) tetap sangat tajam sementara YOLO berjalan di imgsz=320
         const maxDim = 1280;
         let scale = 1.0;
         if (video.videoWidth > maxDim) {
@@ -1465,7 +1465,7 @@ async function performDetectCycle(silent=true){
           const clientCaptureTs = Date.now() / 1000.0;
           inFlightFrameId = clientFrameCounter;
           inFlightFrameTime = Date.now();
-          const b64 = canvas.toDataURL('image/jpeg', 0.80);
+          const b64 = canvas.toDataURL('image/jpeg', 0.75);
           liveWs.send(JSON.stringify({
             type: "detect_frame",
             frame_id: clientFrameCounter,
