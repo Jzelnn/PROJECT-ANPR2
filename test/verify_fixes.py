@@ -199,7 +199,7 @@ def test_plate_bbox_projection_and_stale_rejection():
     print("Testing plate_bbox relative projection and stale frame_id rejection...")
     from app import VehicleTrack
 
-    trk = VehicleTrack(77)
+    trk = VehicleTrack(77, initial_det={"inside_interest_area": True, "bbox": [267, 163, 660, 484]})
     trk.last_bbox = [267, 163, 660, 484]
     # 1. Before any plate detection, get_current_plate_bbox returns None
     assert trk.get_current_plate_bbox([267, 163, 660, 484]) is None
@@ -362,14 +362,91 @@ def test_periodic_plate_alignment_when_locked():
     assert trk.best_candidate == "B1234ABC", "OCR candidate must not be modified by alignment task"
     print("[PASS] Periodic plate alignment without OCR verified successfully!")
 
+def test_corroborating_ocr_confirmation():
+    print("Testing corroborating OCR reading with slightly lower confidence...")
+    from app import VehicleTrack
+
+    trk = VehicleTrack(101, initial_det={
+        "inside_interest_area": True,
+        "bbox": [200, 150, 600, 480],
+        "vehicle_type": "car",
+        "vehicle_confidence": 0.90,
+        "body_style": "MPV",
+        "body_style_confidence": 0.85
+    })
+
+    # First read: conf=0.63 (<0.68 single-frame fast confirm, so needs 2 reads), crop_q=1.20
+    info1 = trk.add_ocr_result(job_id=1, text="B 1452 HOS", conf=0.63, crop_q=1.20)
+    assert info1 is not None
+    assert trk.status == "ANALYZING"
+    assert trk.candidate_counts.get("B1452HOS") == 1
+    assert trk.best_candidate_conf == 0.63
+
+    # Second read of the SAME plate: conf=0.52 (which is < 0.63 - 0.08 = 0.55) and crop_q=1.05 (< 1.20)
+    # Previously this was rejected by the weaker-result guard; now it must corroborate and confirm!
+    info2 = trk.add_ocr_result(job_id=2, text="B 1452 HOS", conf=0.52, crop_q=1.05)
+    assert info2 is not None
+    assert trk.candidate_counts.get("B1452HOS") == 2, f"Expected candidate_counts=2, got {trk.candidate_counts.get('B1452HOS')}"
+    assert trk.best_candidate_conf == 0.63, f"Expected highest confidence 0.63 preserved, got {trk.best_candidate_conf}"
+    assert trk.status == "CONFIRMED", f"Expected CONFIRMED after 2 corroborating reads, got {trk.status}"
+    assert info2["ocr_confidence"] == 0.63
+
+    # Verify a DIFFERENT weaker plate is still rejected on an unconfirmed track
+    trk2 = VehicleTrack(102)
+    trk2.add_ocr_result(job_id=1, text="B 1413 DOF", conf=0.64, crop_q=1.30)
+    info_diff = trk2.add_ocr_result(job_id=2, text="B 9999 XYZ", conf=0.50, crop_q=1.00)
+    assert trk2.best_candidate == "B1413DOF", "Different weaker plate must not overwrite best_candidate"
+    assert trk2.candidate_counts.get("B9999XYZ", 0) == 0, "Different weaker plate must still be rejected"
+    print("[PASS] Corroborating OCR reading confirmation & highest confidence preservation verified!")
+
+def test_ocr_fallback_preemption_and_pending_crop_guard():
+    print("Testing _should_skip_ocr_fallbacks and ensemble_plate_reading preemption...")
+    from app import confirmation_manager, _should_skip_ocr_fallbacks, ensemble_plate_reading
+
+    confirmation_manager.reset()
+    tid, trk = confirmation_manager.get_or_create_track(105, [200, 200, 600, 500], 1920, 1080, frame_id=10)
+    trk.lifecycle_state = "ACTIVE"
+
+    # 1. No pending_ocr_job -> should NOT skip fallbacks
+    assert _should_skip_ocr_fallbacks(tid, 1.0) is False
+
+    # 2. Worse crop queued (crop_q=0.8 < current 1.0) -> should NOT skip fallbacks
+    trk.pending_ocr_job = (2, tid, np.zeros((40, 120, 3), dtype=np.uint8), 0.80, None, time.time(), 11, time.time())
+    assert _should_skip_ocr_fallbacks(tid, 1.0) is False
+
+    # 3. Equally good or better crop queued (crop_q=1.25 >= current 1.0) -> SHOULD skip fallbacks
+    trk.pending_ocr_job = (3, tid, np.zeros((40, 120, 3), dtype=np.uint8), 1.25, None, time.time(), 12, time.time())
+    assert _should_skip_ocr_fallbacks(tid, 1.0) is True
+
+    # 4. Verify ensemble_plate_reading returns fast_preempted_by_better_crop when callback returns True
+    blank_crop = np.zeros((45, 140, 3), dtype=np.uint8)
+    res = ensemble_plate_reading(blank_crop, should_skip_fallbacks=lambda: True)
+    assert res.get("method") == "fast_preempted_by_better_crop", f"Expected fast_preempted_by_better_crop, got {res.get('method')}"
+    print("[PASS] OCR fallback preemption and pending crop quality guard verified!")
+
 if __name__ == "__main__":
-    test_annotated_image()
-    test_websocket_thread_safety()
-    test_plate_refinement()
-    test_track_isolation()
-    test_plate_bbox_in_snapshot()
-    test_plate_bbox_projection_and_stale_rejection()
-    test_entry_history_body_style_flow()
-    test_flicker_tolerance_in_async_ocr()
-    test_periodic_plate_alignment_when_locked()
-    print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")
+    import app
+    orig_history = list(app.LATEST_RECORDS)
+    orig_file_bytes = None
+    if os.path.exists(app.HISTORY_FILE):
+        with open(app.HISTORY_FILE, "rb") as f:
+            orig_file_bytes = f.read()
+    try:
+        test_annotated_image()
+        test_websocket_thread_safety()
+        test_plate_refinement()
+        test_track_isolation()
+        test_plate_bbox_in_snapshot()
+        test_plate_bbox_projection_and_stale_rejection()
+        test_entry_history_body_style_flow()
+        test_flicker_tolerance_in_async_ocr()
+        test_periodic_plate_alignment_when_locked()
+        test_corroborating_ocr_confirmation()
+        test_ocr_fallback_preemption_and_pending_crop_guard()
+        print("\nALL VERIFICATION TESTS COMPLETED SUCCESSFULLY!")
+    finally:
+        app.LATEST_RECORDS.clear()
+        app.LATEST_RECORDS.extend(orig_history)
+        if orig_file_bytes is not None:
+            with open(app.HISTORY_FILE, "wb") as f:
+                f.write(orig_file_bytes)

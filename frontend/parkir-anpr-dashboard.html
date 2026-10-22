@@ -526,14 +526,6 @@
           <span class="dot" id="aiDot" style="background:var(--blue); animation:pulse 1s infinite;"></span>
           <span id="aiStatusText">AI ACTIVE</span>
         </div>
-        <div class="live-pill" id="latencyPill" style="display:none; background:rgba(16,185,129,0.09); border-color:#a7f3d0; color:#059669; font-weight:600;" title="Real-time detection speed / inference latency">
-          <span class="dot" id="latencyDot" style="background:#10b981;"></span>
-          <span id="latencyText">0 ms</span>
-        </div>
-        <div class="live-pill" id="frameAgePill" style="display:none; background:rgba(47,111,237,0.09); border-color:#b9d2fd; color:var(--blue); font-weight:600;" title="Real-time video freshness (Frame Age = Now - Frame Capture)">
-          <span class="dot" id="frameAgeDot" style="background:var(--blue);"></span>
-          <span id="frameAgeText">Age: 0 ms</span>
-        </div>
         <div class="live-pill off" id="wsIndicator" title="WebSocket Live Streaming Connection">
           <span class="dot off" id="wsDot"></span>
           <span id="wsStatusText">WS CONNECTING</span>
@@ -1567,11 +1559,24 @@ function handleDetectionResult(data, silent=false){
           activeDet.plate_detected = lastDetectionData.plate_detected;
         }
       }
-      if (!activeDet.license_plate && lastDetectionData.license_plate) {
+      const hasNewerOcrState = Boolean(
+        lastDetectionData.license_plate && (
+          !activeDet.license_plate ||
+          (lastDetectionData._last_ocr_frame_id != null && (activeDet.frame_id == null || activeDet.frame_id <= lastDetectionData._last_ocr_frame_id)) ||
+          ((lastDetectionData.candidate_matches || 0) > (activeDet.candidate_matches || 0))
+        )
+      );
+      if (hasNewerOcrState) {
         activeDet.license_plate = lastDetectionData.license_plate;
-        activeDet.ocr_text = lastDetectionData.ocr_text;
+        activeDet.ocr_text = lastDetectionData.ocr_text || lastDetectionData.license_plate;
         activeDet.ocr_confidence = lastDetectionData.ocr_confidence;
-        activeDet.candidate_matches = lastDetectionData.candidate_matches;
+        activeDet.candidate_matches = Math.max(activeDet.candidate_matches || 0, lastDetectionData.candidate_matches || 0);
+        if (lastDetectionData.analyzing_frame_count != null) {
+          activeDet.analyzing_frame_count = Math.max(activeDet.analyzing_frame_count || 0, lastDetectionData.analyzing_frame_count);
+        }
+        if (lastDetectionData.ocr_status === 'GOOD_CANDIDATE' && activeDet.ocr_status === 'ANALYZING') {
+          activeDet.ocr_status = 'GOOD_CANDIDATE';
+        }
       }
       if (!activeDet.body_style && lastDetectionData.body_style) {
         activeDet.body_style = lastDetectionData.body_style;
@@ -2842,6 +2847,12 @@ function handleWsMessage(msg){
     lastDetectionData.license_plate = msg.license_plate;
     lastDetectionData.ocr_confidence = msg.ocr_confidence;
     lastDetectionData.candidate_matches = msg.candidate_matches;
+    if (msg.candidate_matches != null && msg.candidate_matches > 0) {
+      lastDetectionData.analyzing_frame_count = Math.min(
+        msg.candidate_matches,
+        lastDetectionData.analyzing_max_frames || 3
+      );
+    }
 
     updateResultCard(lastDetectionData);
     const pLabel = document.querySelector('#detBoxPlate .det-label');
