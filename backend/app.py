@@ -965,6 +965,52 @@ def crop_vehicle_with_context(image, x1, y1, x2, y2, pad_ratio=0.04):
     return image[cy1:cy2, cx1:cx2]
 
 
+# Lookup Table (LUT) Gamma Pre-computed untuk akselerasi Low-Light / Mobil Hitam (~1-2ms tanpa overhead hitung ulang)
+_GAMMA_LUT_NIGHT = np.array([min(255, int(((i / 255.0) ** 0.58) * 255.0)) for i in range(256)], dtype=np.uint8)
+_GAMMA_LUT_BUMPER = np.array([min(255, int(((i / 255.0) ** 0.50) * 255.0)) for i in range(256)], dtype=np.uint8)
+
+
+def get_roi_brightness(image):
+    """Mengukur rata-rata kecerahan di dalam Detection Area (ROI) secara instan dengan subsampling."""
+    if image is None or getattr(image, "size", 0) == 0:
+        return 128.0
+    ih, iw = image.shape[:2]
+    rx1 = max(0, int(iw * INTEREST_AREA.get("x_min", 0.24)))
+    ry1 = max(0, int(ih * INTEREST_AREA.get("y_min", 0.20)))
+    rx2 = min(iw, int(iw * INTEREST_AREA.get("x_max", 0.58)))
+    ry2 = min(ih, int(ih * INTEREST_AREA.get("y_max", 0.80)))
+    roi_sample = image[ry1:ry2:8, rx1:rx2:8]
+    if roi_sample.size == 0:
+        return float(image[::8, ::8].mean())
+    return float(roi_sample.mean())
+
+
+def enhance_dark_bumper_crop(crop):
+    """Menerangkan bayangan bumper mobil hitam / kondisi malam menggunakan LUT Gamma + CLAHE pada kanal L."""
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return crop
+    boosted = cv2.LUT(crop, _GAMMA_LUT_BUMPER)
+    lab = cv2.cvtColor(boosted, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
+    l2 = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def invert_and_enhance_dark_plate(proc_crop, gray=None):
+    """
+    Mengoptimalkan pembacaan plat nomor hitam (huruf putih di atas latar hitam/gelap):
+    1. CLAHE pada grayscale untuk menajamkan kontras huruf putih terhadap latar hitam.
+    2. Bitwise invert sehingga berubah menjadi huruf hitam pekat di atas latar putih bersih (optimal untuk PaddleOCR).
+    """
+    if gray is None:
+        gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(6, 6))
+    enhanced_gray = clahe.apply(gray)
+    inv_gray = cv2.bitwise_not(enhanced_gray)
+    return cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2BGR)
+
+
 SAMSAT_PREFIXES = {
     'A', 'B', 'D', 'E', 'F', 'G', 'H', 'K', 'L', 'M', 'N', 'P', 'R', 'S', 'T', 'W', 'Z',
     'AA', 'AB', 'AD', 'AE', 'AG', 'BA', 'BB', 'BD', 'BE', 'BG', 'BH', 'BK', 'BL', 'BM', 'BN',
@@ -1279,17 +1325,19 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
         for it in items
     )
 
-    # Di mode stream real-time (should_skip_fallbacks is not None), hindari multi-pass berat kecuali plat sangat gelap (malam/hitam pekat)
-    # agar mobil berkecepatan tinggi tidak tertahan oleh 3x pemanggilan PaddleOCR beruntun.
+    # Di mode stream real-time (should_skip_fallbacks is not None), jalankan Pass 2 (CLAHE + Invert) secara adaptif
+    # KHUSUS jika plat terdeteksi sebagai plat hitam / kondisi malam (median latar p50 < 85 dan rata-rata < 105),
+    # sehingga plat putih siang hari tetap 1-pass kilat, sedangkan plat hitam / malam langsung terbaca jelas.
     is_realtime_stream = should_skip_fallbacks is not None
-    if allow_multipass and not has_valid_init and h >= 42 and has_meaningful_pass1 and not (should_skip_fallbacks and should_skip_fallbacks()):
+    if allow_multipass and not has_valid_init and h >= 38 and not (should_skip_fallbacks and should_skip_fallbacks()):
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
+        p50_brightness = float(np.median(gray))
+        is_dark_or_black_plate = (p50_brightness < 85.0 and mean_brightness < 105.0)
 
-        # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau < 130 di mode foto statis)
-        inv_thresh = 75.0 if is_realtime_stream else 130.0
-        if mean_brightness < inv_thresh:
-            inv = cv2.bitwise_not(proc_crop)
+        # Pass 2: Inverted + CLAHE image untuk plat hitam (huruf putih di atas latar gelap) atau kondisi malam
+        if is_dark_or_black_plate or (not is_realtime_stream and mean_brightness < 130.0 and has_meaningful_pass1):
+            inv = invert_and_enhance_dark_plate(proc_crop, gray)
             inv_items = paddle_engine.run(inv)
             if inv_items:
                 items.extend(inv_items)
@@ -1504,7 +1552,8 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     h = plate_crop.shape[0]
     allow_multi = bool(h >= 38)
 
-    # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
+    # 0. Simpan crop asli untuk char_model, dan gunakan enhancement motion-blur untuk PaddleOCR
+    raw_plate_crop = plate_crop
     plate_crop = enhance_moving_plate_crop(plate_crop)
 
     # 1. Pembacaan via PaddleOCR (Akurasi tertinggi)
@@ -1542,10 +1591,14 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             "method": "fast_preempted_by_better_crop"
         }
 
-    # Di mode stream real-time (should_skip_fallbacks is not None), jika PaddleOCR belum menemukan minimal 3 digit angka (atau crop kecil h < 38),
-    # langsung kembalikan tanpa char_model. Namun jika sudah ada >= 3 digit (misal '2866 PBW' kehilangan huruf depan 'B'), jalankan char_model (~80ms) untuk melengkapi!
+    # Cek apakah plat termasuk plat hitam / gelap (median < 85 dan mean < 105)
+    gray_check = cv2.cvtColor(raw_plate_crop, cv2.COLOR_BGR2GRAY)
+    is_dark_plate = (float(np.median(gray_check)) < 85.0 and float(gray_check.mean()) < 105.0)
+
+    # Di mode stream real-time (should_skip_fallbacks is not None), jika PaddleOCR belum menemukan minimal 3 digit angka (dan bukan plat hitam/gelap),
+    # langsung kembalikan tanpa char_model. Namun jika sudah ada >= 3 digit atau plat hitam/gelap, jalankan char_model untuk melengkapi!
     p_digits_count = sum(c.isdigit() for c in paddle_raw)
-    if plate_crop.shape[0] < 38 or (should_skip_fallbacks is not None and p_digits_count < 3):
+    if plate_crop.shape[0] < 38 or (should_skip_fallbacks is not None and p_digits_count < 3 and not is_dark_plate):
         final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
         return {
             "final": final_formatted,
@@ -1557,8 +1610,8 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             "method": "fast_small_crop_skip"
         }
 
-    # 2. Pembacaan via Character Model (Corroborating Fast YOLO)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(plate_crop, conf=0.18)
+    # 2. Pembacaan via Character Model (Corroborating Fast YOLO pada crop asli tanpa artefak sharpening)
+    char_raw, char_conf, line1_chars = read_plate_with_char_model(raw_plate_crop, conf=0.16 if is_dark_plate else 0.18)
     char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
@@ -3069,22 +3122,46 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and not alignment_only and (vw < 180 or vh < 180):
-                with plate_infer_lock:
-                    pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
-                for b in pdet_legacy.boxes:
-                    cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
-                    abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
-                    if is_valid_plate_box(abs_box, iw, ih):
-                        p_conf = float(b.conf[0])
-                        rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
-                        if initial_vtype != "motorcycle" and rel_y < 0.25:
+            if not valid_crops and not alignment_only:
+                bumper_sample = padded_crop[int(padded_crop.shape[0] * 0.45)::4, ::4]
+                is_dark_bumper = bool(bumper_sample.size > 0 and float(bumper_sample.mean()) < 95.0)
+                if is_dark_bumper:
+                    # Mobil hitam / kondisi malam: terangkan area bumper dengan Gamma + CLAHE lalu deteksi ulang
+                    boosted_crop = enhance_dark_bumper_crop(padded_crop)
+                    with plate_infer_lock:
+                        pdet_boost = plate_detector.predict(boosted_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                    for b in pdet_boost.boxes:
+                        cls_id = int(b.cls[0])
+                        cname = plate_detector.names.get(cls_id, "")
+                        if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
                             continue
-                        if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
-                            continue
-                        y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
-                        score = p_conf * y_factor
-                        valid_crops.append((abs_box, p_conf, score))
+                        cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                        abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
+                        if is_valid_plate_box(abs_box, iw, ih):
+                            p_conf = float(b.conf[0])
+                            rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                            if initial_vtype != "motorcycle" and rel_y < 0.25:
+                                continue
+                            y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
+                            valid_crops.append((abs_box, p_conf, p_conf * y_factor))
+
+                if not valid_crops and (is_dark_bumper or vw < 180 or vh < 180):
+                    legacy_input = boosted_crop if is_dark_bumper else padded_crop
+                    with plate_infer_lock:
+                        pdet_legacy = plate_model_legacy.predict(legacy_input, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                    for b in pdet_legacy.boxes:
+                        cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                        abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
+                        if is_valid_plate_box(abs_box, iw, ih):
+                            p_conf = float(b.conf[0])
+                            rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                            if initial_vtype != "motorcycle" and rel_y < 0.25:
+                                continue
+                            if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
+                                continue
+                            y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
+                            score = p_conf * y_factor
+                            valid_crops.append((abs_box, p_conf, score))
 
         # 2. Fallback: Full Frame / ROI Plate Detection only if crop is very small
         need_full_fallback = (
@@ -3153,9 +3230,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
                         min_crop_w = 108 if full_img.shape[1] >= 1100 else (80 if full_img.shape[1] >= 800 else 36)
                         min_crop_h = 58 if full_img.shape[1] >= 1100 else (43 if full_img.shape[1] >= 800 else 18)
-                        # Hanya jalankan OCR jika ukuran plat sudah cukup dekat & terbaca jelas
-                        # sehingga CPU tidak terbuang membaca plat buram saat mobil masih jauh
-                        if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
+                        # Hanya jalankan OCR jika ukuran plat sudah cukup dekat & terbaca jelas (termasuk plat hitam kontras rendah conf >= 0.12)
+                        if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.12):
                             crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                             if not track.ocr_pending:
                                 job_id = get_next_ocr_job_id()
@@ -3456,6 +3532,12 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
     ih, iw = img.shape[:2]
 
+    # Sensor Otomatis Siang / Malam (mengukur kecerahan ROI < 0.05ms):
+    # Jika kondisi gelap/malam (roi_brightness < 85), gunakan LUT Gamma Boost untuk menonjolkan siluet mobil hitam.
+    roi_brightness = get_roi_brightness(img)
+    is_low_light = bool(roi_brightness < 85.0)
+    infer_img = cv2.LUT(img, _GAMMA_LUT_NIGHT) if is_low_light else img
+
     # 1. YOLO VEHICLE INFERENCE (plate detection is gated by interest area)
     t_yolo_0 = time.time()
     print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
@@ -3465,10 +3547,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         t_pure_start = time.time()
         lock_wait_ms = (t_pure_start - t_lock_start) * 1000.0
         if is_stream:
-            vdet = vehicle_model.track(img, persist=True, tracker="bytetrack.yaml",
+            vdet = vehicle_model.track(infer_img, persist=True, tracker="bytetrack.yaml",
                                        conf=infer_conf, imgsz=VEHICLE_STREAM_IMGSZ, device=DEVICE, verbose=False)[0]
         else:
-            vdet = vehicle_model.predict(img, conf=infer_conf,
+            vdet = vehicle_model.predict(infer_img, conf=infer_conf,
                                          imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
         t_pure_end = time.time()
         pure_infer_ms = (t_pure_end - t_pure_start) * 1000.0
@@ -3477,7 +3559,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo_duration_ms = t_yolo * 1000.0
     print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
-    # 2. EKSTRAKSI KANDIDAT KENDARAAN (Two-Tier Confidence: 0.25 for new tracks, 0.18 for active tracks)
+    # 2. EKSTRAKSI KANDIDAT KENDARAAN (Adaptive Day/Night & Dark-Car Confidence)
     candidates = []
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
@@ -3486,8 +3568,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         vehicle_type = map_vehicle_class_name(v_cls, vehicle_model)
         is_existing_track = bool(track_id is not None and track_id in confirmation_manager.tracks)
         threshold = VEHICLE_TRACK_CONTINUE_CONF if is_existing_track else (m_conf_thresh if vehicle_type == "motorcycle" else v_conf_thresh)
-        if v_conf < threshold:
-            continue
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         bw = max(0, x2 - x1)
         bh = max(0, y2 - y1)
@@ -3495,6 +3575,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         # Minimum physical box size check: ignore noise smaller than 40x40 or < 1.5% of frame area
         if bw < 40 or bh < 40 or (area / float(max(1, iw * ih))) < 0.015:
             continue
+
+        if v_conf < threshold:
+            # Toleransi adaptif untuk mobil hitam / kondisi malam (0.22 <= v_conf < threshold):
+            # Diizinkan jika kondisi ROI gelap ATAU bodi kendaraan berwarna gelap/hitam (box_brightness < 82) dengan proporsi fisik mobil normal.
+            if v_conf >= 0.22 and y1 > int(ih * 0.04) and (0.40 <= (bw / float(max(1, bh))) <= 1.65):
+                box_sample = img[max(0, y1):min(ih, y2):6, max(0, x1):min(iw, x2):6]
+                box_brightness = float(box_sample.mean()) if box_sample.size > 0 else 128.0
+                if not (is_low_light or box_brightness < 82.0):
+                    continue
+            else:
+                continue
 
         candidates.append({
             "track_id": track_id,
