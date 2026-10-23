@@ -2838,6 +2838,11 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["ocr_confidence"] = round(track.best_candidate_conf, 3)
                     det["analyzing_frame_count"] = max(1, track.get_current_stability_count())
                     det["analyzing_max_frames"] = 3
+                    if not det.get("plate_bbox"):
+                        det["plate_bbox"] = track.get_current_plate_bbox(det.get("bbox")) or track.last_plate_bbox
+
+                if track.rel_plate_bbox and not det.get("rel_plate_bbox"):
+                    det["rel_plate_bbox"] = list(track.rel_plate_bbox)
 
                 det.pop("plate_crop", None)
                 updated_detections.append(det)

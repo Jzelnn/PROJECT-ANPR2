@@ -1540,11 +1540,11 @@ function handleDetectionResult(data, silent=false){
     activeDet.frame_id = data.frame_id;
     activeDet._hasBakedPlateBox = Boolean(usingBackendAnnotatedImage && activeDet.plate_bbox);
     // Primary track switch: clean old boxes immediately if tracking a new vehicle
-    if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
+    if (lastActiveTrackId !== null && String(lastActiveTrackId) !== String(activeDet.track_id)) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
       clearBoxes();
       lastDetectionData = null; // Reset total data mobil sebelumnya agar tidak bocor ke mobil baru
-    } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
+    } else if (lastDetectionData && (lastActiveTrackId === null || String(lastActiveTrackId) === String(activeDet.track_id))) {
       // Retain relative plate & OCR knowledge across fast detection frames for the SAME track
       activeDet._last_plate_frame_id = lastDetectionData._last_plate_frame_id;
       activeDet._last_ocr_frame_id = lastDetectionData._last_ocr_frame_id;
@@ -1939,7 +1939,13 @@ function drawBoxes(det){
     // Synchronizes 1.5 FPS AI bounding boxes with 25/30 FPS real-time moving video
     // ------------------------------------------------------------
     let effVxBox = det.bbox;
-    let effPlateBox = det.plate_bbox || (lastDetectionData && lastDetectionData.track_id === det.track_id ? lastDetectionData.plate_bbox : null);
+    let effPlateBox = det.plate_bbox;
+    if (!effPlateBox && det.bbox && (det.rel_plate_bbox || (lastDetectionData && lastDetectionData.rel_plate_bbox))) {
+      effPlateBox = projectPlateBbox(det.bbox, det.rel_plate_bbox || lastDetectionData.rel_plate_bbox);
+    }
+    if (!effPlateBox && lastDetectionData && (lastDetectionData.track_id === det.track_id || !lastDetectionData.track_id)) {
+      effPlateBox = lastDetectionData.plate_bbox;
+    }
 
     if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
       const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
@@ -2776,7 +2782,8 @@ function handleWsMessage(msg){
     updateAiIndicator(true, "AI ACTIVE (WS)");
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
-    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
+    if (!lastDetectionData) return;
+    if (lastActiveTrackId != null && String(lastActiveTrackId) !== String(msg.track_id)) return;
     if (msg.frame_id != null && lastDetectionData._last_plate_frame_id != null && msg.frame_id < lastDetectionData._last_plate_frame_id){
       console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < last=${lastDetectionData._last_plate_frame_id}`);
       return;
@@ -2794,11 +2801,7 @@ function handleWsMessage(msg){
       resolvedPlateBox = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
     }
     if (!resolvedPlateBox) {
-      if (msg.frame_id == null || latestRenderedFrameId <= 0 || msg.frame_id >= latestRenderedFrameId) {
-        resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
-      } else {
-        resolvedPlateBox = msg.projected_plate_bbox || null;
-      }
+      resolvedPlateBox = msg.projected_plate_bbox || msg.plate_bbox || null;
     }
     if (resolvedPlateBox) {
       lastDetectionData.plate_bbox = resolvedPlateBox;
@@ -2810,7 +2813,7 @@ function handleWsMessage(msg){
     drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
-    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
+    if (!lastDetectionData || (lastActiveTrackId != null && String(lastActiveTrackId) !== String(msg.track_id))) return;
 
     // Issue 2 Guard: Check if the active track is already locked in a confirmed state
     const isCurrentTrackConfirmed = (
