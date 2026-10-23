@@ -3654,6 +3654,38 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 # ============================================================
                 if not existing_trk.lost_interest:
                     now_plate = time.time()
+                    # Instant Frame-1 Plate Bbox: jika track baru dan belum punya rel_plate_bbox, deteksi plat langsung
+                    # agar kotak plat nomor kuning tampil seketika di frame pertama tanpa menunggu async task!
+                    if existing_trk.rel_plate_bbox is None and existing_trk.last_plate_bbox is None and vehicle_crop.size > 0:
+                        try:
+                            vw = max(1, x2 - x1)
+                            vh = max(1, y2 - y1)
+                            pad_x = int(vw * 0.06)
+                            pad_y_top = int(vh * 0.04)
+                            pad_y_bot = int(vh * 0.10)
+                            cx1 = max(0, x1 - pad_x)
+                            cy1 = max(0, y1 - pad_y_top)
+                            cx2 = min(iw, x2 + pad_x)
+                            cy2 = min(ih, y2 + pad_y_bot)
+                            padded_crop = img[cy1:cy2, cx1:cx2] if img is not None and getattr(img, 'size', 0) > 0 else vehicle_crop
+                            if padded_crop.size > 0:
+                                with plate_infer_lock:
+                                    pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                                for b in pdet_crop.boxes:
+                                    cls_id = int(b.cls[0])
+                                    cname = plate_detector.names.get(cls_id, "")
+                                    if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
+                                        continue
+                                    cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                                    abs_b = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
+                                    if is_valid_plate_box(abs_b, iw, ih):
+                                        existing_trk.update_plate_bbox(abs_b, [x1, y1, x2, y2], frame_id=frame_id)
+                                        existing_trk.last_plate_conf = float(b.conf[0])
+                                        existing_trk.plate_detected = True
+                                        break
+                        except Exception:
+                            pass
+
                     should_detect_plate = False
                     is_alignment_only = bool(existing_trk.is_locked or existing_trk.status in ("CONFIRMED", "HISTORY_SAVED"))
 
