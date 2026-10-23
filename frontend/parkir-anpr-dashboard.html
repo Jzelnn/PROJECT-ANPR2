@@ -1540,11 +1540,11 @@ function handleDetectionResult(data, silent=false){
     activeDet.frame_id = data.frame_id;
     activeDet._hasBakedPlateBox = Boolean(usingBackendAnnotatedImage && activeDet.plate_bbox);
     // Primary track switch: clean old boxes immediately if tracking a new vehicle
-    if (lastActiveTrackId !== null && String(lastActiveTrackId) !== String(activeDet.track_id)) {
+    if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
       clearBoxes();
       lastDetectionData = null; // Reset total data mobil sebelumnya agar tidak bocor ke mobil baru
-    } else if (lastDetectionData && (lastActiveTrackId === null || String(lastActiveTrackId) === String(activeDet.track_id))) {
+    } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
       // Retain relative plate & OCR knowledge across fast detection frames for the SAME track
       activeDet._last_plate_frame_id = lastDetectionData._last_plate_frame_id;
       activeDet._last_ocr_frame_id = lastDetectionData._last_ocr_frame_id;
@@ -1558,11 +1558,6 @@ function handleDetectionResult(data, silent=false){
           activeDet.plate_confidence = lastDetectionData.plate_confidence;
           activeDet.plate_detected = lastDetectionData.plate_detected;
         }
-      }
-      if (!activeDet.plate_bbox && lastDetectionData.plate_bbox) {
-        activeDet.plate_bbox = lastDetectionData.plate_bbox;
-        activeDet.plate_confidence = lastDetectionData.plate_confidence;
-        activeDet.plate_detected = true;
       }
       const hasNewerOcrState = Boolean(
         lastDetectionData.license_plate && (
@@ -1940,12 +1935,6 @@ function drawBoxes(det){
     // ------------------------------------------------------------
     let effVxBox = det.bbox;
     let effPlateBox = det.plate_bbox;
-    if (!effPlateBox && det.bbox && (det.rel_plate_bbox || (lastDetectionData && lastDetectionData.rel_plate_bbox))) {
-      effPlateBox = projectPlateBbox(det.bbox, det.rel_plate_bbox || lastDetectionData.rel_plate_bbox);
-    }
-    if (!effPlateBox && lastDetectionData && (lastDetectionData.track_id === det.track_id || !lastDetectionData.track_id)) {
-      effPlateBox = lastDetectionData.plate_bbox;
-    }
 
     if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
       const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
@@ -2038,21 +2027,20 @@ function drawBoxes(det){
       boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
       boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
-      const vName = (typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle').toUpperCase();
+      const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+      const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
       const bStyle = det.body_style;
-      const vConfVal = det.vehicle_confidence || (det.vehicle_conf != null ? det.vehicle_conf : null);
-      const vehConf = vConfVal ? ` ${Math.round(vConfVal * 100)}%` : '';
-      let baseLabel = `${vName}${vehConf}`;
+      let baseLabel = vName;
       if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        const bConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? ` ${Math.round(det.body_style_confidence * 100)}%` : '';
-        baseLabel = `${vName}${vehConf} | ${bStyle.toUpperCase()}${bConf}`;
+        baseLabel = `${vName} • ${bStyle}`;
       } else if (bStyle) {
-        baseLabel = `${bStyle.toUpperCase()}${vehConf}`;
+        baseLabel = bStyle;
       }
+      const vehConf = det.vehicle_confidence ? ` (${Math.round(det.vehicle_confidence * 100)}%)` : '';
 
       const labelElem = boxVeh.querySelector('.det-label');
       boxVeh.className = 'det-box';
-      const labelText = baseLabel;
+      const labelText = `${baseLabel}${vehConf}`;
       labelElem.textContent = labelText;
       if (isConfirmed) {
         boxVeh.style.borderColor = '#10b981';
@@ -2088,7 +2076,7 @@ function drawBoxes(det){
       boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
       boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
       boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-      const plateLabel = det.ocr_text || det.license_plate || (lastDetectionData && lastDetectionData.track_id === det.track_id ? (lastDetectionData.ocr_text || lastDetectionData.license_plate) : null) || 'PLATE DETECTED';
+      const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
       boxPlate.querySelector('.det-label').textContent = plateLabel;
     } else if (boxPlate){
       boxPlate.style.display = 'none';
@@ -2467,8 +2455,6 @@ function addLogRow(det, isInit=false){
   const bodyOrType = formatEntryHistoryBodyStyle(det);
   const bodyConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? det.body_style_confidence : null;
   const bodyConfBadge = (bodyConf != null && bodyOrType !== 'Classifying...' && bodyOrType !== 'Unknown') ? `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bodyConf * 100)}%">${Math.round(bodyConf * 100)}%</span>` : '';
-  const vehConf = (det.vehicle_confidence != null && det.vehicle_confidence > 0) ? det.vehicle_confidence : (det.vehicle_conf != null && det.vehicle_conf > 0 ? det.vehicle_conf : (det.track_confidence != null && det.track_confidence > 0 ? det.track_confidence : null));
-  const vehConfBadge = (vehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#ecfdf5; color:#047857; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Deteksi Kendaraan: ${Math.round(vehConf * 100)}%">Veh ${Math.round(vehConf * 100)}%</span>` : '';
 
   // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList
   if (det.id && logList.querySelector(`.log-row[data-id="${det.id}"]`)) {
@@ -2505,7 +2491,7 @@ function addLogRow(det, isInit=false){
       const typeEl = topRow.querySelector('.log-type');
       if (typeEl) {
         typeEl.innerHTML = `
-          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}${vehConfBadge}</span>
+          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}</span>
           ${procDisplay}
         `;
       }
@@ -2541,7 +2527,7 @@ function addLogRow(det, isInit=false){
     <span class="log-time">${timeStr}</span>
     <span class="log-plate" style="display:inline-flex; align-items:center;">${trackPrefix}<span>${plateText}</span>${plateConfBadge}</span>
     <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
-      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}${vehConfBadge}</span>
+      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}</span>
       ${procDisplay}
     </span>
   `;
@@ -2587,25 +2573,15 @@ function shareDetection(){
   const now = new Date();
   const vType = typeLabel[d.vehicle_type] || d.vehicle_type || 'Vehicle';
   const bStyle = d.body_style ? ` (${d.body_style})` : '';
-  const ocrConf = (d.ocr_confidence != null && d.ocr_confidence > 0)
-    ? Math.round(d.ocr_confidence * 100) + '%'
-    : (d.plate_confidence ? Math.round(d.plate_confidence * 100) + '%' : (d.confidence ? Math.round(d.confidence * 100) + '%' : '-'));
-  const vehConf = (d.vehicle_confidence != null && d.vehicle_confidence > 0)
-    ? Math.round(d.vehicle_confidence * 100) + '%'
-    : '-';
-  const bodyConf = (d.body_style_confidence != null && d.body_style_confidence > 0)
-    ? Math.round(d.body_style_confidence * 100) + '%'
-    : '-';
+  const conf = d.confidence ? Math.round(d.confidence*100)+'%' : (d.plate_confidence ? Math.round(d.plate_confidence*100)+'%' : '95%');
   
   const shareText = 
 `[Parkour ANPR] Vehicle Entry Report
 --------------------------------------
 License Plate : ${d.license_plate}
-Plate OCR Conf: ${ocrConf}
 Vehicle Type  : ${vType}${bStyle}
-Veh Confidence: ${vehConf}
-Body Conf     : ${bodyConf}
 Timestamp     : ${d.timestamp || now.toISOString().replace('T', ' ').slice(0,19)}
+Confidence    : ${conf}
 Status        : Verified Entry - Gate 01`;
 
   if (navigator.clipboard && navigator.clipboard.writeText){
@@ -2792,8 +2768,7 @@ function handleWsMessage(msg){
     updateAiIndicator(true, "AI ACTIVE (WS)");
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
-    if (!lastDetectionData) return;
-    if (lastActiveTrackId != null && String(lastActiveTrackId) !== String(msg.track_id)) return;
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
     if (msg.frame_id != null && lastDetectionData._last_plate_frame_id != null && msg.frame_id < lastDetectionData._last_plate_frame_id){
       console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < last=${lastDetectionData._last_plate_frame_id}`);
       return;
@@ -2811,7 +2786,11 @@ function handleWsMessage(msg){
       resolvedPlateBox = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
     }
     if (!resolvedPlateBox) {
-      resolvedPlateBox = msg.projected_plate_bbox || msg.plate_bbox || null;
+      if (msg.frame_id == null || latestRenderedFrameId <= 0 || msg.frame_id >= latestRenderedFrameId) {
+        resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
+      } else {
+        resolvedPlateBox = msg.projected_plate_bbox || null;
+      }
     }
     if (resolvedPlateBox) {
       lastDetectionData.plate_bbox = resolvedPlateBox;
@@ -2823,7 +2802,7 @@ function handleWsMessage(msg){
     drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
   } else if (msg.type === "ocr_update"){
-    if (!lastDetectionData || (lastActiveTrackId != null && String(lastActiveTrackId) !== String(msg.track_id))) return;
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
 
     // Issue 2 Guard: Check if the active track is already locked in a confirmed state
     const isCurrentTrackConfirmed = (
@@ -2896,23 +2875,21 @@ function handleWsMessage(msg){
     updateResultCard(lastDetectionData);
     const vLabel = document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
-      const vName = (typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle').toUpperCase();
+      const vName = typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle';
       const bStyle = lastDetectionData.body_style;
-      const vConfVal = lastDetectionData.vehicle_confidence || (lastDetectionData.vehicle_conf != null ? lastDetectionData.vehicle_conf : null);
-      const vehConf = vConfVal ? ` ${Math.round(vConfVal * 100)}%` : '';
-      let baseLabel = `${vName}${vehConf}`;
+      let baseLabel = vName;
       if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        const bConf = (lastDetectionData.body_style_confidence != null && lastDetectionData.body_style_confidence > 0) ? ` ${Math.round(lastDetectionData.body_style_confidence * 100)}%` : '';
-        baseLabel = `${vName}${vehConf} | ${bStyle.toUpperCase()}${bConf}`;
+        baseLabel = `${vName} • ${bStyle}`;
       } else if (bStyle) {
-        baseLabel = `${bStyle.toUpperCase()}${vehConf}`;
+        baseLabel = bStyle;
       }
-      vLabel.textContent = baseLabel;
+      const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
+      vLabel.textContent = `${baseLabel}${vehConf}`;
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
     if (msg.record){
-      if (lastDetectionData && (String(lastDetectionData.track_id) === String(msg.record.track_id) || !lastDetectionData.track_id)) {
+      if (lastDetectionData && lastDetectionData.track_id === msg.record.track_id) {
         lastDetectionData.status = 'CONFIRMED';
         lastDetectionData.confirmation_status = 'CONFIRMED';
         lastDetectionData.ocr_status = 'CONFIRMED';
@@ -2922,11 +2899,6 @@ function handleWsMessage(msg){
         }
         if (msg.record.ocr_confidence) {
           lastDetectionData.ocr_confidence = msg.record.ocr_confidence;
-        }
-        if (msg.record.vehicle_confidence) {
-          lastDetectionData.vehicle_confidence = msg.record.vehicle_confidence;
-        } else if (lastDetectionData.vehicle_confidence) {
-          msg.record.vehicle_confidence = lastDetectionData.vehicle_confidence;
         }
         if (!msg.record.body_style && lastDetectionData.body_style) {
           msg.record.body_style = lastDetectionData.body_style;
