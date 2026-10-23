@@ -388,6 +388,7 @@ def draw_annotations_on_image(img, detections, interest_area=None):
 
             v_name = v_type_raw.upper() if v_type_raw else "VEHICLE"
             has_body = bool(b_style_raw and b_style_raw.upper() not in ("UNKNOWN", "NONE", "NULL", "UNDEFINED"))
+            v_pct = f" {int(round(float(v_conf) * 100))}%" if v_conf is not None and 0 < float(v_conf) <= 1.0 else ""
 
             if has_body:
                 b_name = b_style_raw.upper()
@@ -398,14 +399,12 @@ def draw_annotations_on_image(img, detections, interest_area=None):
                     b_text = b_name
 
                 if b_name.lower() != v_name.lower():
-                    v_label = f"{v_name} | {b_text}"
+                    v_label = f"{v_name}{v_pct} | {b_text}"
                 else:
-                    v_label = b_text
+                    v_label = f"{b_name}{v_pct}"
             else:
                 # Body style not available yet: display only vehicle detection label without incorrect/stale result
-                v_label = v_name
-                if v_conf is not None and 0 < float(v_conf) <= 1.0:
-                    v_label += f" {int(round(float(v_conf) * 100))}%"
+                v_label = f"{v_name}{v_pct}"
 
             (tw, th), _ = cv2.getTextSize(v_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             lbl_y1 = max(0, vy1 - th - 8)

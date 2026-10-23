@@ -2027,20 +2027,21 @@ function drawBoxes(det){
       boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
       boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
-      const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
-      const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
+      const vName = (typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle').toUpperCase();
       const bStyle = det.body_style;
-      let baseLabel = vName;
+      const vConfVal = det.vehicle_confidence || (det.vehicle_conf != null ? det.vehicle_conf : null);
+      const vehConf = vConfVal ? ` ${Math.round(vConfVal * 100)}%` : '';
+      let baseLabel = `${vName}${vehConf}`;
       if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
+        const bConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? ` ${Math.round(det.body_style_confidence * 100)}%` : '';
+        baseLabel = `${vName}${vehConf} | ${bStyle.toUpperCase()}${bConf}`;
       } else if (bStyle) {
-        baseLabel = bStyle;
+        baseLabel = `${bStyle.toUpperCase()}${vehConf}`;
       }
-      const vehConf = det.vehicle_confidence ? ` (${Math.round(det.vehicle_confidence * 100)}%)` : '';
 
       const labelElem = boxVeh.querySelector('.det-label');
       boxVeh.className = 'det-box';
-      const labelText = `${baseLabel}${vehConf}`;
+      const labelText = baseLabel;
       labelElem.textContent = labelText;
       if (isConfirmed) {
         boxVeh.style.borderColor = '#10b981';
@@ -2455,6 +2456,8 @@ function addLogRow(det, isInit=false){
   const bodyOrType = formatEntryHistoryBodyStyle(det);
   const bodyConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? det.body_style_confidence : null;
   const bodyConfBadge = (bodyConf != null && bodyOrType !== 'Classifying...' && bodyOrType !== 'Unknown') ? `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bodyConf * 100)}%">${Math.round(bodyConf * 100)}%</span>` : '';
+  const vehConf = (det.vehicle_confidence != null && det.vehicle_confidence > 0) ? det.vehicle_confidence : (det.vehicle_conf != null && det.vehicle_conf > 0 ? det.vehicle_conf : 0.95);
+  const vehConfBadge = (vehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#ecfdf5; color:#047857; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Deteksi Kendaraan: ${Math.round(vehConf * 100)}%">Veh ${Math.round(vehConf * 100)}%</span>` : '';
 
   // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList
   if (det.id && logList.querySelector(`.log-row[data-id="${det.id}"]`)) {
@@ -2491,7 +2494,7 @@ function addLogRow(det, isInit=false){
       const typeEl = topRow.querySelector('.log-type');
       if (typeEl) {
         typeEl.innerHTML = `
-          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}</span>
+          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}${vehConfBadge}</span>
           ${procDisplay}
         `;
       }
@@ -2527,7 +2530,7 @@ function addLogRow(det, isInit=false){
     <span class="log-time">${timeStr}</span>
     <span class="log-plate" style="display:inline-flex; align-items:center;">${trackPrefix}<span>${plateText}</span>${plateConfBadge}</span>
     <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
-      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}</span>
+      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}${vehConfBadge}</span>
       ${procDisplay}
     </span>
   `;
@@ -2875,16 +2878,18 @@ function handleWsMessage(msg){
     updateResultCard(lastDetectionData);
     const vLabel = document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
-      const vName = typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle';
+      const vName = (typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle').toUpperCase();
       const bStyle = lastDetectionData.body_style;
-      let baseLabel = vName;
+      const vConfVal = lastDetectionData.vehicle_confidence || (lastDetectionData.vehicle_conf != null ? lastDetectionData.vehicle_conf : null);
+      const vehConf = vConfVal ? ` ${Math.round(vConfVal * 100)}%` : '';
+      let baseLabel = `${vName}${vehConf}`;
       if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
+        const bConf = (lastDetectionData.body_style_confidence != null && lastDetectionData.body_style_confidence > 0) ? ` ${Math.round(lastDetectionData.body_style_confidence * 100)}%` : '';
+        baseLabel = `${vName}${vehConf} | ${bStyle.toUpperCase()}${bConf}`;
       } else if (bStyle) {
-        baseLabel = bStyle;
+        baseLabel = `${bStyle.toUpperCase()}${vehConf}`;
       }
-      const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
-      vLabel.textContent = `${baseLabel}${vehConf}`;
+      vLabel.textContent = baseLabel;
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
