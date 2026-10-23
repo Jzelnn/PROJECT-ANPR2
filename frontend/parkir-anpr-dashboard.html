@@ -1559,6 +1559,11 @@ function handleDetectionResult(data, silent=false){
           activeDet.plate_detected = lastDetectionData.plate_detected;
         }
       }
+      if (!activeDet.plate_bbox && lastDetectionData.plate_bbox) {
+        activeDet.plate_bbox = lastDetectionData.plate_bbox;
+        activeDet.plate_confidence = lastDetectionData.plate_confidence;
+        activeDet.plate_detected = true;
+      }
       const hasNewerOcrState = Boolean(
         lastDetectionData.license_plate && (
           !activeDet.license_plate ||
@@ -1934,7 +1939,7 @@ function drawBoxes(det){
     // Synchronizes 1.5 FPS AI bounding boxes with 25/30 FPS real-time moving video
     // ------------------------------------------------------------
     let effVxBox = det.bbox;
-    let effPlateBox = det.plate_bbox;
+    let effPlateBox = det.plate_bbox || (lastDetectionData && lastDetectionData.track_id === det.track_id ? lastDetectionData.plate_bbox : null);
 
     if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
       const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
@@ -2077,7 +2082,7 @@ function drawBoxes(det){
       boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
       boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
       boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-      const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
+      const plateLabel = det.ocr_text || det.license_plate || (lastDetectionData && lastDetectionData.track_id === det.track_id ? (lastDetectionData.ocr_text || lastDetectionData.license_plate) : null) || 'PLATE DETECTED';
       boxPlate.querySelector('.det-label').textContent = plateLabel;
     } else if (boxPlate){
       boxPlate.style.display = 'none';
@@ -2456,7 +2461,7 @@ function addLogRow(det, isInit=false){
   const bodyOrType = formatEntryHistoryBodyStyle(det);
   const bodyConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? det.body_style_confidence : null;
   const bodyConfBadge = (bodyConf != null && bodyOrType !== 'Classifying...' && bodyOrType !== 'Unknown') ? `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bodyConf * 100)}%">${Math.round(bodyConf * 100)}%</span>` : '';
-  const vehConf = (det.vehicle_confidence != null && det.vehicle_confidence > 0) ? det.vehicle_confidence : (det.vehicle_conf != null && det.vehicle_conf > 0 ? det.vehicle_conf : 0.95);
+  const vehConf = (det.vehicle_confidence != null && det.vehicle_confidence > 0) ? det.vehicle_confidence : (det.vehicle_conf != null && det.vehicle_conf > 0 ? det.vehicle_conf : (det.track_confidence != null && det.track_confidence > 0 ? det.track_confidence : null));
   const vehConfBadge = (vehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#ecfdf5; color:#047857; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Deteksi Kendaraan: ${Math.round(vehConf * 100)}%">Veh ${Math.round(vehConf * 100)}%</span>` : '';
 
   // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList

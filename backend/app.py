@@ -560,12 +560,18 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
     conf_rounded = round(plate_conf, 3)
     resolved_body_style = det.get("body_style")
+    raw_vconf = det.get("vehicle_confidence")
+    if raw_vconf is None:
+        raw_vconf = det.get("vehicle_conf") or det.get("v_conf")
+    rec_vconf = round(float(raw_vconf), 2) if raw_vconf is not None else None
+
     rec = {
         "id": int(now_epoch * 1000) % 1000000,
         "track_id": track_id,
         "timestamp": timestamp_str,
         "license_plate": plate_text,
         "vehicle_type": det.get("vehicle_type"),
+        "vehicle_confidence": rec_vconf,
         "body_style": resolved_body_style,
         "body_style_confidence": det.get("body_style_confidence"),
         "body_pending": False if resolved_body_style else bool(det.get("body_pending", False)),
@@ -2375,9 +2381,11 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         self.total_processing_ms = total_proc_ms
 
         conf_rounded = round(stable_conf, 3)
+        v_conf_val = round(self.track_confidence, 2) if self.track_confidence > 0 else round(best_f.get("v_conf", 0.0), 2)
         self.confirmed_data = {
             "track_id": self.track_id,
             "vehicle_type": best_type,
+            "vehicle_confidence": v_conf_val if v_conf_val > 0 else None,
             "body_style": best_style,
             "body_style_confidence": round(avg_style_conf, 3) if avg_style_conf else None,
             "body_pending": bool(self.body_pending and not best_style),
@@ -2464,13 +2472,13 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
                     ratio_w = cand_w / prev_w
                     ratio_h = cand_h / prev_h
 
-                    # Spatial outlier rejection: vertical jump > 0.08, horizontal jump > 0.12, or extreme box size change
-                    if delta_y > 0.08 or delta_x > 0.12 or ratio_w < 0.45 or ratio_w > 2.2 or ratio_h < 0.45 or ratio_h > 2.2:
+                    # Spatial outlier rejection: vertical jump > 0.18, horizontal jump > 0.22, or extreme box size change
+                    if delta_y > 0.18 or delta_x > 0.22 or ratio_w < 0.35 or ratio_w > 2.8 or ratio_h < 0.35 or ratio_h > 2.8:
                         print(f"[PLATE_ALIGNMENT_OUTLIER_REJECTED] track_id={self.track_id} frame_id={frame_id} dy={delta_y:.3f} dx={delta_x:.3f} rw={ratio_w:.2f}", flush=True)
                         return False
 
-                    # Valid update: smooth coordinates via EMA (alpha=0.25) to follow perspective changes smoothly without jumping
-                    alpha = 0.25
+                    # Valid update: smooth coordinates via EMA (alpha=0.30) to follow perspective changes smoothly without jumping
+                    alpha = 0.30
                     smooth_rx1 = (1.0 - alpha) * prev_rx1 + alpha * rx1
                     smooth_ry1 = (1.0 - alpha) * prev_ry1 + alpha * ry1
                     smooth_rx2 = (1.0 - alpha) * prev_rx2 + alpha * rx2
@@ -2793,6 +2801,10 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
                         det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                        if track.confirmed_data.get("vehicle_confidence") and not det.get("vehicle_confidence"):
+                            det["vehicle_confidence"] = track.confirmed_data["vehicle_confidence"]
+                        if not det.get("plate_bbox"):
+                            det["plate_bbox"] = track.get_current_plate_bbox(det.get("bbox")) or track.last_plate_bbox or track.confirmed_data.get("plate_bbox")
                 elif track.status == "CONFIRMED":
                     det["status"] = "CONFIRMED"
                     det["ocr_status"] = "CONFIRMED"
@@ -2810,6 +2822,10 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
                         det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                        if track.confirmed_data.get("vehicle_confidence") and not det.get("vehicle_confidence"):
+                            det["vehicle_confidence"] = track.confirmed_data["vehicle_confidence"]
+                        if not det.get("plate_bbox"):
+                            det["plate_bbox"] = track.get_current_plate_bbox(det.get("bbox")) or track.last_plate_bbox or track.confirmed_data.get("plate_bbox")
                 else:
                     det["status"] = "ANALYZING"
                     cand_count = track.candidate_counts.get(track.best_candidate, 0) if track.best_candidate else 0
