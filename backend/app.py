@@ -479,6 +479,10 @@ def save_parking_record(det, source_img=None, source_img_path=None):
                 if trk:
                     if not det.get("plate_bbox") and trk.last_plate_bbox:
                         det["plate_bbox"] = list(trk.last_plate_bbox)
+                    if not det.get("vehicle_confidence") and trk.confirmed_data and trk.confirmed_data.get("vehicle_confidence"):
+                        det["vehicle_confidence"] = trk.confirmed_data["vehicle_confidence"]
+                    elif not det.get("vehicle_confidence") and getattr(trk, 'track_confidence', 0) > 0:
+                        det["vehicle_confidence"] = round(trk.track_confidence, 2)
                     if not det.get("body_style") and trk.cached_body_style:
                         det["body_style"] = trk.cached_body_style
                         det["body_style_confidence"] = round(trk.cached_body_conf, 3) if trk.cached_body_conf else None
@@ -4421,11 +4425,13 @@ def export_history():
     records = list(LATEST_RECORDS)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID", "Entry Timestamp", "License Plate", "Vehicle Type", "Body Style", "Confidence", "Snapshot File"])
+    writer.writerow(["ID", "Entry Timestamp", "License Plate", "Plate OCR Conf", "Vehicle Type", "Vehicle Conf", "Body Style", "Body Style Conf", "Snapshot File"])
     for r in records:
-        conf_pct = f"{round(r['confidence']*100, 1)}%" if r.get("confidence") else "-"
+        plate_conf_pct = f"{round(r['confidence']*100, 1)}%" if r.get("confidence") else "-"
+        veh_conf_pct = f"{round(r['vehicle_confidence']*100, 1)}%" if r.get("vehicle_confidence") else "-"
+        body_conf_pct = f"{round(r['body_style_confidence']*100, 1)}%" if r.get("body_style_confidence") else "-"
         snap = r.get("snapshot_url", "").split("/")[-1] if r.get("snapshot_url") else "-"
-        writer.writerow([r.get("id"), r.get("timestamp"), r.get("license_plate") or "-", r.get("vehicle_type") or "-", r.get("body_style") or "-", conf_pct, snap])
+        writer.writerow([r.get("id"), r.get("timestamp"), r.get("license_plate") or "-", plate_conf_pct, r.get("vehicle_type") or "-", veh_conf_pct, r.get("body_style") or "-", body_conf_pct, snap])
 
     output.seek(0)
     return Response(

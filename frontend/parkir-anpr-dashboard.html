@@ -2587,15 +2587,25 @@ function shareDetection(){
   const now = new Date();
   const vType = typeLabel[d.vehicle_type] || d.vehicle_type || 'Vehicle';
   const bStyle = d.body_style ? ` (${d.body_style})` : '';
-  const conf = d.confidence ? Math.round(d.confidence*100)+'%' : (d.plate_confidence ? Math.round(d.plate_confidence*100)+'%' : '95%');
+  const ocrConf = (d.ocr_confidence != null && d.ocr_confidence > 0)
+    ? Math.round(d.ocr_confidence * 100) + '%'
+    : (d.plate_confidence ? Math.round(d.plate_confidence * 100) + '%' : (d.confidence ? Math.round(d.confidence * 100) + '%' : '-'));
+  const vehConf = (d.vehicle_confidence != null && d.vehicle_confidence > 0)
+    ? Math.round(d.vehicle_confidence * 100) + '%'
+    : '-';
+  const bodyConf = (d.body_style_confidence != null && d.body_style_confidence > 0)
+    ? Math.round(d.body_style_confidence * 100) + '%'
+    : '-';
   
   const shareText = 
 `[Parkour ANPR] Vehicle Entry Report
 --------------------------------------
 License Plate : ${d.license_plate}
+Plate OCR Conf: ${ocrConf}
 Vehicle Type  : ${vType}${bStyle}
+Veh Confidence: ${vehConf}
+Body Conf     : ${bodyConf}
 Timestamp     : ${d.timestamp || now.toISOString().replace('T', ' ').slice(0,19)}
-Confidence    : ${conf}
 Status        : Verified Entry - Gate 01`;
 
   if (navigator.clipboard && navigator.clipboard.writeText){
@@ -2902,7 +2912,7 @@ function handleWsMessage(msg){
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
     if (msg.record){
-      if (lastDetectionData && lastDetectionData.track_id === msg.record.track_id) {
+      if (lastDetectionData && (String(lastDetectionData.track_id) === String(msg.record.track_id) || !lastDetectionData.track_id)) {
         lastDetectionData.status = 'CONFIRMED';
         lastDetectionData.confirmation_status = 'CONFIRMED';
         lastDetectionData.ocr_status = 'CONFIRMED';
@@ -2912,6 +2922,11 @@ function handleWsMessage(msg){
         }
         if (msg.record.ocr_confidence) {
           lastDetectionData.ocr_confidence = msg.record.ocr_confidence;
+        }
+        if (msg.record.vehicle_confidence) {
+          lastDetectionData.vehicle_confidence = msg.record.vehicle_confidence;
+        } else if (lastDetectionData.vehicle_confidence) {
+          msg.record.vehicle_confidence = lastDetectionData.vehicle_confidence;
         }
         if (!msg.record.body_style && lastDetectionData.body_style) {
           msg.record.body_style = lastDetectionData.body_style;
