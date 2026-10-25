@@ -1357,6 +1357,57 @@ function toggleMotionExtrapolation(enable){
   showToast(`Motion Sync: ${ENABLE_MOTION_EXTRAPOLATION ? 'ON' : 'OFF'}`);
 }
 
+function formatPercent(val){
+  if (val == null || val === '' || isNaN(val)) return '-';
+  const num = parseFloat(val);
+  const pct = num <= 1.0 ? num * 100 : num;
+  return pct.toFixed(1) + '%';
+}
+
+function formatVehicleBoxLabel(det){
+  if (!det) return 'VEHICLE';
+  const vTypeRaw = String(det.vehicle_type || '').trim();
+  const bStyleRaw = String(det.body_style || '').trim();
+  const vName = (vTypeRaw ? vTypeRaw : 'VEHICLE').toUpperCase();
+  const hasBody = Boolean(bStyleRaw && !['UNKNOWN', 'NONE', 'NULL', 'UNDEFINED', '-'].includes(bStyleRaw.toUpperCase()));
+
+  const vConf = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0)
+    ? formatPercent(det.vehicle_confidence)
+    : '';
+  const vPctStr = vConf ? ` ${vConf}` : '';
+
+  if (hasBody) {
+    const bName = bStyleRaw.toUpperCase();
+    const bConf = (det.body_style_confidence != null && !isNaN(det.body_style_confidence) && det.body_style_confidence > 0)
+      ? formatPercent(det.body_style_confidence)
+      : '';
+    const bText = bConf ? `${bName} ${bConf}` : bName;
+
+    if (bName.toLowerCase() !== vName.toLowerCase()) {
+      return `${vName}${vPctStr} | ${bText}`;
+    } else {
+      return (bText === bName && vPctStr) ? `${bText}${vPctStr}` : bText;
+    }
+  } else {
+    return `${vName}${vPctStr}`;
+  }
+}
+
+function formatPlateBoxLabel(det){
+  if (!det) return 'PLATE DETECTED';
+  const plate = String(det.ocr_text || det.license_plate || '').trim();
+  const hasValidPlate = Boolean(plate && !['UNKNOWN', 'TIDAK_TERBACA', 'NONE', 'NULL', '-', ''].includes(plate.toUpperCase()));
+  const rawOcrConf = det.ocr_confidence != null ? det.ocr_confidence : det.plate_confidence;
+
+  if (hasValidPlate) {
+    if (rawOcrConf != null && !isNaN(rawOcrConf) && Number(rawOcrConf) > 0) {
+      return `${plate} | OCR ${formatPercent(rawOcrConf)}`;
+    }
+    return plate;
+  }
+  return plate || 'PLATE DETECTED';
+}
+
 function isBackendAnnotatedVisible(){
   const feedImg = document.getElementById('feedImg');
   if (feedImg && feedImg.dataset.backendAnnotated === 'true') return true;
@@ -1582,6 +1633,9 @@ function handleDetectionResult(data, silent=false){
         activeDet.body_style = lastDetectionData.body_style;
         activeDet.body_style_confidence = lastDetectionData.body_style_confidence;
       }
+      if (activeDet.vehicle_confidence == null && lastDetectionData.vehicle_confidence != null) {
+        activeDet.vehicle_confidence = lastDetectionData.vehicle_confidence;
+      }
       // Retain locked confirmed status across fast detection frames for the SAME track
       const isPrevConfirmed = (
         lastDetectionData.status === 'CONFIRMED' ||
@@ -1597,6 +1651,27 @@ function handleDetectionResult(data, silent=false){
           activeDet.license_plate = lastDetectionData.license_plate;
           activeDet.ocr_text = lastDetectionData.ocr_text || lastDetectionData.license_plate;
           activeDet.ocr_confidence = lastDetectionData.ocr_confidence;
+        }
+        if (lastDetectionData.record_id) {
+          activeDet.record_id = lastDetectionData.record_id;
+        }
+      }
+
+      // If track is confirmed, enforce authoritative confirmed vehicle confidence consistently across all UI components!
+      const isTrackConfirmed = (
+        activeDet.status === 'CONFIRMED' ||
+        activeDet.status === 'HISTORY_SAVED' ||
+        activeDet.confirmation_status === 'CONFIRMED' ||
+        activeDet.confirmation_status === 'HISTORY_SAVED' ||
+        isPrevConfirmed
+      );
+      if (isTrackConfirmed) {
+        const confVeh = activeDet.confirmed_vehicle_confidence != null
+          ? activeDet.confirmed_vehicle_confidence
+          : (lastDetectionData.confirmed_vehicle_confidence != null ? lastDetectionData.confirmed_vehicle_confidence : lastDetectionData.vehicle_confidence);
+        if (confVeh != null) {
+          activeDet.vehicle_confidence = confVeh;
+          activeDet.confirmed_vehicle_confidence = confVeh;
         }
       }
     }
@@ -2028,19 +2103,9 @@ function drawBoxes(det){
       boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
       const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
-      const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
-      const bStyle = det.body_style;
-      let baseLabel = vName;
-      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
-      } else if (bStyle) {
-        baseLabel = bStyle;
-      }
-      const vehConf = det.vehicle_confidence ? ` (${Math.round(det.vehicle_confidence * 100)}%)` : '';
-
       const labelElem = boxVeh.querySelector('.det-label');
       boxVeh.className = 'det-box';
-      const labelText = `${baseLabel}${vehConf}`;
+      const labelText = formatVehicleBoxLabel(det);
       labelElem.textContent = labelText;
       if (isConfirmed) {
         boxVeh.style.borderColor = '#10b981';
@@ -2076,7 +2141,7 @@ function drawBoxes(det){
       boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
       boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
       boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-      const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
+      const plateLabel = formatPlateBoxLabel(det);
       boxPlate.querySelector('.det-label').textContent = plateLabel;
     } else if (boxPlate){
       boxPlate.style.display = 'none';
@@ -2146,7 +2211,7 @@ function drawPlateBoxOnly(det){
   boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
   boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
   boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-  const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
+  const plateLabel = formatPlateBoxLabel(det);
   boxPlate.querySelector('.det-label').textContent = plateLabel;
 }
 
@@ -2199,8 +2264,8 @@ function updateResultCard(det, detMs){
       tagStatus.style.color = '#065f46';
       tagStatus.style.borderColor = '#a7f3d0';
       const confScore = det.ocr_confidence || det.confirmation_score || det.plate_confidence;
-      const pct = confScore ? Math.round(confScore * 100) : 100;
-      tagStatus.textContent = `CONFIRMED (${pct}%)`;
+      const pct = confScore ? formatPercent(confScore) : '100%';
+      tagStatus.textContent = `CONFIRMED (${pct})`;
     } else if (isConfirming) {
       tagStatus.style.background = '#fef3c7';
       tagStatus.style.color = '#92400e';
@@ -2230,12 +2295,13 @@ function updateResultCard(det, detMs){
   document.getElementById('plateText').textContent = plateDisplay;
 
   // Strict OCR confidence: NEVER fall back to vehicle confidence or YOLO plate bbox confidence when analyzing!
-  const confPct = (det.ocr_confidence && det.ocr_confidence > 0)
-    ? Math.round(det.ocr_confidence * 100) + '%'
-    : (isConfirmed && det.plate_confidence ? Math.round(det.plate_confidence * 100) + '%' : '-');
+  const rawOcr = (det.ocr_confidence != null && det.ocr_confidence > 0)
+    ? det.ocr_confidence
+    : ((isConfirmed && det.plate_confidence != null && det.plate_confidence > 0) ? det.plate_confidence : null);
+  const confPct = rawOcr != null ? formatPercent(rawOcr) : '-';
   document.getElementById('pctConf').textContent = confPct;
 
-  const vehPct = det.vehicle_confidence ? Math.round(det.vehicle_confidence * 100) + '%' : '-';
+  const vehPct = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? formatPercent(det.vehicle_confidence) : '-';
   const vehElem = document.getElementById('pctVehConf');
   if (vehElem) vehElem.textContent = vehPct;
 
@@ -2345,12 +2411,12 @@ function updateTelemetry(det){
   // 6. OCR Conf
   if (telemOcrConf) {
     const oConf = (det.ocr_confidence && det.ocr_confidence > 0) ? det.ocr_confidence : det.candidate_confidence;
-    telemOcrConf.textContent = oConf ? Math.round(oConf * 100) + '%' : '-';
+    telemOcrConf.textContent = oConf ? formatPercent(oConf) : '-';
   }
 
   // 7. Vehicle Conf
   if (telemVehConf) {
-    telemVehConf.textContent = det.vehicle_confidence ? Math.round(det.vehicle_confidence * 100) + '%' : '-';
+    telemVehConf.textContent = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? formatPercent(det.vehicle_confidence) : '-';
   }
 
   // 8. Interest / Age
@@ -2380,7 +2446,7 @@ function formatEntryHistoryBodyStyle(det){
   return 'Unknown';
 }
 
-function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null){
+function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null, vehConf=null){
   const cleanBody = bodyStyle != null ? String(bodyStyle).trim() : '';
   if (!cleanBody || cleanBody === '-' || cleanBody.toUpperCase() === 'UNKNOWN') return;
   const logList = document.getElementById('logList');
@@ -2420,7 +2486,45 @@ function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null
     } else if (bConfEl) {
       bConfEl.remove();
     }
+
+    const vConfVal = (vehConf != null && !isNaN(vehConf) && vehConf > 0) ? vehConf : null;
+    if (vConfVal != null) {
+      targetRow.setAttribute('data-veh-conf', vConfVal);
+      const vehConfBadge = `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(vConfVal)}">Veh ${formatPercent(vConfVal)}</span>`;
+      let vConfEl = targetRow.querySelector('.log-veh-conf');
+      if (vConfEl) {
+        vConfEl.outerHTML = vehConfBadge;
+      } else {
+        const typeEl = targetRow.querySelector('.log-type');
+        if (typeEl && typeEl.firstElementChild) {
+          typeEl.firstElementChild.insertAdjacentHTML('beforeend', vehConfBadge);
+        }
+      }
+    }
   }
+}
+
+function selectHistoryRecord(rec){
+  if (!rec) return;
+  const pConf = rec.ocr_confidence != null ? rec.ocr_confidence : (rec.plate_confidence != null ? rec.plate_confidence : rec.confidence);
+  const detLike = {
+    track_id: rec.track_id,
+    record_id: rec.id,
+    license_plate: rec.license_plate,
+    ocr_text: rec.license_plate,
+    ocr_confidence: pConf,
+    plate_confidence: rec.plate_confidence || pConf,
+    vehicle_type: rec.vehicle_type,
+    vehicle_confidence: rec.vehicle_confidence,
+    confirmed_vehicle_confidence: rec.vehicle_confidence,
+    body_style: rec.body_style,
+    body_style_confidence: rec.body_style_confidence,
+    status: 'CONFIRMED',
+    confirmation_status: 'CONFIRMED',
+    ocr_status: 'CONFIRMED',
+    latency_ms: rec.processing_ms || rec.latency_ms
+  };
+  updateResultCard(detLike);
 }
 
 function addLogRow(det, isInit=false){
@@ -2450,11 +2554,14 @@ function addLogRow(det, isInit=false){
   
   // Pisahkan secara eksplisit Akurasi OCR Plat Nomor dan Confidence Tipe Bodi
   const plateConf = det.ocr_confidence != null ? det.ocr_confidence : (det.plate_confidence != null ? det.plate_confidence : det.confidence);
-  const plateConfBadge = (plateConf != null && plateConf > 0) ? `<span class="log-plate-conf" style="font-size:10.5px; background:#eff6ff; color:#1d4ed8; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Akurasi Pembacaan Plat (OCR): ${Math.round(plateConf * 100)}%">OCR ${Math.round(plateConf * 100)}%</span>` : '';
+  const plateConfBadge = (plateConf != null && plateConf > 0) ? `<span class="log-plate-conf" style="font-size:10.5px; background:#eff6ff; color:#1d4ed8; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Akurasi Pembacaan Plat (OCR): ${formatPercent(plateConf)}">OCR ${formatPercent(plateConf)}</span>` : '';
   
   const bodyOrType = formatEntryHistoryBodyStyle(det);
   const bodyConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? det.body_style_confidence : null;
   const bodyConfBadge = (bodyConf != null && bodyOrType !== 'Classifying...' && bodyOrType !== 'Unknown') ? `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bodyConf * 100)}%">${Math.round(bodyConf * 100)}%</span>` : '';
+
+  const vehConf = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? det.vehicle_confidence : null;
+  const vehConfBadge = (vehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(vehConf)}">Veh ${formatPercent(vehConf)}</span>` : '';
 
   // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList
   if (det.id && logList.querySelector(`.log-row[data-id="${det.id}"]`)) {
@@ -2485,22 +2592,38 @@ function addLogRow(det, isInit=false){
         plateEl.innerHTML = `${trackPrefix}<span>${plateText}</span>${plateConfBadge}`;
         topRow.setAttribute('data-plate', plateText);
       }
+      const existingVehConf = topRow.getAttribute('data-veh-conf');
+      if (det.id != null && det.vehicle_confidence != null) {
+        topRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+      } else if (!existingVehConf && det.vehicle_confidence != null) {
+        topRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+      }
+      const currentVehConfAttr = topRow.getAttribute('data-veh-conf');
+      const resolvedVehConf = currentVehConfAttr ? parseFloat(currentVehConfAttr) : ((vehConf != null) ? vehConf : null);
+      const resolvedVehConfBadge = (resolvedVehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(resolvedVehConf)}">Veh ${formatPercent(resolvedVehConf)}</span>` : '';
+
       const existingBs = topRow.getAttribute('data-body-style') || '';
       const resolvedBs = (det.body_style && String(det.body_style).trim()) ? String(det.body_style).trim() : (existingBs || bodyOrType);
       topRow.setAttribute('data-body-style', resolvedBs);
       const typeEl = topRow.querySelector('.log-type');
       if (typeEl) {
         typeEl.innerHTML = `
-          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}</span>
+          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}${resolvedVehConfBadge}</span>
           ${procDisplay}
         `;
       }
       if (det.id) topRow.setAttribute('data-id', det.id);
+      topRow.style.cursor = 'pointer';
+      topRow.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
+      topRow.onclick = () => {
+        selectHistoryRecord(det);
+        const allRows = logList.querySelectorAll('.log-row');
+        allRows.forEach(r => r.style.outline = 'none');
+        topRow.style.outline = '2px solid #2f6fed';
+      };
       if (det.snapshot_url) {
         topRow.setAttribute('data-snapshot', det.snapshot_url);
-        topRow.style.cursor = 'pointer';
-        topRow.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
-        topRow.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+        topRow.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
       }
       return;
     }
@@ -2514,20 +2637,27 @@ function addLogRow(det, isInit=false){
   if (det.track_id) row.setAttribute('data-track-id', det.track_id);
   row.setAttribute('data-plate', plateText);
   row.setAttribute('data-body-style', bodyOrType);
+  if (vehConf != null) row.setAttribute('data-veh-conf', vehConf);
   row.setAttribute('data-created-epoch', Math.floor(Date.now() / 1000));
   
+  row.style.cursor = 'pointer';
+  row.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
+  row.onclick = () => {
+    selectHistoryRecord(det);
+    const allRows = logList.querySelectorAll('.log-row');
+    allRows.forEach(r => r.style.outline = 'none');
+    row.style.outline = '2px solid #2f6fed';
+  };
   if (det.snapshot_url) {
     row.setAttribute('data-snapshot', det.snapshot_url);
-    row.style.cursor = 'pointer';
-    row.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
-    row.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+    row.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
   }
   
   row.innerHTML = `
     <span class="log-time">${timeStr}</span>
     <span class="log-plate" style="display:inline-flex; align-items:center;">${trackPrefix}<span>${plateText}</span>${plateConfBadge}</span>
     <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
-      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}</span>
+      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}${vehConfBadge}</span>
       ${procDisplay}
     </span>
   `;
@@ -2573,7 +2703,7 @@ function shareDetection(){
   const now = new Date();
   const vType = typeLabel[d.vehicle_type] || d.vehicle_type || 'Vehicle';
   const bStyle = d.body_style ? ` (${d.body_style})` : '';
-  const conf = d.confidence ? Math.round(d.confidence*100)+'%' : (d.plate_confidence ? Math.round(d.plate_confidence*100)+'%' : '95%');
+  const conf = d.ocr_confidence ? formatPercent(d.ocr_confidence) : (d.plate_confidence ? formatPercent(d.plate_confidence) : (d.confidence ? formatPercent(d.confidence) : '95.0%'));
   
   const shareText = 
 `[Parkour ANPR] Vehicle Entry Report
@@ -2856,13 +2986,17 @@ function handleWsMessage(msg){
 
     updateResultCard(lastDetectionData);
     const pLabel = document.querySelector('#detBoxPlate .det-label');
-    if (pLabel && msg.license_plate) {
-      pLabel.textContent = msg.license_plate;
+    if (pLabel) {
+      pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
+    }
+    const vLabel = document.querySelector('#detBoxVehicle .det-label');
+    if (vLabel) {
+      vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "body_update"){
     // Perbarui baris Entry History jika klasifikasi bodi selesai setelah record Entry History dibuat
     if (msg.body_style) {
-      updateEntryHistoryBodyStyle(msg.track_id, msg.body_style, msg.record_id, msg.body_style_confidence);
+      updateEntryHistoryBodyStyle(msg.track_id, msg.body_style, msg.record_id, msg.body_style_confidence, msg.vehicle_confidence);
     }
     // STALE ASYNC BODY RESULT PROTECTION (untuk kartu Latest Detection aktif):
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id){
@@ -2875,16 +3009,7 @@ function handleWsMessage(msg){
     updateResultCard(lastDetectionData);
     const vLabel = document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
-      const vName = typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle';
-      const bStyle = lastDetectionData.body_style;
-      let baseLabel = vName;
-      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
-      } else if (bStyle) {
-        baseLabel = bStyle;
-      }
-      const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
-      vLabel.textContent = `${baseLabel}${vehConf}`;
+      vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
@@ -2893,6 +3018,7 @@ function handleWsMessage(msg){
         lastDetectionData.status = 'CONFIRMED';
         lastDetectionData.confirmation_status = 'CONFIRMED';
         lastDetectionData.ocr_status = 'CONFIRMED';
+        lastDetectionData.record_id = msg.record.id;
         if (msg.record.license_plate) {
           lastDetectionData.license_plate = msg.record.license_plate;
           lastDetectionData.ocr_text = msg.record.license_plate;
@@ -2900,11 +3026,16 @@ function handleWsMessage(msg){
         if (msg.record.ocr_confidence) {
           lastDetectionData.ocr_confidence = msg.record.ocr_confidence;
         }
+        if (msg.record.vehicle_confidence != null) {
+          lastDetectionData.vehicle_confidence = msg.record.vehicle_confidence;
+          lastDetectionData.confirmed_vehicle_confidence = msg.record.vehicle_confidence;
+        }
         if (!msg.record.body_style && lastDetectionData.body_style) {
           msg.record.body_style = lastDetectionData.body_style;
           msg.record.body_pending = false;
         }
         updateResultCard(lastDetectionData);
+        drawBoxes(lastDetectionData);
       }
       addLogRow(msg.record);
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);

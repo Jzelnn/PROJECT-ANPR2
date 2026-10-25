@@ -389,23 +389,27 @@ def draw_annotations_on_image(img, detections, interest_area=None):
             v_name = v_type_raw.upper() if v_type_raw else "VEHICLE"
             has_body = bool(b_style_raw and b_style_raw.upper() not in ("UNKNOWN", "NONE", "NULL", "UNDEFINED"))
 
+            v_pct_str = ""
+            if v_conf is not None and 0 < float(v_conf) <= 1.0:
+                pct_val = round(float(v_conf) * 100, 1)
+                v_pct_str = f" {pct_val:.1f}%"
+
             if has_body:
                 b_name = b_style_raw.upper()
                 if b_conf is not None and float(b_conf) > 0:
-                    b_pct = f"{int(round(float(b_conf) * 100))}%"
-                    b_text = f"{b_name} {b_pct}"
+                    b_pct_val = round(float(b_conf) * 100, 1)
+                    b_pct = f" {b_pct_val:.1f}%"
+                    b_text = f"{b_name}{b_pct}"
                 else:
                     b_text = b_name
 
                 if b_name.lower() != v_name.lower():
-                    v_label = f"{v_name} | {b_text}"
+                    v_label = f"{v_name}{v_pct_str} | {b_text}"
                 else:
-                    v_label = b_text
+                    v_label = f"{b_text}{v_pct_str}" if b_text == b_name else b_text
             else:
                 # Body style not available yet: display only vehicle detection label without incorrect/stale result
-                v_label = v_name
-                if v_conf is not None and 0 < float(v_conf) <= 1.0:
-                    v_label += f" {int(round(float(v_conf) * 100))}%"
+                v_label = f"{v_name}{v_pct_str}"
 
             (tw, th), _ = cv2.getTextSize(v_label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
             lbl_y1 = max(0, vy1 - th - 8)
@@ -423,12 +427,19 @@ def draw_annotations_on_image(img, detections, interest_area=None):
 
             plate_txt = det.get("license_plate")
             ocr_conf = det.get("ocr_confidence") or det.get("plate_confidence")
-            if plate_txt:
+            has_valid_plate = bool(plate_txt and str(plate_txt).strip().upper() not in ("UNKNOWN", "TIDAK_TERBACA", "NONE", "NULL", "-", ""))
+            if has_valid_plate:
                 p_label = f"{plate_txt}"
-                if ocr_conf:
-                    p_label += f" ({int(ocr_conf*100)}%)"
+                if ocr_conf is not None:
+                    try:
+                        ocr_num = float(ocr_conf)
+                        if ocr_num > 0:
+                            ocr_pct_val = ocr_num * 100.0 if ocr_num <= 1.0 else ocr_num
+                            p_label += f" | OCR {ocr_pct_val:.1f}%"
+                    except (ValueError, TypeError):
+                        pass
             else:
-                p_label = "PLATE DETECTED"
+                p_label = plate_txt if plate_txt else "PLATE DETECTED"
 
             (ptw, pth), _ = cv2.getTextSize(p_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             plbl_y1 = max(0, py1 - pth - 6)
@@ -561,12 +572,29 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 
     conf_rounded = round(plate_conf, 3)
     resolved_body_style = det.get("body_style")
+
+    veh_conf = det.get("vehicle_confidence")
+    if veh_conf is None and track_id is not None and 'confirmation_manager' in globals():
+        try:
+            with confirmation_manager.lock:
+                trk = confirmation_manager.tracks.get(track_id)
+                if trk:
+                    if trk.confirmed_data and trk.confirmed_data.get("vehicle_confidence") is not None:
+                        veh_conf = trk.confirmed_data["vehicle_confidence"]
+                    else:
+                        veh_conf = trk.track_confidence or (trk.frames[-1].get("v_conf") if trk.frames else None)
+        except Exception:
+            pass
+    if veh_conf is not None:
+        veh_conf = round(float(veh_conf), 3)
+
     rec = {
         "id": int(now_epoch * 1000) % 1000000,
         "track_id": track_id,
         "timestamp": timestamp_str,
         "license_plate": plate_text,
         "vehicle_type": det.get("vehicle_type"),
+        "vehicle_confidence": veh_conf,
         "body_style": resolved_body_style,
         "body_style_confidence": det.get("body_style_confidence"),
         "body_pending": False if resolved_body_style else bool(det.get("body_pending", False)),
@@ -2376,9 +2404,12 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         self.total_processing_ms = total_proc_ms
 
         conf_rounded = round(stable_conf, 3)
+        p_v_conf = getattr(self, 'pending_body_data', {}).get("v_conf") if getattr(self, 'pending_body_data', None) else None
+        best_v_conf = round(float(p_v_conf or best_f.get("v_conf") or self.track_confidence or (self.frames[-1].get("v_conf") if self.frames else 0.0)), 3)
         self.confirmed_data = {
             "track_id": self.track_id,
             "vehicle_type": best_type,
+            "vehicle_confidence": best_v_conf,
             "body_style": best_style,
             "body_style_confidence": round(avg_style_conf, 3) if avg_style_conf else None,
             "body_pending": bool(self.body_pending and not best_style),
@@ -2794,6 +2825,11 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
                         det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                        if track.confirmed_data.get("vehicle_confidence") is not None:
+                            det["vehicle_confidence"] = track.confirmed_data["vehicle_confidence"]
+                        det["confirmed_vehicle_confidence"] = track.confirmed_data.get("vehicle_confidence")
+                        if track.confirmed_data.get("id"):
+                            det["record_id"] = track.confirmed_data["id"]
                 elif track.status == "CONFIRMED":
                     det["status"] = "CONFIRMED"
                     det["ocr_status"] = "CONFIRMED"
@@ -2811,6 +2847,11 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["plate_confidence"] = track.confirmed_data["plate_confidence"]
                         det["ocr_confidence"] = track.confirmed_data["plate_confidence"]
                         det["vehicle_type"] = track.confirmed_data["vehicle_type"]
+                        if track.confirmed_data.get("vehicle_confidence") is not None:
+                            det["vehicle_confidence"] = track.confirmed_data["vehicle_confidence"]
+                        det["confirmed_vehicle_confidence"] = track.confirmed_data.get("vehicle_confidence")
+                        if track.confirmed_data.get("id"):
+                            det["record_id"] = track.confirmed_data["id"]
                 else:
                     det["status"] = "ANALYZING"
                     cand_count = track.candidate_counts.get(track.best_candidate, 0) if track.best_candidate else 0
@@ -2926,12 +2967,16 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
                     track.confirmed_data["body_style_confidence"] = conf_rounded
                     track.confirmed_data["vehicle_type"] = vehicle_type
                     track.confirmed_data["body_pending"] = False
+                    if v_conf is not None and float(v_conf) > 0:
+                        track.confirmed_data["vehicle_confidence"] = round(float(v_conf), 3)
             for r in LATEST_RECORDS:
                 if r.get("track_id") == track_id and not r.get("body_style"):
                     r["body_style"] = body_style
                     r["body_style_confidence"] = conf_rounded
                     r["vehicle_type"] = vehicle_type
                     r["body_pending"] = False
+                    if v_conf is not None and float(v_conf) > 0:
+                        r["vehicle_confidence"] = round(float(v_conf), 3)
                     updated_rec = dict(r)
                     break
 
@@ -2973,6 +3018,8 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
                             item["body_style"] = rec_to_update.get("body_style")
                             item["body_style_confidence"] = rec_to_update.get("body_style_confidence")
                             item["vehicle_type"] = rec_to_update.get("vehicle_type")
+                            if rec_to_update.get("vehicle_confidence") is not None:
+                                item["vehicle_confidence"] = rec_to_update.get("vehicle_confidence")
                             item["body_pending"] = False
                             changed = True
                             break
@@ -2991,6 +3038,7 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
             "track_id": track_id,
             "record_id": updated_rec.get("id") if updated_rec else None,
             "vehicle_type": vehicle_type,
+            "vehicle_confidence": updated_rec.get("vehicle_confidence") if (updated_rec and updated_rec.get("vehicle_confidence") is not None) else (round(float(v_conf), 3) if v_conf else None),
             "body_style": body_style,
             "body_style_confidence": conf_rounded,
             "body_pending": False,
@@ -3350,6 +3398,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
             with confirmation_manager.lock:
                 trk = confirmation_manager.tracks.get(track_id)
                 if trk:
+                    if rec and "id" in rec and trk.confirmed_data:
+                        trk.confirmed_data["id"] = rec["id"]
                     trigger_deferred_body_task(trk)
     except Exception as e:
         print(f"[ASYNC OCR ERROR] Track {track_id} job {job_id}: {e}")
@@ -3547,7 +3597,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         else:
             candidates = scored_candidates
 
-    print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id'] if candidates else None}", flush=True)
+    v_conf_log = f" veh_conf={candidates[0]['v_conf']:.3f} ({candidates[0]['v_conf']*100:.1f}%)" if candidates else ""
+    print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id'] if candidates else None}{v_conf_log}", flush=True)
     any_inside_roi = bool(candidates)
 
     # Single Photo Mode: Jalankan deteksi plat global synchronous HANYA jika ada kendaraan di dalam area deteksi
@@ -3608,7 +3659,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             cand_track_id = tid
             existing_trk.vehicle_infer_ms = pure_infer_ms
             existing_trk.vehicle_lock_wait_ms = lock_wait_ms
-            print(f"[PERF_VEHICLE] frame_id={frame_id} track_id={tid} duration_ms={t_yolo_duration_ms:.1f} infer_ms={pure_infer_ms:.1f} lock_wait_ms={lock_wait_ms:.1f}", flush=True)
+            print(f"[PERF_VEHICLE] frame_id={frame_id} track_id={tid} veh_conf={v_conf:.3f} ({v_conf*100:.1f}%) duration_ms={t_yolo_duration_ms:.1f} infer_ms={pure_infer_ms:.1f} lock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
             # Cek apakah ada deteksi 'bus' di area kendaraan ini
             has_bus_det = any(
