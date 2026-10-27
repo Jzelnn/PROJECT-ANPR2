@@ -262,6 +262,7 @@
     pointer-events:none;z-index:15;
     box-shadow: 0 0 8px rgba(47, 111, 237, 0.4);
     transition: none;
+    will-change: left, top, width, height;
   }
   .det-box.plate-box{border-color:#f2c94c;border-width:2.5px;box-shadow: 0 0 10px rgba(242, 201, 76, 0.45);}
   .det-box.outside-roi{
@@ -1326,10 +1327,7 @@ function updateFrameAgeIndicator(frameAgeMs){
 }
 
 function clearBoxes(){
-  const target = document.getElementById('liveVideo') || document.getElementById('liveStreamImg') || document.getElementById('feedImg');
-  if (target && target.parentElement){
-    target.parentElement.querySelectorAll('.det-box').forEach(b => b.remove());
-  }
+  document.querySelectorAll('.det-box').forEach(b => b.remove());
 }
 
 // ============================================================
@@ -1353,7 +1351,9 @@ function toggleMotionExtrapolation(enable){
   ENABLE_MOTION_EXTRAPOLATION = Boolean(enable);
   const chk = document.getElementById('chkMotionExtrap');
   if (chk) chk.checked = ENABLE_MOTION_EXTRAPOLATION;
-  if (lastDetectionData) drawBoxes(lastDetectionData);
+  if (lastDetectionData && lastDetectionData.inside_interest_area && !lastDetectionData.lost_interest) {
+    drawBoxes(lastDetectionData);
+  }
   showToast(`Motion Sync: ${ENABLE_MOTION_EXTRAPOLATION ? 'ON' : 'OFF'}`);
 }
 
@@ -1466,7 +1466,7 @@ async function runContinuousDetectLoop(){
     if (!isScanning){
       await performDetectCycle(true);
     }
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, 10));
   }
 }
 
@@ -1482,8 +1482,8 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 1500ms, release it
-    if (nowMs - inFlightFrameTime > 1500) {
+    // Watchdog: If frame in flight took > 600ms, release it to keep video stream fresh
+    if (nowMs - inFlightFrameTime > 600) {
       console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
@@ -1500,8 +1500,8 @@ async function performDetectCycle(silent=true){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
-        // Cap resolusi maksimum ke 1280px agar detail karakter plat (seperti M vs H/N) tetap sangat tajam sementara YOLO berjalan di imgsz=320
-        const maxDim = 1280;
+        // Cap resolusi ke 960px untuk latensi encode ultra-cepat (~10ms) dan payload ringan tanpa kehilangan ketajaman plat
+        const maxDim = 960;
         let scale = 1.0;
         if (video.videoWidth > maxDim) {
           scale = maxDim / video.videoWidth;
@@ -1516,7 +1516,7 @@ async function performDetectCycle(silent=true){
           const clientCaptureTs = Date.now() / 1000.0;
           inFlightFrameId = clientFrameCounter;
           inFlightFrameTime = Date.now();
-          const b64 = canvas.toDataURL('image/jpeg', 0.75);
+          const b64 = canvas.toDataURL('image/jpeg', 0.70);
           liveWs.send(JSON.stringify({
             type: "detect_frame",
             frame_id: clientFrameCounter,
@@ -1579,10 +1579,14 @@ function handleDetectionResult(data, silent=false){
   }
 
   let activeDet = null;
-  if (data.detections && data.detections.length > 0){
+  const activeDetections = (data.detections || []).filter(d => 
+    d && d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI'
+  );
+
+  if (activeDetections.length > 0){
     // Prioritaskan kendaraan yang sedang di-ANALYZING (mobil antre baru di ROI), baru mobil yang sudah CONFIRMED
-    const unconfirmed = data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status === 'ANALYZING');
-    activeDet = unconfirmed || data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI');
+    const unconfirmed = activeDetections.find(d => d.status === 'ANALYZING');
+    activeDet = unconfirmed || activeDetections[0];
   }
 
   if (activeDet){
@@ -1590,25 +1594,19 @@ function handleDetectionResult(data, silent=false){
     activeDet.latency_ms = detMs;
     activeDet.frame_id = data.frame_id;
     activeDet._hasBakedPlateBox = Boolean(usingBackendAnnotatedImage && activeDet.plate_bbox);
-    // Primary track switch: clean old boxes immediately if tracking a new vehicle
+    // Primary track switch:
     if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
-      clearBoxes();
-      lastDetectionData = null; // Reset total data mobil sebelumnya agar tidak bocor ke mobil baru
+      const prevStillPresent = activeDetections.some(d => d.track_id === lastActiveTrackId);
+      if (!prevStillPresent) {
+        lastDetectionData = null; // Reset data mobil sebelumnya yang sudah pergi
+      }
     } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
       // Retain relative plate & OCR knowledge across fast detection frames for the SAME track
       activeDet._last_plate_frame_id = lastDetectionData._last_plate_frame_id;
       activeDet._last_ocr_frame_id = lastDetectionData._last_ocr_frame_id;
       if (!activeDet.rel_plate_bbox && lastDetectionData.rel_plate_bbox) {
         activeDet.rel_plate_bbox = lastDetectionData.rel_plate_bbox;
-      }
-      if (!activeDet.plate_bbox && activeDet.rel_plate_bbox && activeDet.bbox) {
-        const projected = projectPlateBbox(activeDet.bbox, activeDet.rel_plate_bbox);
-        if (projected) {
-          activeDet.plate_bbox = projected;
-          activeDet.plate_confidence = lastDetectionData.plate_confidence;
-          activeDet.plate_detected = lastDetectionData.plate_detected;
-        }
       }
       const hasNewerOcrState = Boolean(
         lastDetectionData.license_plate && (
@@ -1683,7 +1681,7 @@ function handleDetectionResult(data, silent=false){
         drawPlateBoxOnly(activeDet);
       }
     } else {
-      drawBoxes(activeDet);
+      drawBoxes(activeDetections);
     }
     updateResultCard(activeDet, detMs);
 
@@ -1704,32 +1702,20 @@ function handleDetectionResult(data, silent=false){
     }
   } else {
     consecutiveEmptyCycles++;
-    // 2-frame persistence buffer: allow up to 2 momentary missed frames without flickering boxes off
-    const hasActiveBufferedTrack = (consecutiveEmptyCycles <= 2 && lastActiveTrackId !== null && lastDetectionData !== null);
-
-    if (hasActiveBufferedTrack) {
-      // Keep displaying the last known bounding boxes on screen to avoid 1-frame visual flash/disappearance.
-      // Do NOT trigger any OCR call, do NOT add Entry History rows, do NOT increase confidence.
-      if (!usingBackendAnnotatedImage) {
-        drawBoxes(lastDetectionData);
-      }
-    } else {
-      // Exceeded persistence buffer (vehicle genuinely left ROI) or no prior track: clear immediately
-      if (lastActiveTrackId !== null) {
-        console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId} after ${consecutiveEmptyCycles} empty cycles`);
-      }
-      lastActiveTrackId = null;
-      clearBoxes();
-      if (!usingBackendAnnotatedImage) {
-        drawRoiBox(currentRoi);
-      }
-      lastDetectionData = null;
-      updateResultCard(null, 0);
-      updateTelemetry(null);
-      if (!silent){
-        const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-        showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
-      }
+    if (lastActiveTrackId !== null) {
+      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
+    }
+    lastActiveTrackId = null;
+    clearBoxes();
+    if (!usingBackendAnnotatedImage) {
+      drawRoiBox(currentRoi);
+    }
+    lastDetectionData = null;
+    updateResultCard(null, 0);
+    updateTelemetry(null);
+    if (!silent){
+      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
+      showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
     }
   }
 }
@@ -1942,15 +1928,19 @@ function drawRoiBox(roi){
 // ============================================================
 // DRAW BOUNDING BOXES WITH PRECISE LETTERBOXING
 // ============================================================
-function drawBoxes(det){
-  if (!det || det.inside_interest_area === false || det.status === 'OUTSIDE_ROI' || det.lost_interest){
+function drawBoxes(detOrList){
+  const rawList = Array.isArray(detOrList) ? detOrList : (detOrList ? [detOrList] : []);
+  const detList = rawList.filter(d => d && d.inside_interest_area !== false && d.status !== 'OUTSIDE_ROI' && !d.lost_interest);
+
+  if (detList.length === 0){
     clearBoxes();
     return;
   }
   if (isBackendAnnotatedVisible()){
     clearBoxes();
-    if (!det._hasBakedPlateBox && det.plate_bbox){
-      drawPlateBoxOnly(det);
+    const primary = detList[0];
+    if (primary && !primary._hasBakedPlateBox && primary.plate_bbox){
+      drawPlateBoxOnly(primary);
     }
     return;
   }
@@ -1964,26 +1954,23 @@ function drawBoxes(det){
     const elemW = target.clientWidth;
     const elemH = target.clientHeight;
 
-    // Resolusi asli frame saat diproses oleh AI (misal 1280x674 atau 1920x1080)
-    let refW = (det && det.image_width) || (lastDetectionData && lastDetectionData.image_width);
-    let refH = (det && det.image_height) || (lastDetectionData && lastDetectionData.image_height);
+    const primary = detList[0];
+    let refW = (primary && primary.image_width) || (lastDetectionData && lastDetectionData.image_width);
+    let refH = (primary && primary.image_height) || (lastDetectionData && lastDetectionData.image_height);
 
     const natW = target.videoWidth || target.naturalWidth;
     const natH = target.videoHeight || target.naturalHeight;
 
-    // Jika resolusi dari backend belum tersedia, fallback ke naturalWidth / videoWidth
     if (!refW || !refH){
       refW = natW;
       refH = natH;
     }
 
-    // Jika elemen belum selesai di-render browser atau ukuran asli belum siap
     if (!elemW || !elemH || !refW || !refH){
       setTimeout(place, 40);
       return;
     }
 
-    // Aspek rasio tampilan sebenarnya dari gambar/video di browser
     const dispRatio = (refW && refH) ? (refW / refH) : ((natW && natH) ? (natW / natH) : (16 / 9));
     const elemRatio = elemW / elemH;
 
@@ -2000,152 +1987,140 @@ function drawBoxes(det){
       offsetY = (elemH - renderH) / 2;
     }
 
-    // Skala pemetaan terpisah (scaleX & scaleY) dari koordinat citra AI (refW x refH) ke ukuran render di browser
     const scaleX = renderW / refW;
     const scaleY = renderH / refH;
 
-    // ------------------------------------------------------------
-    // MOTION EXTRAPOLATION WITH SAFEGUARDS (Feature Flag: ENABLE_MOTION_EXTRAPOLATION)
-    // Synchronizes 1.5 FPS AI bounding boxes with 25/30 FPS real-time moving video
-    // ------------------------------------------------------------
-    let effVxBox = det.bbox;
-    let effPlateBox = det.plate_bbox;
+    const activeBoxIds = new Set();
 
-    if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
-      const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
-      const isConfGood = (det.vehicle_confidence || 0) >= 0.40;
+    detList.forEach((det, idx) => {
+      const tid = det.track_id != null ? det.track_id : `idx_${idx}`;
+      const vehBoxId = `detBoxVehicle_${tid}`;
+      const plateBoxId = `detBoxPlate_${tid}`;
 
-      if (isTrackActive && isConfGood) {
-        // Frame age calculation with matching timestamps
-        let frameAgeSec = 0;
-        if (det.capture_timestamp && det.capture_timestamp > 0) {
-          const nowSec = Date.now() / 1000.0;
-          frameAgeSec = Math.max(0, nowSec - det.capture_timestamp);
-        } else if (det.frame_age_ms != null && det.frame_age_ms > 0) {
-          frameAgeSec = det.frame_age_ms / 1000.0;
-        }
+      let effVxBox = det.bbox;
+      let effPlateBox = det.plate_bbox;
 
-        // Safeguard 1: Clamp prediction horizon (max 0.70s = 700ms)
-        const MAX_HORIZON_SEC = 0.70;
-        const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
+      // Motion extrapolation per vehicle
+      if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
+        const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
+        const isConfGood = (det.vehicle_confidence || 0) >= 0.35;
 
-        if (horizon > 0.05) { // Only extrapolate when latency is noticeable (>50ms)
-          let vx = 0, vy = 0;
-          if (det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
-            vx = det.velocity[0];
-            vy = det.velocity[1];
-          } else if (lastDetectionData && lastDetectionData.track_id === det.track_id && lastDetectionData.bbox) {
-            const dt = (det.capture_timestamp && lastDetectionData.capture_timestamp)
-              ? (det.capture_timestamp - lastDetectionData.capture_timestamp)
-              : 0;
-            if (dt > 0.05 && dt < 1.5) {
-              const prevCx = (lastDetectionData.bbox[0] + lastDetectionData.bbox[2]) / 2.0;
-              const prevCy = (lastDetectionData.bbox[1] + lastDetectionData.bbox[3]) / 2.0;
-              const curCx = (det.bbox[0] + det.bbox[2]) / 2.0;
-              const curCy = (det.bbox[1] + det.bbox[3]) / 2.0;
-              vx = (curCx - prevCx) / dt;
-              vy = (curCy - prevCy) / dt;
-            }
+        if (isTrackActive && isConfGood) {
+          let frameAgeSec = 0;
+          if (det.capture_timestamp && det.capture_timestamp > 0) {
+            const nowSec = Date.now() / 1000.0;
+            frameAgeSec = Math.max(0, nowSec - det.capture_timestamp);
+          } else if (det.frame_age_ms != null && det.frame_age_ms > 0) {
+            frameAgeSec = det.frame_age_ms / 1000.0;
           }
 
-          if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
-            let dx = vx * horizon;
-            let dy = vy * horizon;
+          const MAX_HORIZON_SEC = 0.70;
+          const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
 
-            // Safeguard 2: Clamp maximum displacement (max 12% frame dimension or 75% bbox dimension)
-            const [bx1, by1, bx2, by2] = det.bbox;
-            const bw = bx2 - bx1;
-            const bh = by2 - by1;
-            const maxDx = Math.min(refW * 0.12, bw * 0.75);
-            const maxDy = Math.min(refH * 0.12, bh * 0.75);
-            dx = Math.max(-maxDx, Math.min(maxDx, dx));
-            dy = Math.max(-maxDy, Math.min(maxDy, dy));
+          if (horizon > 0.05 && det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
+            const [vx, vy] = det.velocity;
+            if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
+              let dx = vx * horizon;
+              let dy = vy * horizon;
+              const [bx1, by1, bx2, by2] = det.bbox;
+              const bw = bx2 - bx1;
+              const bh = by2 - by1;
+              const maxDx = Math.min(refW * 0.12, bw * 0.75);
+              const maxDy = Math.min(refH * 0.12, bh * 0.75);
+              dx = Math.max(-maxDx, Math.min(maxDx, dx));
+              dy = Math.max(-maxDy, Math.min(maxDy, dy));
 
-            // Apply displacement clamped within image boundaries
-            const nx1 = Math.max(0, Math.min(refW - bw, bx1 + dx));
-            const ny1 = Math.max(0, Math.min(refH - bh, by1 + dy));
-            effVxBox = [nx1, ny1, nx1 + bw, ny1 + bh];
+              const nx1 = Math.max(0, Math.min(refW - bw, bx1 + dx));
+              const ny1 = Math.max(0, Math.min(refH - bh, by1 + dy));
+              effVxBox = [nx1, ny1, nx1 + bw, ny1 + bh];
 
-            // Synchronized plate bounding box extrapolation (anchored rigidly to vehicle bumper)
-            if (det.rel_plate_bbox) {
-              const projected = projectPlateBbox(effVxBox, det.rel_plate_bbox);
-              if (projected) effPlateBox = projected;
-            } else if (det.plate_bbox) {
-              const pw = det.plate_bbox[2] - det.plate_bbox[0];
-              const ph = det.plate_bbox[3] - det.plate_bbox[1];
-              const px1 = Math.max(0, Math.min(refW - pw, det.plate_bbox[0] + dx));
-              const py1 = Math.max(0, Math.min(refH - ph, det.plate_bbox[1] + dy));
-              effPlateBox = [px1, py1, px1 + pw, py1 + ph];
+              if (det.rel_plate_bbox) {
+                const projected = projectPlateBbox(effVxBox, det.rel_plate_bbox);
+                if (projected) effPlateBox = projected;
+              } else if (det.plate_bbox) {
+                const pw = det.plate_bbox[2] - det.plate_bbox[0];
+                const ph = det.plate_bbox[3] - det.plate_bbox[1];
+                const px1 = Math.max(0, Math.min(refW - pw, det.plate_bbox[0] + dx));
+                const py1 = Math.max(0, Math.min(refH - ph, det.plate_bbox[1] + dy));
+                effPlateBox = [px1, py1, px1 + pw, py1 + ph];
+              }
             }
           }
         }
       }
-    }
 
-    // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
-    let boxVeh = wrap.querySelector('#detBoxVehicle');
-    if (effVxBox){
-      const [x1,y1,x2,y2] = effVxBox;
-      if (!boxVeh){
-        boxVeh = document.createElement('div');
-        boxVeh.id = 'detBoxVehicle';
-        boxVeh.className = 'det-box';
-        const label = document.createElement('div');
-        label.className = 'det-label';
-        boxVeh.appendChild(label);
-        wrap.appendChild(boxVeh);
-      }
-      const vPad = 4;
-      boxVeh.style.display = 'block';
-      boxVeh.style.left = Math.max(0, Math.round(offsetX + x1 * scaleX - vPad)) + 'px';
-      boxVeh.style.top = Math.max(0, Math.round(offsetY + y1 * scaleY - vPad)) + 'px';
-      boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
-      boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
+      // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
+      if (effVxBox && Array.isArray(effVxBox) && effVxBox.length === 4) {
+        activeBoxIds.add(vehBoxId);
+        let boxVeh = wrap.querySelector(`#${vehBoxId}`);
+        if (!boxVeh) {
+          boxVeh = document.createElement('div');
+          boxVeh.id = vehBoxId;
+          boxVeh.className = 'det-box';
+          boxVeh.dataset.trackId = String(tid);
+          const label = document.createElement('div');
+          label.className = 'det-label';
+          boxVeh.appendChild(label);
+          wrap.appendChild(boxVeh);
+        }
+        const [x1, y1, x2, y2] = effVxBox;
+        const vPad = 4;
+        boxVeh.style.display = 'block';
+        boxVeh.style.left = Math.max(0, Math.round(offsetX + x1 * scaleX - vPad)) + 'px';
+        boxVeh.style.top = Math.max(0, Math.round(offsetY + y1 * scaleY - vPad)) + 'px';
+        boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
+        boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
-      const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
-      const labelElem = boxVeh.querySelector('.det-label');
-      boxVeh.className = 'det-box';
-      const labelText = formatVehicleBoxLabel(det);
-      labelElem.textContent = labelText;
-      if (isConfirmed) {
-        boxVeh.style.borderColor = '#10b981';
-        boxVeh.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
-        labelElem.style.background = '#10b981';
-      } else {
-        boxVeh.style.borderColor = '#2f6fed';
-        boxVeh.style.boxShadow = '0 0 8px rgba(47, 111, 237, 0.4)';
-        labelElem.style.background = '#2f6fed';
+        const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+        const labelElem = boxVeh.querySelector('.det-label');
+        const labelText = formatVehicleBoxLabel(det);
+        if (labelElem) labelElem.textContent = labelText;
+        if (isConfirmed) {
+          boxVeh.style.borderColor = '#10b981';
+          boxVeh.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
+          if (labelElem) labelElem.style.background = '#10b981';
+        } else {
+          boxVeh.style.borderColor = '#2f6fed';
+          boxVeh.style.boxShadow = '0 0 8px rgba(47, 111, 237, 0.4)';
+          if (labelElem) labelElem.style.background = '#2f6fed';
+        }
       }
-    } else if (boxVeh){
-      boxVeh.style.display = 'none';
-    }
 
-    // 2. Kotak Bounding Box Plat Nomor (Kuning) - Hanya jika dideteksi dan di dalam ROI
-    let boxPlate = wrap.querySelector('#detBoxPlate');
-    if (effPlateBox){
-      const [x1,y1,x2,y2] = effPlateBox;
-      if (!boxPlate){
-        boxPlate = document.createElement('div');
-        boxPlate.id = 'detBoxPlate';
-        boxPlate.className = 'det-box plate-box';
-        const pLabel = document.createElement('div');
-        pLabel.className = 'det-label';
-        pLabel.style.background = '#f2c94c';
-        pLabel.style.color = '#000';
-        pLabel.style.fontWeight = '700';
-        boxPlate.appendChild(pLabel);
-        wrap.appendChild(boxPlate);
+      // 2. Kotak Bounding Box Plat Nomor (Kuning) - Hanya jika dideteksi dan di dalam ROI
+      if (effPlateBox && Array.isArray(effPlateBox) && effPlateBox.length === 4) {
+        activeBoxIds.add(plateBoxId);
+        let boxPlate = wrap.querySelector(`#${plateBoxId}`);
+        if (!boxPlate) {
+          boxPlate = document.createElement('div');
+          boxPlate.id = plateBoxId;
+          boxPlate.className = 'det-box plate-box';
+          boxPlate.dataset.trackId = String(tid);
+          const pLabel = document.createElement('div');
+          pLabel.className = 'det-label';
+          pLabel.style.background = '#f2c94c';
+          pLabel.style.color = '#000';
+          pLabel.style.fontWeight = '700';
+          boxPlate.appendChild(pLabel);
+          wrap.appendChild(boxPlate);
+        }
+        const [px1, py1, px2, py2] = effPlateBox;
+        boxPlate.style.display = 'block';
+        boxPlate.style.left = Math.round(offsetX + px1 * scaleX) + 'px';
+        boxPlate.style.top = Math.round(offsetY + py1 * scaleY) + 'px';
+        boxPlate.style.width = Math.round((px2 - px1) * scaleX) + 'px';
+        boxPlate.style.height = Math.round((py2 - py1) * scaleY) + 'px';
+        const plateLabel = formatPlateBoxLabel(det);
+        const pLabelElem = boxPlate.querySelector('.det-label');
+        if (pLabelElem) pLabelElem.textContent = plateLabel;
       }
-      boxPlate.style.display = 'block';
-      boxPlate.style.left = Math.round(offsetX + x1 * scaleX) + 'px';
-      boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
-      boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
-      boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-      const plateLabel = formatPlateBoxLabel(det);
-      boxPlate.querySelector('.det-label').textContent = plateLabel;
-    } else if (boxPlate){
-      boxPlate.style.display = 'none';
-    }
+    });
+
+    // Clean up stale boxes for tracks that are no longer in active detList
+    wrap.querySelectorAll('.det-box').forEach(box => {
+      if (!activeBoxIds.has(box.id)) {
+        box.remove();
+      }
+    });
   };
 
   if (target.tagName === 'IMG' && (!target.complete || target.naturalWidth === 0)){
@@ -2217,7 +2192,9 @@ function drawPlateBoxOnly(det){
 
 // Reposition bounding boxes on window resize
 window.addEventListener('resize', () => {
-  if (lastDetectionData) drawBoxes(lastDetectionData);
+  if (lastDetectionData && lastDetectionData.inside_interest_area && !lastDetectionData.lost_interest) {
+    drawBoxes(lastDetectionData);
+  }
 });
 
 // ============================================================
@@ -2370,7 +2347,7 @@ function updateTelemetry(det){
 
   // 3. Plate Detect
   if (telemPlate) {
-    if (det.plate_bbox || det.plate_detected) {
+    if (det.plate_bbox || det.plate_detected || det.license_plate || det.ocr_text) {
       telemPlate.textContent = 'DETECTED';
       telemPlate.className = 'telem-val warn-amber';
     } else if (det.inside_interest_area === false || det.status === 'OUTSIDE_ROI') {
@@ -2899,6 +2876,10 @@ function handleWsMessage(msg){
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
+    if (msg.frame_id != null && latestRenderedFrameId > 0 && msg.frame_id < latestRenderedFrameId){
+      console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < latestRendered=${latestRenderedFrameId}`);
+      return;
+    }
     if (msg.frame_id != null && lastDetectionData._last_plate_frame_id != null && msg.frame_id < lastDetectionData._last_plate_frame_id){
       console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < last=${lastDetectionData._last_plate_frame_id}`);
       return;
@@ -2909,18 +2890,12 @@ function handleWsMessage(msg){
     if (msg.rel_plate_bbox) {
       lastDetectionData.rel_plate_bbox = msg.rel_plate_bbox;
     }
-    // Synchronize WebSocket updates: prioritize projecting against the current vehicle bbox
-    // so older frame plate detections never pull or jump the plate box backward.
     let resolvedPlateBox = null;
     if (lastDetectionData.bbox && lastDetectionData.rel_plate_bbox) {
       resolvedPlateBox = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
     }
     if (!resolvedPlateBox) {
-      if (msg.frame_id == null || latestRenderedFrameId <= 0 || msg.frame_id >= latestRenderedFrameId) {
-        resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
-      } else {
-        resolvedPlateBox = msg.projected_plate_bbox || null;
-      }
+      resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
     }
     if (resolvedPlateBox) {
       lastDetectionData.plate_bbox = resolvedPlateBox;
@@ -2929,8 +2904,11 @@ function handleWsMessage(msg){
     lastDetectionData.plate_detected = true;
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
-    drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
+    const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
+    if (pLabel) {
+      pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
+    }
   } else if (msg.type === "ocr_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
 
@@ -2985,11 +2963,11 @@ function handleWsMessage(msg){
     }
 
     updateResultCard(lastDetectionData);
-    const pLabel = document.querySelector('#detBoxPlate .det-label');
+    const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
     if (pLabel) {
       pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
     }
-    const vLabel = document.querySelector('#detBoxVehicle .det-label');
+    const vLabel = document.querySelector(`#detBoxVehicle_${msg.track_id} .det-label`) || document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
       vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
@@ -3007,7 +2985,7 @@ function handleWsMessage(msg){
     lastDetectionData.body_style_confidence = msg.body_style_confidence;
     lastDetectionData.body_pending = false;
     updateResultCard(lastDetectionData);
-    const vLabel = document.querySelector('#detBoxVehicle .det-label');
+    const vLabel = document.querySelector(`#detBoxVehicle_${msg.track_id} .det-label`) || document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
       vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
@@ -3035,7 +3013,16 @@ function handleWsMessage(msg){
           msg.record.body_pending = false;
         }
         updateResultCard(lastDetectionData);
-        drawBoxes(lastDetectionData);
+        const vBox = document.querySelector(`#detBoxVehicle_${lastDetectionData.track_id}`);
+        if (vBox) {
+          vBox.style.borderColor = '#10b981';
+          vBox.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
+          const vLabel = vBox.querySelector('.det-label');
+          if (vLabel) {
+            vLabel.style.background = '#10b981';
+            vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
+          }
+        }
       }
       addLogRow(msg.record);
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);

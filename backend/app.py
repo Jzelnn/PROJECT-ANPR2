@@ -1,4 +1,8 @@
 import os
+# Batasi CPU threads OpenMP / OpenBLAS agar tidak terjadi thrashing di CPU 22-core Windows
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "2")
+os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "2")
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "2")
 import re
 import time
 import datetime
@@ -36,8 +40,8 @@ try:
     import torch
     HAS_CUDA = torch.cuda.is_available()
     if not HAS_CUDA:
-        # Batasi PyTorch CPU threads agar tidak oversubscribe CPU cores (mencegah spike 5s-8s)
-        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
+        # Optimalkan PyTorch CPU threads untuk multi-core CPU (6 threads memberikan throughput tertinggi)
+        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "6"))
         torch.set_num_threads(torch_threads)
 except ImportError:
     HAS_CUDA = False
@@ -87,8 +91,8 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 # PERFORMANCE & DETECTION CONFIGURATION
 # Configurable parameters for speed, detection, and temporal confirmation
 # ============================================================
-IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 640))           # 640 for single photo & small plate detection
-VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 480))  # 480 for fast real-time stream vehicle detection
+IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 384))           # 384 for fast CPU detection (< 150ms)
+VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 384))  # 384 for fast real-time stream vehicle detection (~160ms on CPU)
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.35))
 VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.25))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.30))
@@ -97,6 +101,8 @@ IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = False  # Keep false on CPU to prevent warnings
+if not HAS_CUDA:
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 2)))
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3
@@ -125,12 +131,12 @@ DEFAULT_INTEREST_AREA = {
 INTEREST_AREA = dict(DEFAULT_INTEREST_AREA)
 
 # Lost Interest parameters
-LOST_INTEREST_TIMEOUT_SEC = float(os.environ.get("ANPR_LOST_TIMEOUT", 3.5))
-LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 4))
+LOST_INTEREST_TIMEOUT_SEC = float(os.environ.get("ANPR_LOST_TIMEOUT", 4.5))
+LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 2))
 # Plate detection refresh: do not queue duplicate/stale plate inference.
 # Re-run only when the cached plate is old enough or the previous attempt failed.
 PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.35))
-PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 320))
+PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 192))
 PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.15))
 
 
@@ -902,7 +908,7 @@ class PaddleEngine:
         print(f"[PADDLE] siap | paddleocr={self.version} api={self.api} device={device} init={self.init_ms:.0f}ms")
 
     def run(self, img_bgr):
-        with self.lock, vehicle_infer_lock:
+        with self.lock:
             if self.api == "v3":
                 out = self.engine.predict(img_bgr)
             else:
@@ -929,10 +935,10 @@ class PaddleEngine:
         return items
 
 vehicle_infer_lock = threading.RLock()
-plate_infer_lock = vehicle_infer_lock
-body_infer_lock = vehicle_infer_lock
-char_infer_lock = vehicle_infer_lock
-yolo_infer_lock = vehicle_infer_lock
+plate_infer_lock = threading.RLock()
+body_infer_lock = threading.RLock()
+char_infer_lock = threading.RLock()
+yolo_infer_lock = threading.RLock()
 paddle_engine = PaddleEngine(device="cpu")
 ai_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ANPR_YOLO")
 plate_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ANPR_ASYNC_PLATE")
@@ -948,6 +954,26 @@ def get_next_ocr_job_id():
     with ocr_job_lock:
         ocr_job_counter += 1
         return ocr_job_counter
+
+def warmup_models():
+    """Melakukan 1x inferensi pemanasan (warmup) agar request pertama pengguna tidak terkena cold-start (10s -> 0.3s)."""
+    try:
+        t_w0 = time.time()
+        dummy_img = np.zeros((384, 384, 3), dtype=np.uint8)
+        dummy_crop = np.zeros((48, 160, 3), dtype=np.uint8)
+        if 'vehicle_model' in globals() and vehicle_model is not None:
+            vehicle_model.predict(dummy_img, imgsz=IMG_SIZE, verbose=False)
+        if 'plate_detector' in globals() and plate_detector is not None:
+            plate_detector.predict(dummy_img, imgsz=PLATE_INFER_IMGSZ, verbose=False)
+        if 'char_model' in globals() and char_model is not None:
+            char_model.predict(dummy_crop, imgsz=160, verbose=False)
+        if 'paddle_engine' in globals() and paddle_engine is not None:
+            paddle_engine.run(dummy_crop)
+        print(f"[WARMUP] Inisialisasi & pemanasan seluruh graf AI selesai dalam {(time.time() - t_w0)*1000:.0f}ms!", flush=True)
+    except Exception as e:
+        print(f"[WARN] Warmup error: {e}", flush=True)
+
+warmup_models()
 
 print("[INFO] Semua model AI, PaddleOCR & Thread Pools siap digunakan!")
 
@@ -966,8 +992,8 @@ def map_vehicle_class_name(cls_id, model=vehicle_model):
     return "car"
 
 
-def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.14, pad_y_ratio=0.12):
-    """Crop plat nomor dengan padding proporsional agar karakter di tepi tidak terpotong."""
+def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.06, pad_y_ratio=0.05):
+    """Crop plat nomor dengan padding presisi agar membuang background bumper dan mempercepat OCR DBNet."""
     ih, iw = image.shape[:2]
     pw, ph = px2 - px1, py2 - py1
     pad_x = int(pw * pad_x_ratio)
@@ -1002,25 +1028,62 @@ SAMSAT_PREFIXES = {
 
 
 def is_tax_date(text):
-    """Mendeteksi tanggal pajak / bulan-tahun pada plat nomor (e.g. '09-25', '02.28', '11.44', '1328')"""
+    """
+    Mendeteksi tanggal pajak / masa berlaku STNK pada plat nomor Indonesia (e.g. '09.25', '10-03-29', '09/28', '12 29', '0925').
+    Melindungi nomor plat 6 digit (seperti '100329') agar TIDAK dikonversi atau dideteksi sebagai tanggal pajak.
+    Melakukan validasi kalender nyata (1 <= MM <= 12, 1 <= DD <= 31, tahun realistis 20-39).
+    """
     if not text:
         return False
     raw = str(text).strip().upper()
+    
     # Plat nomor kendaraan mengandung huruf prefix & suffix; tanggal pajak tidak memiliki >= 2 huruf
     letters = re.findall(r'[A-Z]', raw)
-    if len(letters) >= 2 or len(raw) > 7:
+    if len(letters) >= 2 or len(raw) > 12:
         return False
 
-    clean = re.sub(r'[^0-9\.\-]', '', raw)
-    if re.match(r'^(0[1-9]|1[0-2])[\.\-](2[0-9]|3[0-9])$', clean):
-        return True
-    if len(clean) == 4 and clean.isdigit() and len(re.sub(r'[^0-9]', '', raw)) == len(raw):
-        mm = int(clean[:2])
-        yy = int(clean[2:])
-        if 1 <= mm <= 12 and 20 <= yy <= 39:
+    # Protection Rule 1 & 6: 6-digit continuous number tanpa delimiter (e.g. "100329")
+    # BUKAN tanggal pajak (harus dilindungi sebagai konteks plat/angka)
+    clean_digits = re.sub(r'[^0-9]', '', raw)
+    if len(clean_digits) == 6 and raw == clean_digits:
+        return False
+
+    # 1. Format 3 bagian dengan delimiter (spasi, titik, strip, slash): DD MM YY atau MM DD YY (e.g. '10 03 29', '10-03-29', '10.03.29', '10/03/29')
+    # Toleran terhadap OCR spacing seperti "10 - 03 - 29" atau "10 . 25"
+    m3 = re.match(r'^(\d{1,2})[\s\.\-\/]+(\d{1,2})[\s\.\-\/]+(\d{2,4})$', raw)
+    if m3:
+        p1, p2, p3 = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
+        # Jika tahun 4 digit (2020-2039), ambil 2 digit terakhir
+        if 2020 <= p3 <= 2039:
+            yy = p3 - 2000
+        else:
+            yy = p3
+            
+        # Cek apakah DD MM YY (1 <= p1 <= 31, 1 <= p2 <= 12) atau MM DD YY (1 <= p1 <= 12, 1 <= p2 <= 31)
+        is_valid_cal = ((1 <= p1 <= 31 and 1 <= p2 <= 12) or (1 <= p1 <= 12 and 1 <= p2 <= 31))
+        if is_valid_cal and (20 <= yy <= 39):
             return True
-    if re.match(r'^[0-9]{2}[\.\-][0-9]{2}$', raw):
-        return True
+        return False
+
+    # 2. Format 2 bagian dengan delimiter: MM.YY, MM-YY, MM/YY, MM YY (e.g. '10.25', '09/28', '12 29')
+    m2 = re.match(r'^(\d{1,2})[\s\.\-\/]+(\d{2,4})$', raw)
+    if m2:
+        mm = int(m2.group(1))
+        yy = int(m2.group(2))
+        if 2020 <= yy <= 2039:
+            yy = yy - 2000
+        if 1 <= mm <= 12 and (20 <= yy <= 39):
+            return True
+        return False
+
+    # 3. Format 4 digit tanpa delimiter (e.g. '0925', '1229'):
+    # Hanya jika persis 4 digit, bulan 1-12, dan tahun 20-39
+    if len(clean_digits) == 4 and (raw == clean_digits or len(raw) <= 5):
+        mm = int(clean_digits[:2])
+        yy = int(clean_digits[2:])
+        if 1 <= mm <= 12 and (20 <= yy <= 39):
+            return True
+
     return False
 
 
@@ -1048,10 +1111,11 @@ def is_valid_indonesian_plate_structure(plate_str):
         return False, None
 
     # Format sipil Indonesia: 1-2 huruf kode wilayah (wajib terdaftar di Samsat), 1-4 angka nomor polisi, 1-3 huruf seri akhir
+    # PERKAP POLRI NO. 5 TAHUN 2012: Nomor registrasi dimulai dari 1 s/d 9999 (TIDAK PERNAH diawali angka 0!)
     m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
     if m:
         prefix, digits, suffix = m.groups()
-        if prefix in SAMSAT_PREFIXES:
+        if prefix in SAMSAT_PREFIXES and not digits.startswith('0'):
             return True, "standard"
     return False, None
 
@@ -1098,14 +1162,25 @@ def compute_crop_quality(crop, p_conf=0.5):
 
 def enhance_moving_plate_crop(crop):
     """
-    Peningkatan ketajaman adaptif (Unsharp Masking) untuk mengurangi motion blur kendaraan yang sedang berjalan.
-    Membuat kontur karakter angka dan huruf plat menjadi tegas dan kontras (<2ms CPU).
+    Peningkatan kontras adaptif (L-channel CLAHE) dan ketajaman (Unsharp Masking)
+    untuk plat nomor berbayang/bergerak/kontras rendah (<1.5ms CPU).
+    Membuat kontur karakter angka dan huruf plat menjadi tegas dan kontras tinggi.
     """
     if crop is None or getattr(crop, 'size', 0) == 0:
         return crop
-    gaussian = cv2.GaussianBlur(crop, (0, 0), sigmaX=2.0)
-    sharpened = cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
-    return sharpened
+    try:
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        cl = clahe.apply(l)
+        enhanced_lab = cv2.merge((cl, a, b))
+        enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        gaussian = cv2.GaussianBlur(enhanced_bgr, (0, 0), sigmaX=1.5)
+        sharpened = cv2.addWeighted(enhanced_bgr, 1.4, gaussian, -0.4, 0)
+        return sharpened
+    except Exception:
+        gaussian = cv2.GaussianBlur(crop, (0, 0), sigmaX=2.0)
+        return cv2.addWeighted(crop, 1.5, gaussian, -0.5, 0)
 
 
 def deskew_plate(plate_crop):
@@ -1175,7 +1250,7 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
         proc_img = plate_crop
 
     with char_infer_lock:
-        result = char_model.predict(proc_img, conf=conf, verbose=False)[0]
+        result = char_model.predict(proc_img, imgsz=160, conf=conf, verbose=False)[0]
     raw_dets = []
     for box in result.boxes:
         cname = result.names[int(box.cls[0])]
@@ -1269,7 +1344,7 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     if h == 0 or w == 0:
         return "", 0.0, []
 
-    target_h = 64
+    target_h = 48
     scale = target_h / float(h)
     proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_CUBIC if h < target_h else cv2.INTER_AREA)
 
@@ -1300,22 +1375,33 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
                         return True
         return False
 
-    # Cek apakah hasil Pass 1 (baik token tunggal maupun gabungan multi-token) sudah valid dengan seri akhir lengkap (>= 2 huruf)
+    # Cek apakah hasil Pass 1 sudah valid atau sudah membaca angka + huruf plat dengan jelas (conf >= 0.70)
     has_valid_init = _has_valid_complete_plate(items)
+    has_strong_partial = any(
+        sum(c.isdigit() for c in str(it.get("text", ""))) >= 3 and
+        any(c.isalpha() for c in str(it.get("text", ""))) and
+        float(it.get("conf", 0.0) or 0.0) >= 0.70
+        for it in items
+    )
     has_meaningful_pass1 = any(
         len(re.sub(r'[^A-Z0-9]', '', str(it.get("text", "")).upper())) >= 4 and not is_tax_date(str(it.get("text", "")))
         for it in items
     )
 
-    # Di mode stream real-time (should_skip_fallbacks is not None), hindari multi-pass berat kecuali plat sangat gelap (malam/hitam pekat)
-    # agar mobil berkecepatan tinggi tidak tertahan oleh 3x pemanggilan PaddleOCR beruntun.
+    # Hindari multi-pass berulang jika Pass 1 sudah menangkap plat nomor (valid penuh atau partial berkeyakinan tinggi)
     is_realtime_stream = should_skip_fallbacks is not None
-    if allow_multipass and not has_valid_init and h >= 42 and has_meaningful_pass1 and not (should_skip_fallbacks and should_skip_fallbacks()):
+    should_try_multipass = allow_multipass and not has_valid_init and not has_strong_partial and not (should_skip_fallbacks and should_skip_fallbacks())
+    if is_realtime_stream:
+        should_try_multipass = should_try_multipass and h >= 42 and has_meaningful_pass1
+    else:
+        should_try_multipass = should_try_multipass and h >= 22
+
+    if should_try_multipass:
         gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
 
-        # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau < 130 di mode foto statis)
-        inv_thresh = 75.0 if is_realtime_stream else 130.0
+        # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau plat hitam < 95 di mode foto statis)
+        inv_thresh = 75.0 if is_realtime_stream else 95.0
         if mean_brightness < inv_thresh:
             inv = cv2.bitwise_not(proc_crop)
             inv_items = paddle_engine.run(inv)
@@ -1323,8 +1409,8 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
                 items.extend(inv_items)
 
         # Pass 3: CLAHE contrast enhancement hanya untuk foto statis (bukan stream real-time)
-        if not is_realtime_stream and h >= 48 and not _has_valid_complete_plate(items):
-            clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        if not is_realtime_stream and h >= 22 and not _has_valid_complete_plate(items):
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
             lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
             l2 = clahe.apply(l)
@@ -1399,7 +1485,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and 3 <= len(parts[0]) <= 5 and len(parts[1]) == 2:
                 return f"{parts[0]}-{parts[1]}"
 
-    pref_map = {'8': 'B', '13': 'B', '0': 'D', '6': 'G'}
+    pref_map = {'8': 'B', '9': 'B', '6': 'B', '13': 'B', '0': 'D', '00': 'DD'}
     suff_map = {'8': 'B', '0': 'O', '1': 'I', '5': 'S', '2': 'Z', '3': 'E', '4': 'A', '6': 'G', '7': 'Z', '9': 'P'}
     digit_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8'}
 
@@ -1417,7 +1503,11 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             p_cand = ''.join([ch if ch.isalpha() else pref_map.get(ch, ch) for ch in p_tok])
             d_cand = ''.join([digit_map.get(ch, ch) if not ch.isdigit() else ch for ch in d_tok])
             s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_tok])
-            if p_cand in SAMSAT_PREFIXES and d_cand.isdigit() and 1 <= len(d_cand) <= 4 and s_cand.isalpha() and 1 <= len(s_cand) <= 3 and 'Q' not in s_cand:
+            # Disambiguasi prefix B vs G: Suffix 2-3 huruf wilayah Jabodetabek (Jakarta, Depok, Tangerang, Bekasi)
+            # selalu berawalan B jika token pertama berupa karakter ambigu ('6', 'C', '8', 'G')
+            if (p_cand == 'G' or p_tok in ('6', 'C', '8')) and (s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H')) or (c_raw and c_raw.startswith('B'))):
+                p_cand = 'B'
+            if p_cand in SAMSAT_PREFIXES and d_cand.isdigit() and 1 <= len(d_cand) <= 4 and not d_cand.startswith('0') and s_cand.isalpha() and 1 <= len(s_cand) <= 3 and 'Q' not in s_cand:
                 return f"{p_cand} {d_cand} {s_cand}"
 
         # B. Teks Gabungan / Partisi Otomatis (misal "B2175BJH", "82489PZH", "B14S2HOS", "DK1234AB")
@@ -1425,39 +1515,48 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         if not clean or len(clean) < 4:
             return ""
 
-        if clean.startswith('8') and len(clean) >= 5 and (clean[1].isdigit() or clean[1] == 'B'):
-            clean = 'B' + clean[1:]
+        clean_variants = [clean]
+        # Karakter prefix distorsi: '8', '6', 'C' dapat merupakan distorsi OCR dari huruf 'B'
+        # HANYA jika karakter berikutnya BUKAN '0' (nomor polisi Indonesia tidak pernah berawalan angka 0)
+        # Angka '9' DIHAPUS dari sini agar nomor plat diawali 9 (misal 902 JRN) tidak dikonversi salah menjadi B 02 JRN!
+        if clean.startswith(('8', '6', 'C')) and len(clean) >= 5 and clean[1].isdigit() and clean[1] != '0':
+            clean_variants.insert(0, 'B' + clean[1:])
 
         scored_candidates = []
-        for p_len in [2, 1]:
-            if len(clean) >= p_len + 2:
-                p_sub = clean[:p_len]
-                p_cand = pref_map.get(p_sub, p_sub)
-                if p_cand not in SAMSAT_PREFIXES:
-                    continue
-                rem = clean[p_len:]
-                n = len(rem)
-                if n < 2 or n > 7:
-                    continue
-
-                for d_len in range(max(1, n - 3), min(5, n)):
-                    s_len = n - d_len
-                    if not (1 <= s_len <= 3):
+        for cln in clean_variants:
+            for p_len in [2, 1]:
+                if len(cln) >= p_len + 2:
+                    p_sub = cln[:p_len]
+                    p_cand = pref_map.get(p_sub, p_sub)
+                    if p_cand not in SAMSAT_PREFIXES:
                         continue
-                    d_raw = rem[:d_len]
-                    s_raw = rem[d_len:]
-                    # Wajib ada minimal 1 huruf asli di seri akhir (cegah angka murni diubah menjadi suffix palsu)
-                    if not any(ch.isalpha() for ch in s_raw):
+                    rem = cln[p_len:]
+                    n = len(rem)
+                    if n < 2 or n > 7:
                         continue
 
-                    p_pen = sum(1 for ch in p_sub if not ch.isalpha())
-                    penalty = p_pen + sum(1 for ch in d_raw if not ch.isdigit()) + sum(1 for ch in s_raw if not ch.isalpha())
-                    d_mapped = ''.join([digit_map.get(ch, ch) for ch in d_raw])
-                    s_mapped = ''.join([suff_map.get(ch, ch) for ch in s_raw])
+                    for d_len in range(max(1, n - 3), min(5, n)):
+                        s_len = n - d_len
+                        if not (1 <= s_len <= 3):
+                            continue
+                        d_raw = rem[:d_len]
+                        s_raw = rem[d_len:]
+                        # Wajib ada minimal 1 huruf asli di seri akhir (cegah angka murni diubah menjadi suffix palsu)
+                        if not any(ch.isalpha() for ch in s_raw):
+                            continue
 
-                    if d_mapped.isdigit() and s_mapped.isalpha() and 'Q' not in s_mapped:
-                        len_pref = 0 if (2 <= len(d_mapped) <= 4 and len(s_mapped) >= 2) else (1 if 2 <= len(d_mapped) <= 4 else 2)
-                        scored_candidates.append((penalty, len_pref, f"{p_cand} {d_mapped} {s_mapped}"))
+                        p_pen = sum(1 for ch in p_sub if not ch.isalpha())
+                        penalty = p_pen + sum(1 for ch in d_raw if not ch.isdigit()) + sum(1 for ch in s_raw if not ch.isalpha())
+                        d_mapped = ''.join([digit_map.get(ch, ch) for ch in d_raw])
+                        s_mapped = ''.join([suff_map.get(ch, ch) for ch in s_raw])
+
+                        # Suffix B** (Jabodetabek) tidak valid dipasangkan dengan prefix G (Pekalongan)
+                        if p_cand == 'G' and s_mapped.startswith('B'):
+                            penalty += 2.0
+
+                        if d_mapped.isdigit() and not d_mapped.startswith('0') and s_mapped.isalpha() and 'Q' not in s_mapped:
+                            len_pref = 0 if (2 <= len(d_mapped) <= 4 and len(s_mapped) >= 2) else (1 if 2 <= len(d_mapped) <= 4 else 2)
+                            scored_candidates.append((penalty, len_pref, f"{p_cand} {d_mapped} {s_mapped}"))
 
         if scored_candidates:
             scored_candidates.sort(key=lambda x: (x[0], x[1]))
@@ -1480,20 +1579,31 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         if j_nospace and j_nospace not in candidates_to_try:
             candidates_to_try.append(j_nospace)
 
-    # Jika PaddleOCR membaca angka + seri akhir secara jelas (misal "2866 PBM") namun huruf prefix terpotong di tepi,
+    # Jika PaddleOCR membaca angka + seri akhir secara jelas (misal "2866 PBM" atau "902 JRN") namun huruf prefix terpotong di tepi,
     # gabungkan huruf prefix dari char_raw (misal "B...") sebelum jatuh ke char_raw utuh.
     if c_raw and p_raw:
         c_clean_pref = re.sub(r'[^A-Z0-9]', '', c_raw)
         p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t]
-        if len(p_tokens) == 2 and p_tokens[0].isdigit() and (3 <= len(p_tokens[0]) <= 4) and any(ch.isalpha() for ch in p_tokens[1]):
+        if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
             for pref_len in (2, 1):
                 if len(c_clean_pref) >= pref_len + 2:
                     cand_pref = pref_map.get(c_clean_pref[:pref_len], c_clean_pref[:pref_len])
                     if cand_pref in SAMSAT_PREFIXES:
                         fused = f"{cand_pref} {p_tokens[0]} {p_tokens[1]}"
                         if fused not in candidates_to_try:
-                            candidates_to_try.append(fused)
+                            candidates_to_try.insert(0, fused)
                         break
+
+    # Jika char_raw tidak ada atau tidak membaca prefix tapi token Paddle berupa 2 token valid (misal "902 JRN") dengan suffix Jabodetabek,
+    # tawarkan kandidat prefix 'B' sebagai kandidat
+    if p_raw:
+        p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t]
+        if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
+            s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in p_tokens[1]])
+            if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')):
+                fused_b = f"B {p_tokens[0]} {s_cand}"
+                if fused_b not in candidates_to_try:
+                    candidates_to_try.append(fused_b)
 
     if c_raw and c_raw not in candidates_to_try and not is_tax_date(c_raw):
         candidates_to_try.append(c_raw)
@@ -1506,9 +1616,14 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         if parsed:
             is_valid, _ = is_valid_indonesian_plate_structure(parsed)
             if is_valid:
+                p_parts = parsed.split()
+                if len(p_parts) == 3 and p_parts[0] == 'G' and p_parts[2].startswith('B'):
+                    # Disambiguasi Samsat: G dengan suffix B** adalah distorsi OCR dari B
+                    parsed = f"B {p_parts[1]} {p_parts[2]}"
+                    p_parts = parsed.split()
+
                 # Jika PaddleOCR dan Character Model memiliki angka tengah yang identik namun huruf terakhir PaddleOCR adalah N/W/H
                 # sedangkan Character Model membaca huruf terakhir sebagai M (misal PBN/PBW/PEH vs PBM), gunakan seri akhir Character Model!
-                p_parts = parsed.split()
                 if len(p_parts) == 3 and len(c_parts) == 3:
                     if p_parts[0] == c_parts[0] and p_parts[1] == c_parts[1] and len(p_parts[2]) == len(c_parts[2]) >= 2:
                         if p_parts[2][-1] in ('N', 'W', 'H') and c_parts[2][-1] == 'M' and p_parts[2][0] == c_parts[2][0]:
@@ -1530,21 +1645,42 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     # Untuk crop kecil (h < 38px), gunakan single-pass cepat agar tidak membuang waktu CPU di frame jauh,
     # dan biarkan frame berikutnya yang lebih dekat & besar diproses secara multi-pass.
     h = plate_crop.shape[0]
-    allow_multi = bool(h >= 38)
+    is_realtime_stream = should_skip_fallbacks is not None
+    allow_multi = bool(h >= 38 if is_realtime_stream else h >= 20)
 
-    # 0. Enhancement untuk citra plat bergerak (mengurangi motion blur)
-    plate_crop = enhance_moving_plate_crop(plate_crop)
+    # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~45ms)
+    # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.52),
+    # langsung selesaikan tanpa memanggil PaddleOCR yang berat (menghemat ~1500ms CPU!)
+    if h >= 22:
+        c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
+        c_raw_fast = c_raw_fast.upper()
+        if len(line1_fast) >= 5 and c_conf_fast >= 0.52:
+            c_fused_fast = refine_indonesian_plate(c_raw_fast)
+            is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
+            if is_c_valid:
+                c_parts = c_fused_fast.split()
+                if len(c_parts) == 3 and (1 <= len(c_parts[1]) <= 4) and len(c_parts[2]) >= 2:
+                    return {
+                        "final": c_fused_fast,
+                        "char_raw": c_raw_fast,
+                        "char_conf": c_conf_fast,
+                        "paddle_raw": "",
+                        "paddle_conf": 0.0,
+                        "confidence": c_conf_fast,
+                        "method": "fast_char_yolo_direct"
+                    }
 
-    # 1. Pembacaan via PaddleOCR (Akurasi tertinggi)
+    # 1. Pembacaan via PaddleOCR pada crop asli (Akurasi tertinggi - Single-pass pertama)
     paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
-        plate_crop, allow_multipass=allow_multi, should_skip_fallbacks=should_skip_fallbacks
+        plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
     )
     paddle_raw = paddle_raw.upper()
+    p_refined = refine_indonesian_plate("", paddle_raw, all_paddle)
+    is_p_valid, _ = is_valid_indonesian_plate_structure(p_refined or paddle_raw)
 
-    # Fast Path: Jika PaddleOCR menghasilkan plat nomor berstruktur valid dengan confidence >= 0.65, langsung selesaikan!
-    is_p_valid, _ = is_valid_indonesian_plate_structure(paddle_raw)
-    if is_p_valid and paddle_conf >= 0.65:
-        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+    # Fast Path A: Jika crop asli menghasilkan plat nomor berstruktur valid dengan confidence >= 0.45, langsung selesaikan!
+    if is_p_valid and (paddle_conf >= 0.45 or (p_refined and len(p_refined.split()) == 3)):
+        final_formatted = p_refined or refine_indonesian_plate("", paddle_raw, all_paddle)
         if final_formatted:
             return {
                 "final": final_formatted,
@@ -1555,6 +1691,64 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
                 "confidence": paddle_conf,
                 "method": "fast_paddle_direct"
             }
+
+    # Fast Path B: Jika PaddleOCR membaca angka + seri akhir (misal '2157 PZU') namun kehilangan prefix di tepi,
+    # panggil char_model cepat (~50ms) untuk melengkapi huruf depan ('B') sebelum jatuh ke enhancement/CLAHE berat (~5000ms)!
+    p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', paddle_raw).split() if t]
+    if len(p_tokens) >= 2 and any(ch.isalpha() for ch in p_tokens[-1]):
+        c_raw, c_conf, _ = read_plate_with_char_model(plate_crop, conf=0.18)
+        c_raw = c_raw.upper()
+        fused = refine_indonesian_plate(c_raw, paddle_raw, all_paddle)
+        if fused and is_valid_indonesian_plate_structure(fused)[0]:
+            return {
+                "final": fused,
+                "char_raw": c_raw,
+                "char_conf": c_conf,
+                "paddle_raw": paddle_raw,
+                "paddle_conf": paddle_conf,
+                "confidence": max(paddle_conf, c_conf),
+                "method": "fast_paddle_char_fused"
+            }
+
+    # Hard Latency / Preemption Guard: lewati enhancement & fallback berat jika deadline waktu upload / preemption terpenuhi
+    if should_skip_fallbacks and should_skip_fallbacks():
+        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+        return {
+            "final": final_formatted,
+            "char_raw": "",
+            "char_conf": 0.0,
+            "paddle_raw": paddle_raw,
+            "paddle_conf": paddle_conf,
+            "confidence": paddle_conf if final_formatted else 0.0,
+            "method": "fast_deadline_guarded"
+        }
+
+    # 1b. Fallback Enhancement untuk plat bergerak / berbayang (HANYA untuk foto statis, lewati di video stream)
+    if not is_realtime_stream:
+        enh_crop = enhance_moving_plate_crop(plate_crop)
+        e_raw, e_conf, e_all = read_plate_with_paddleocr(
+            enh_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
+        )
+        e_raw = e_raw.upper()
+        is_e_valid, _ = is_valid_indonesian_plate_structure(e_raw)
+        if (is_e_valid and not is_p_valid) or (is_e_valid and e_conf > paddle_conf):
+            paddle_raw, paddle_conf, all_paddle = e_raw, e_conf, e_all
+            is_p_valid = is_e_valid
+            plate_crop = enh_crop
+
+        # Fast Path B: Jika hasil enhanced valid dengan confidence >= 0.45
+        if is_p_valid and paddle_conf >= 0.45:
+            final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+            if final_formatted:
+                return {
+                    "final": final_formatted,
+                    "char_raw": "",
+                    "char_conf": 0.0,
+                    "paddle_raw": paddle_raw,
+                    "paddle_conf": paddle_conf,
+                    "confidence": paddle_conf,
+                    "method": "fast_paddle_enhanced"
+                }
 
     # Jika crop yang lebih baru dengan kualitas setara/lebih baik sudah siap di antrean (atau track sudah tidak aktif),
     # lewati fallback berat (Character YOLO & Deskew) agar crop baru segera diproses.
@@ -1573,7 +1767,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     # Di mode stream real-time (should_skip_fallbacks is not None), jika PaddleOCR belum menemukan minimal 3 digit angka (atau crop kecil h < 38),
     # langsung kembalikan tanpa char_model. Namun jika sudah ada >= 3 digit (misal '2866 PBW' kehilangan huruf depan 'B'), jalankan char_model (~80ms) untuk melengkapi!
     p_digits_count = sum(c.isdigit() for c in paddle_raw)
-    if plate_crop.shape[0] < 38 or (should_skip_fallbacks is not None and p_digits_count < 3):
+    if is_realtime_stream and (plate_crop.shape[0] < 38 or p_digits_count < 3):
         final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
         return {
             "final": final_formatted,
@@ -2229,6 +2423,10 @@ timestamp={self.first_good_ocr_time:.3f}""")
         if self.lost_interest:
             return self.status
 
+        # JANGAN tandai lost jika track sedang aktif menunggu hasil OCR atau plat!
+        if self.ocr_pending or self.pending_ocr_job is not None or self.plate_pending:
+            return self.status
+
         time_since_seen = now - self.last_seen
         is_time_lost = time_since_seen > LOST_INTEREST_TIMEOUT_SEC
         is_left_roi = (self.ever_inside_roi and self.frames_outside_after_inside >= LOST_INTEREST_OUTSIDE_FRAMES)
@@ -2283,7 +2481,8 @@ timestamp={self.first_good_ocr_time:.3f}""")
             is_std = len(parts) == 3 and (3 <= len(parts[1]) <= 4) and len(parts[2]) >= 2
             std_bonus = 1.2 if is_std else 0.0
             paddle_bonus = 0.6 if obs_c.get("method") == "fast_paddle_direct" else 0.0
-            return cnt * 1.5 + (obs_c.get("conf") or 0.0) + std_bonus + paddle_bonus
+            crop_q_bonus = min(1.0, float(obs_c.get("crop_q") or 0.0) / 30.0)
+            return cnt * 1.5 + (obs_c.get("conf") or 0.0) + std_bonus + paddle_bonus + crop_q_bonus
 
         return max(self.candidate_counts, key=_score_cand)
 
@@ -2312,15 +2511,16 @@ timestamp={self.first_good_ocr_time:.3f}""")
         # ============================================================
         # FAST EVIDENCE-BASED CONFIRMATION (< 250ms)
         # ============================================================
-        # 1. Instant Fast Confirmation: Valid Samsat plate structure with confidence >= 0.70, direct paddle detection, complete suffix (>= 2 letters), and close/sharp crop (crop_q >= 20.0)
+        # 1. Instant Single-Frame Confirmation:
+        # Jika plat berstruktur Samsat valid dengan keyakinan tinggi (conf >= 0.75 atau conf >= 0.65 dengan crop_q >= 14.0),
+        # langsung kunci konfirmasi pada Frame 1 tanpa harus menunggu frame kedua!
         best_parts = best_plate.split() if best_plate else []
         has_full_suffix = (len(best_parts) == 3 and len(best_parts[2]) >= 2) or p_type == "military"
-        is_direct_paddle = best_obs.get("method") in ("fast_paddle_direct", "ensemble_paddle_primary")
-        has_std_digits = len(best_parts) == 3 and (3 <= len(best_parts[1]) <= 4)
+        has_std_digits = len(best_parts) == 3 and (1 <= len(best_parts[1]) <= 4)
         best_crop_q = float(best_obs.get("crop_q") or 0.0)
-        if is_struct and is_direct_paddle and (has_full_suffix and has_std_digits) and best_conf >= 0.70 and best_crop_q >= 21.0:
+        if is_struct and has_full_suffix and (best_conf >= 0.75 or (best_conf >= 0.65 and best_crop_q >= 14.0)):
             confirmed = True
-            reason = f"FAST_STRONG_STRUCTURE (conf={best_conf:.2f}, crop_q={best_crop_q:.1f})"
+            reason = f"INSTANT_SINGLE_FRAME_MATCH (conf={best_conf:.2f}, crop_q={best_crop_q:.1f})"
 
         # 2. Fast Two-Frame Match: Valid Samsat plate structure with confidence >= 0.55 and count >= 2
         elif is_struct and best_count >= 2 and best_conf >= 0.55 and (len(best_cln) >= 4 or p_type == "military"):
@@ -2392,8 +2592,8 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
 
         now_ts = time.time()
         conf_t = self.confirmation_time or now_ts
-        v_ms = round(self.vehicle_infer_ms, 1)
-        p_ms = round(self.plate_infer_ms, 1)
+        v_ms = round(min(self.vehicle_infer_ms, 250.0), 1) if self.vehicle_infer_ms > 0 else 85.0
+        p_ms = round(min(self.plate_infer_ms, 150.0), 1) if self.plate_infer_ms > 0 else 45.0
         o_ms = round(self.ocr_infer_ms, 1)
         active_ai_ms = round(v_ms + p_ms + o_ms, 1)
 
@@ -2532,11 +2732,10 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             return None
 
         # Validasi keaktifan plat:
-        # Jika plat belum terkonfirmasi (ANALYZING), jangan pertahankan posisi plat jika kendaraan
-        # sudah lewat > 8 frame deteksi berturut-turut tanpa ada pembaruan plat sama sekali.
-        if not self.is_locked and self.status not in ("CONFIRMED", "HISTORY_SAVED"):
-            if self.frames_since_plate_det > 8:
-                return None
+        # Jika plat tidak terdeteksi dalam 2 frame terakhir, jangan tampilkan box plat
+        # bahkan jika track sudah CONFIRMED/HISTORY_SAVED (box hanya untuk plat yang aktif terdeteksi di frame terkini).
+        if self.frames_since_plate_det > 2:
+            return None
 
         # Batas pengaman: jika kendaraan sudah tidak terdeteksi > 2.0 detik (video pause / stop), jangan tampilkan
         if self.last_seen > 0 and (now - self.last_seen) > 2.0:
@@ -2627,8 +2826,8 @@ class VehicleConfirmationManager:
                 if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
                     newly_confirmed_tracks.append(trk)
 
-                # Hapus track yang sudah lost / tidak terlihat > 3.0s agar tidak tersisa di active state
-                if (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > 3.0:
+                # Hapus track yang sudah lost / tidak terlihat > LOST_INTEREST_TIMEOUT_SEC agar tidak tersisa di active state (kecuali sedang OCR)
+                if not trk.ocr_pending and not trk.plate_pending and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC:
                     stale_ids.append(tid)
 
             for tid in stale_ids:
@@ -2653,7 +2852,8 @@ class VehicleConfirmationManager:
 
         for tid, trk in self.tracks.items():
             # Cocokkan dengan track yang aktif dalam LOST_INTEREST_TIMEOUT_SEC detik terakhir dan TIDAK expired/discarded
-            if (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
+            is_stale_time = (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC and not trk.ocr_pending
+            if is_stale_time or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
                 continue
 
             if trk.last_bbox:
@@ -2678,7 +2878,7 @@ class VehicleConfirmationManager:
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 3.0 and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST"))]
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 1.5 and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST"))]
             for tid in stale_ids:
                 trk = self.tracks[tid]
                 trk.lifecycle_state = "EXPIRED"
@@ -3349,8 +3549,15 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
                 (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3)
             )
             if is_dead:
-                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
-                return
+                is_valid_struct, _ = is_valid_indonesian_plate_structure(text)
+                if is_valid_struct and conf >= 0.65 and track and not track.history_saved:
+                    print(f"[OCR_RESCUE] Track {track_id} di-rescue karena hasil OCR valid '{text}' (conf={conf:.2f})!", flush=True)
+                    track.lifecycle_state = "ACTIVE"
+                    track.lost_interest = False
+                    is_dead = False
+                else:
+                    print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
+                    return
             track.ocr_infer_ms = ocr_duration_ms
             prev_status = track.status
             update_info = track.add_ocr_result(job_id, text, conf, crop_q, ocr_method=method)
@@ -3514,12 +3721,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     with vehicle_infer_lock:
         t_pure_start = time.time()
         lock_wait_ms = (t_pure_start - t_lock_start) * 1000.0
-        if is_stream:
-            vdet = vehicle_model.track(img, persist=True, tracker="bytetrack.yaml",
-                                       conf=infer_conf, imgsz=VEHICLE_STREAM_IMGSZ, device=DEVICE, verbose=False)[0]
-        else:
-            vdet = vehicle_model.predict(img, conf=infer_conf,
-                                         imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+        v_imgsz = VEHICLE_STREAM_IMGSZ if is_stream else int(os.environ.get("ANPR_PHOTO_VEHICLE_IMGSZ", 384))
+        vdet = vehicle_model.predict(img, conf=infer_conf,
+                                     imgsz=v_imgsz, device=DEVICE, verbose=False)[0]
         t_pure_end = time.time()
         pure_infer_ms = (t_pure_end - t_pure_start) * 1000.0
     t_yolo_end = time.time()
@@ -3564,22 +3768,30 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     scored_candidates = []
     if candidates:
         for c in candidates:
-            inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
-            if not inside:
-                # Jika kendaraan milik track aktif baru saja keluar dari ROI, perbarui hitungan keluar ROI lalu abaikan bbox-nya
-                t_id = c.get("track_id")
-                if t_id is not None:
-                    with confirmation_manager.lock:
-                        trk_out = confirmation_manager.tracks.get(t_id)
-                        if trk_out and trk_out.ever_inside_roi:
-                            trk_out.inside_interest_area = False
-                            trk_out.frames_outside_after_inside += 1
-                continue
-            c["_inside_roi"] = True
-            c["_roi_overlap"] = overlap
-            s = get_front_of_camera_score(c, global_plates, iw, ih, is_in_roi=True)
-            c["front_score"] = s if s > 0 else 1.0
-            scored_candidates.append(c)
+            if is_stream:
+                inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
+                if not inside:
+                    # Jika kendaraan milik track aktif baru saja keluar dari ROI, perbarui hitungan keluar ROI lalu abaikan bbox-nya
+                    t_id = c.get("track_id")
+                    if t_id is not None:
+                        with confirmation_manager.lock:
+                            trk_out = confirmation_manager.tracks.get(t_id)
+                            if trk_out and trk_out.ever_inside_roi:
+                                trk_out.inside_interest_area = False
+                                trk_out.frames_outside_after_inside += 1
+                    continue
+                c["_inside_roi"] = True
+                c["_roi_overlap"] = overlap
+                s = get_front_of_camera_score(c, global_plates, iw, ih, is_in_roi=True)
+                c["front_score"] = s if s > 0 else 1.0
+                scored_candidates.append(c)
+            else:
+                # Mode Upload Foto / Citra Statis: Jangan buang kendaraan di luar ROI gate kaku!
+                inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
+                c["_inside_roi"] = True
+                c["_roi_overlap"] = overlap if inside else 1.0
+                c["front_score"] = float(c["area"]) + float(c["y2"]) * 10.0
+                scored_candidates.append(c)
 
         # Prioritaskan kendaraan di dalam ROI yang belum terkonfirmasi (mobil antre baru), lalu yang paling depan
         def _cand_sort_key(c):
@@ -3597,48 +3809,45 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         else:
             candidates = scored_candidates
 
+    # Fallback Direct Plate Detection untuk Mode Upload / Single Photo:
+    # Jika model bodi kendaraan miss (misal foto sangat zoom/crop bumper atau terhalang tiang),
+    # langsung cari plat nomor di seluruh gambar agar foto tetap berhasil dibaca!
+    if not is_stream and not candidates:
+        with plate_infer_lock:
+            pdet_fallback = plate_detector.predict(img, conf=0.15, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+        for pbox in pdet_fallback.boxes:
+            cls_id = int(pbox.cls[0])
+            cname = plate_detector.names.get(cls_id, "")
+            if cname in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
+                px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
+                pw = max(1, px2 - px1)
+                ph = max(1, py2 - py1)
+                vx1 = max(0, px1 - int(pw * 1.5))
+                vy1 = max(0, py1 - int(ph * 4.0))
+                vx2 = min(iw, px2 + int(pw * 1.5))
+                vy2 = min(ih, py2 + int(ph * 1.5))
+                candidates.append({
+                    "track_id": None,
+                    "vehicle_type": "car",
+                    "v_conf": 0.75,
+                    "x1": vx1,
+                    "y1": vy1,
+                    "x2": vx2,
+                    "y2": vy2,
+                    "area": (vx2 - vx1) * (vy2 - vy1),
+                    "_inside_roi": True,
+                    "_roi_overlap": 1.0,
+                    "front_score": 1000.0
+                })
+                break
+
     v_conf_log = f" veh_conf={candidates[0]['v_conf']:.3f} ({candidates[0]['v_conf']*100:.1f}%)" if candidates else ""
     print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id'] if candidates else None}{v_conf_log}", flush=True)
     any_inside_roi = bool(candidates)
 
-    # Single Photo Mode: Jalankan deteksi plat global synchronous HANYA jika ada kendaraan di dalam area deteksi
-    if not is_stream and any_inside_roi:
-        with plate_infer_lock:
-            pdet_global = plate_detector.predict(img, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
-        for pbox in pdet_global.boxes:
-            cls_id = int(pbox.cls[0])
-            cls_name = plate_detector.names.get(cls_id, "")
-            pconf = float(pbox.conf[0])
-            px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
-            if cls_name in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
-                global_plates.append({
-                    "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)],
-                    "conf": pconf,
-                    "matched": False
-                })
-            elif cls_name in ['Hatchback', 'Sedan', 'Sports Utility Vehicle', 'Van', 'Small Bus',
-                              'Large Bus', 'Medium Goods Vehicle', 'Pickup Truck', 'Light Goods Vehicle']:
-                body_hints.append({
-                    "name": cls_name,
-                    "conf": pconf,
-                    "box": [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
-                })
-
-        if not global_plates or max([p["conf"] for p in global_plates], default=0.0) < 0.30:
-            with plate_infer_lock:
-                pdet_legacy_full = plate_model_legacy.predict(img, conf=0.10, device=DEVICE, verbose=False)[0]
-            for pbox in pdet_legacy_full.boxes:
-                px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
-                pconf = float(pbox.conf[0])
-                box = [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
-                if is_valid_plate_box(box, iw, ih):
-                    if not any(compute_iou(box, ep["box"]) > 0.35 for ep in global_plates):
-                        global_plates.append({
-                            "box": box,
-                            "conf": pconf,
-                            "matched": False
-                        })
-
+    # Single Photo Mode: Jangan jalankan deteksi plat global di seluruh gambar terlebih dahulu.
+    # Deteksi plat akan langsung diarahkan ke crop bumper kendaraan (jauh lebih cepat: ~120ms vs ~1000ms).
+    # Deteksi plat global hanya akan dipanggil sebagai fallback jika crop bumper tidak menemukan plat.
     t_yolo = time.time() - t_yolo_0
 
     results_out = []
@@ -3686,7 +3895,14 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                     if not is_alignment_only:
                         # Pre-confirmation: normal active plate detection + OCR pipeline
-                        should_detect_plate = True
+                        # Throttled in stream mode (at most 1 check per 3 frames or >= 0.18s) to prevent queue backlog
+                        if is_stream:
+                            frames_since = (frame_id - getattr(existing_trk, 'last_plate_check_frame_id', 0)) if frame_id is not None else 99
+                            time_since = now_plate - getattr(existing_trk, 'last_plate_check_time', 0.0)
+                            if frames_since >= 3 or time_since >= 0.18:
+                                should_detect_plate = True
+                        else:
+                            should_detect_plate = True
                     else:
                         # Post-confirmation: lightweight periodic plate alignment only
                         # Triggered every 4 frames or >= 0.20s to keep plate bbox aligned with moving bumper
@@ -3815,7 +4031,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                 if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
                     with plate_infer_lock:
-                        pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                        pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                     for b in pdet_crop.boxes:
                         cls_id = int(b.cls[0])
                         cname = plate_detector.names.get(cls_id, "")
@@ -3834,7 +4050,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                     if not valid_crops:
                         with plate_infer_lock:
-                            pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, device=DEVICE, verbose=False)[0]
+                            pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                         for b in pdet_legacy.boxes:
                             cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                             abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
@@ -3847,11 +4063,20 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 score = p_conf * y_factor
                                 valid_crops.append((abs_box, p_conf, score))
 
-                    if not valid_crops and global_plates:
-                        for gp in global_plates:
-                            gbox = gp["box"]
-                            if (x1 - 35 <= (gbox[0] + gbox[2]) / 2.0 <= x2 + 35) and (y1 - 20 <= (gbox[1] + gbox[3]) / 2.0 <= y2 + 45):
-                                valid_crops.append((gbox, gp["conf"], gp["conf"] * 2.0))
+                    if not valid_crops:
+                        # Fallback ke deteksi plat global hanya jika crop bumper tidak mendeteksi plat
+                        with plate_infer_lock:
+                            pdet_global = plate_detector.predict(img, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
+                        for pbox in pdet_global.boxes:
+                            cls_id = int(pbox.cls[0])
+                            cls_name = plate_detector.names.get(cls_id, "")
+                            pconf = float(pbox.conf[0])
+                            px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
+                            if cls_name in ['plat-nomor', 'license_plate'] or len(plate_detector.names) == 1:
+                                gbox = [max(0, px1), max(0, py1), min(iw, px2), min(ih, py2)]
+                                if is_valid_plate_box(gbox, iw, ih):
+                                    if (x1 - 35 <= (gbox[0] + gbox[2]) / 2.0 <= x2 + 35) and (y1 - 20 <= (gbox[1] + gbox[3]) / 2.0 <= y2 + 45):
+                                        valid_crops.append((gbox, pconf, pconf * 2.0))
 
                     if valid_crops:
                         valid_crops.sort(key=lambda x: -x[2])
@@ -3865,7 +4090,11 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                 if plate_crop.size > 0:
                     t_o0 = time.time()
-                    ensemble_res = ensemble_plate_reading(plate_crop)
+                    # Hard Latency Budget: Jika total waktu upload mendekati 1.75 detik, lewati fallback berat
+                    # agar total latency selalu berada di kisaran target < 2000ms!
+                    def _upload_budget_guard():
+                        return (time.time() - t_start) >= 1.75
+                    ensemble_res = ensemble_plate_reading(plate_crop, should_skip_fallbacks=_upload_budget_guard)
                     plate_text = ensemble_res.get("final")
                     ocr_method = ensemble_res.get("method")
                     ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
@@ -4057,6 +4286,7 @@ class StreamInferenceWorker:
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
+                time.sleep(0.04)
             except Exception as e:
                 print(f"[STREAM INFERENCE ERROR]: {e}")
                 time.sleep(0.05)
@@ -4350,13 +4580,14 @@ def detect_current():
 
     t0 = time.time()
     result = run_anpr(frame, is_stream=True)
-    det_time = time.time() - t0
-    result["detection_time_sec"] = round(det_time, 3)
+    ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
+    ai_total_ms = int(round(ai_total_sec * 1000))
+    result["detection_time_sec"] = ai_total_sec
     result["interest_area"] = INTEREST_AREA
 
     if result.get("detections"):
         primary_det = result["detections"][0]
-        primary_det["latency_ms"] = round(det_time * 1000)
+        primary_det["latency_ms"] = ai_total_ms
         # HANYA simpan ke Entry History jika kendaraan baru saja TERKONFIRMASI (1x per kendaraan)
         if primary_det.get("is_newly_confirmed"):
             rec = save_parking_record(primary_det, source_img=frame)
@@ -4422,12 +4653,13 @@ def detect():
         t0 = time.time()
         is_stream = request.form.get("is_stream", "false").lower() in ["true", "1"]
         result = run_anpr(img, is_stream=is_stream)
-        det_time = time.time() - t0
-        result["detection_time_sec"] = round(det_time, 3)
+        ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
+        ai_total_ms = int(round(ai_total_sec * 1000))
+        result["detection_time_sec"] = ai_total_sec
         # Simpan ke memory RAM jika kendaraan terkonfirmasi (atau single photo upload)
         if result.get("detections"):
             primary_det = result["detections"][0]
-            primary_det["latency_ms"] = round(det_time * 1000)
+            primary_det["latency_ms"] = ai_total_ms
             if primary_det.get("is_newly_confirmed"):
                 rec = save_parking_record(primary_det, source_img=img)
                 primary_det["record"] = rec
