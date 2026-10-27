@@ -141,11 +141,31 @@ PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.15))
 
 
 
+def is_plate_inside_roi(plate_bbox, img_w, img_h, roi=None):
+    """
+    Mengecek apakah koordinat plat nomor berada di dalam AREA DETEKTOR (ROI).
+    Jika plat sudah melewati batas bawah/samping ROI, kendaraan dinyatakan keluar ROI.
+    """
+    if not plate_bbox or len(plate_bbox) < 4:
+        return False
+    if roi is None:
+        roi = INTEREST_AREA
+    rx1 = roi["x_min"] * img_w
+    ry1 = roi["y_min"] * img_h
+    rx2 = roi["x_max"] * img_w
+    ry2 = roi["y_max"] * img_h
+    px1, py1, px2, py2 = plate_bbox[:4]
+    pcx = (px1 + px2) / 2.0
+    pcy = (py1 + py2) / 2.0
+    # Plat keluar jika pusat plat berada di luar batas ROI (terutama saat mobil maju melewati batas bawah ry2)
+    return (rx1 - 25 <= pcx <= rx2 + 25) and (ry1 - 15 <= pcy <= ry2 + 20)
+
+
 def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
     """
-    Mengecek apakah kendaraan benar-benar masuk ke dalam AREA DETEKTOR (ROI).
-    Kendaraan di luar kotak deteksi, motor parkir di pinggir, atau false-positive
-    latar belakang/plafon yang membentang lebar di luar ROI diabaikan sepenuhnya.
+    Mengecek apakah kendaraan masuk ke dalam AREA DETEKTOR (ROI).
+    Responsif: Begitu moncong / bumper kendaraan menyentuh ROI (overlap >= 25%),
+    bounding box langsung ditampilkan seketika tanpa delay.
     """
     if roi is None:
         roi = INTEREST_AREA
@@ -159,17 +179,11 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
 
     bw = max(1.0, float(x2 - x1))
     bh = max(1.0, float(y2 - y1))
-    aspect_wh = bw / bh
 
-    # 1. Tolak false-positive latar belakang/plafon/deretan motor parkir:
-    #    - Lebar bbox melebihi 1.65x lebar ROI atau > 62% lebar frame
-    #    - Rasio lebar:tinggi terlalu pipih/melebar (aspect_wh > 1.85)
-    #    - Posisi menggantung di plafon atas (y1 <= 10px dan bagian bawah y2 berada di paruh atas ROI)
-    if bw > roi_w * 1.65 or (bw / float(max(1, img_w))) > 0.62:
+    # 1. Tolak false-positive plafon atas yang menggantung di luar lorong
+    if bw > roi_w * 2.2 or (bw / float(max(1, img_w))) > 0.85:
         return False, 0.0
-    if aspect_wh > 1.85:
-        return False, 0.0
-    if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.58):
+    if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.45):
         return False, 0.0
 
     # 2. Cek perpotongan bounding box dengan area deteksi
@@ -186,9 +200,8 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
         cy = (float(y1) + float(y2)) / 2.0
         center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
 
-        # Aktif HANYA jika titik tengah kendaraan berada di dalam ROI DAN minimal 55% bodi kendaraan berada di dalam ROI
-        # (atau minimal 70% bodi kendaraan berada di dalam ROI)
-        if (center_in and overlap_ratio >= 0.55) or overlap_ratio >= 0.70:
+        # Responsif: Moncong kendaraan masuk ROI (overlap >= 25%) atau titik tengah di ROI
+        if (center_in and overlap_ratio >= 0.20) or overlap_ratio >= 0.25:
             return True, overlap_ratio
 
     return False, 0.0
@@ -902,10 +915,35 @@ class PaddleEngine:
                 use_textline_orientation=False,
             )
             self.engine = PaddleOCR(**kw)
+            p = getattr(self.engine, "paddlex_pipeline", None)
+            self.rec_model = getattr(p, "text_rec_model", None) if p else None
         else:
             self.engine = PaddleOCR(lang="en", use_angle_cls=False, use_gpu=(device != "cpu"), show_log=False)
+            self.rec_model = None
         self.init_ms = (time.time() - t0) * 1000.0
-        print(f"[PADDLE] siap | paddleocr={self.version} api={self.api} device={device} init={self.init_ms:.0f}ms")
+        rec_stat = "rec_only=enabled" if self.rec_model else "rec_only=disabled"
+        print(f"[PADDLE] siap | paddleocr={self.version} api={self.api} {rec_stat} device={device} init={self.init_ms:.0f}ms")
+
+    def run_rec_only(self, img_bgr):
+        """
+        Fast-Path Recognition Only: Menjalankan model pengenal karakter langsung pada potongan plat
+        tanpa membuang waktu menjalankan Text Detection ulang (~250ms vs ~1500ms).
+        """
+        if img_bgr is None or getattr(img_bgr, "size", 0) == 0:
+            return []
+        with self.lock:
+            if self.rec_model is not None:
+                try:
+                    res = list(self.rec_model([img_bgr]))
+                    if res:
+                        r0 = res[0]
+                        txt = r0.get("rec_text", "")
+                        sc = float(r0.get("rec_score", 0.0) or 0.0)
+                        if txt:
+                            return [{"text": str(txt), "conf": sc}]
+                except Exception:
+                    pass
+        return self.run(img_bgr)
 
     def run(self, img_bgr):
         with self.lock:
@@ -1348,8 +1386,6 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     scale = target_h / float(h)
     proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_CUBIC if h < target_h else cv2.INTER_AREA)
 
-    items = paddle_engine.run(proc_crop)
-
     def _has_valid_complete_plate(item_list):
         if not item_list:
             return False
@@ -1374,6 +1410,14 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
                     if (len(parts) == 3 and len(parts[2]) >= 2) or '-' in p_test:
                         return True
         return False
+
+    # Pass 0: Fast Recognition-Only (~200ms) tanpa text detection ulang
+    items = paddle_engine.run_rec_only(proc_crop)
+    if not _has_valid_complete_plate(items):
+        # Fallback ke pipeline lengkap deteksi teks + rekognisi jika fast rec belum menangkap plat valid
+        full_items = paddle_engine.run(proc_crop)
+        if full_items:
+            items = full_items
 
     # Cek apakah hasil Pass 1 sudah valid atau sudah membaca angka + huruf plat dengan jelas (conf >= 0.70)
     has_valid_init = _has_valid_complete_plate(items)
@@ -2789,7 +2833,7 @@ class VehicleConfirmationManager:
             if raw_tid is not None and raw_tid in self.tracks:
                 tid = raw_tid
             else:
-                matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h, iou_thresh=0.20)
+                matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h, iou_thresh=0.35)
                 if matched_id is not None:
                     tid = matched_id
                 elif raw_tid is not None:
@@ -2826,8 +2870,9 @@ class VehicleConfirmationManager:
                 if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
                     newly_confirmed_tracks.append(trk)
 
-                # Hapus track yang sudah lost / tidak terlihat > LOST_INTEREST_TIMEOUT_SEC agar tidak tersisa di active state (kecuali sedang OCR)
-                if not trk.ocr_pending and not trk.plate_pending and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC:
+                # Hapus track yang sudah lost / tidak terlihat > timeout (0.6s untuk track yang sudah tersimpan agar langsung bersih)
+                max_stale_time = 0.6 if trk.history_saved else LOST_INTEREST_TIMEOUT_SEC
+                if not trk.ocr_pending and not trk.plate_pending and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > max_stale_time:
                     stale_ids.append(tid)
 
             for tid in stale_ids:
@@ -2851,9 +2896,13 @@ class VehicleConfirmationManager:
         best_iou = -1.0
 
         for tid, trk in self.tracks.items():
-            # Cocokkan dengan track yang aktif dalam LOST_INTEREST_TIMEOUT_SEC detik terakhir dan TIDAK expired/discarded
-            is_stale_time = (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC and not trk.ocr_pending
+            max_stale_time = 0.6 if trk.history_saved else LOST_INTEREST_TIMEOUT_SEC
+            is_stale_time = (now - trk.last_seen) > max_stale_time and not trk.ocr_pending
             if is_stale_time or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
+                continue
+
+            # JANGAN pernah cocokkan mobil baru ke track yang sudah terkonfirmasi dan keluar ROI / lost
+            if (trk.history_saved or trk.is_locked) and (trk.lost_interest or not trk.inside_interest_area):
                 continue
 
             if trk.last_bbox:
@@ -3771,14 +3820,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             if is_stream:
                 inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
                 if not inside:
-                    # Jika kendaraan milik track aktif baru saja keluar dari ROI, perbarui hitungan keluar ROI lalu abaikan bbox-nya
-                    t_id = c.get("track_id")
-                    if t_id is not None:
+                    # Jika kendaraan milik track aktif baru saja keluar dari ROI, perbarui status keluar ROI lalu abaikan bbox-nya
+                    matched_tid = confirmation_manager._match_track([c["x1"], c["y1"], c["x2"], c["y2"]], img_w=iw, img_h=ih, iou_thresh=0.20)
+                    if matched_tid is not None:
                         with confirmation_manager.lock:
-                            trk_out = confirmation_manager.tracks.get(t_id)
+                            trk_out = confirmation_manager.tracks.get(matched_tid)
                             if trk_out and trk_out.ever_inside_roi:
                                 trk_out.inside_interest_area = False
                                 trk_out.frames_outside_after_inside += 1
+                                if trk_out.history_saved or trk_out.status in ("CONFIRMED", "HISTORY_SAVED") or trk_out.frames_outside_after_inside >= 2:
+                                    trk_out.lost_interest = True
+                                    trk_out.lifecycle_state = "LOST"
                     continue
                 c["_inside_roi"] = True
                 c["_roi_overlap"] = overlap
@@ -3876,6 +3928,14 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 compute_iou([x1, y1, x2, y2], list(map(int, b.xyxy[0].tolist()))) > 0.30
                 for b in vdet.boxes
             )
+
+            # Cek jika plat nomor kendaraan sudah keluar dari batas ROI (mobil maju keluar gerbang):
+            if is_stream and existing_trk.last_plate_bbox:
+                if not is_plate_inside_roi(existing_trk.last_plate_bbox, iw, ih):
+                    existing_trk.inside_interest_area = False
+                    existing_trk.lost_interest = True
+                    existing_trk.lifecycle_state = "LOST"
+                    print(f"[PLATE_EXITED_ROI]\ntrack_id={tid}", flush=True)
 
             # JIKA LOST INTEREST, ABAIKAN AGAR BBOX TIDAK DITAMPILKAN:
             if existing_trk.lost_interest:

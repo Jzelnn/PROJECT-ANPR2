@@ -2905,6 +2905,11 @@ function handleWsMessage(msg){
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
     updateResultCard(lastDetectionData);
+    if (!usingBackendAnnotatedImage) {
+      drawBoxes([lastDetectionData]);
+    } else if (lastDetectionData.plate_bbox) {
+      drawPlateBoxOnly(lastDetectionData);
+    }
     const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
     if (pLabel) {
       pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
