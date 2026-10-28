@@ -1702,20 +1702,22 @@ function handleDetectionResult(data, silent=false){
     }
   } else {
     consecutiveEmptyCycles++;
-    if (lastActiveTrackId !== null) {
-      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
-    }
-    lastActiveTrackId = null;
-    clearBoxes();
-    if (!usingBackendAnnotatedImage) {
-      drawRoiBox(currentRoi);
-    }
-    lastDetectionData = null;
-    updateResultCard(null, 0);
-    updateTelemetry(null);
-    if (!silent){
-      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-      showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
+    if (consecutiveEmptyCycles >= 4) {
+      if (lastActiveTrackId !== null) {
+        console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
+      }
+      lastActiveTrackId = null;
+      clearBoxes();
+      if (!usingBackendAnnotatedImage) {
+        drawRoiBox(currentRoi);
+      }
+      lastDetectionData = null;
+      updateResultCard(null, 0);
+      updateTelemetry(null);
+      if (!silent && consecutiveEmptyCycles === 4){
+        const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
+        showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
+      }
     }
   }
 }
@@ -2915,7 +2917,11 @@ function handleWsMessage(msg){
       pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "ocr_update"){
-    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
+    if (!lastDetectionData && (lastActiveTrackId === null || lastActiveTrackId === msg.track_id)) {
+      lastActiveTrackId = msg.track_id;
+      lastDetectionData = { track_id: msg.track_id, status: msg.status || 'ANALYZING' };
+    }
+    if (!lastDetectionData || (lastActiveTrackId !== null && lastActiveTrackId !== msg.track_id)) return;
 
     // Issue 2 Guard: Check if the active track is already locked in a confirmed state
     const isCurrentTrackConfirmed = (

@@ -1066,6 +1066,7 @@ def warmup_models():
             char_model.predict(dummy_crop, imgsz=160, verbose=False)
         if 'paddle_engine' in globals() and paddle_engine is not None:
             paddle_engine.run(dummy_crop)
+            paddle_engine.run_rec_only(dummy_crop)
         print(f"[WARMUP] Inisialisasi & pemanasan seluruh graf AI selesai dalam {(time.time() - t_w0)*1000:.0f}ms!", flush=True)
     except Exception as e:
         print(f"[WARN] Warmup error: {e}", flush=True)
@@ -1645,7 +1646,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             d_part, s_part = m_missing_pref.groups()
             if not d_part.startswith('0'):
                 s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_part])
-                if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')) or (c_raw and c_raw.startswith('B')):
+                if (c_raw and c_raw.startswith('B')) or (len(d_part) >= 4 and s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J'))):
                     clean_variants.insert(0, 'B' + clean)
 
         scored_candidates = []
@@ -1726,7 +1727,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t]
         if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
             s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in p_tokens[1]])
-            if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')):
+            if (c_raw and c_raw.startswith('B')) or (len(p_tokens[0]) >= 4 and s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J'))):
                 fused_b = f"B {p_tokens[0]} {s_cand}"
                 if fused_b not in candidates_to_try:
                     candidates_to_try.append(fused_b)
@@ -1846,7 +1847,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             "paddle_raw": paddle_raw,
             "paddle_conf": paddle_conf,
             "confidence": paddle_conf if final_formatted else 0.0,
-            "method": "fast_deadline_guarded"
+            "method": "fast_preempted_by_better_crop"
         }
 
     # 1b. Fallback Enhancement untuk plat bergerak / berbayang (HANYA untuk foto statis, lewati di video stream)
@@ -3549,10 +3550,10 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     # Queue or prepare OCR job ONLY if NOT alignment_only and track is not locked
                     if not alignment_only and not track.is_locked and track.status not in ('CONFIRMED', 'HISTORY_SAVED'):
                         crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
-                        min_crop_w = 108 if full_img.shape[1] >= 1100 else (80 if full_img.shape[1] >= 800 else 36)
-                        min_crop_h = 58 if full_img.shape[1] >= 1100 else (43 if full_img.shape[1] >= 800 else 18)
-                        # Hanya jalankan OCR jika ukuran plat sudah cukup dekat & terbaca jelas
-                        # sehingga CPU tidak terbuang membaca plat buram saat mobil masih jauh
+                        min_crop_w = 54 if full_img.shape[1] >= 1100 else (44 if full_img.shape[1] >= 800 else 28)
+                        min_crop_h = 24 if full_img.shape[1] >= 1100 else (18 if full_img.shape[1] >= 800 else 14)
+                        # Jalankan OCR segera saat plat mulai terbaca di area deteksi (lebar >= 44px, tinggi >= 18px)
+                        # agar konfirmasi plat selesai sebelum kendaraan melaju melewati gerbang
                         if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
                             crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                             if not track.ocr_pending:
@@ -4387,6 +4388,12 @@ class StreamInferenceWorker:
                 time.sleep(0.02)
                 continue
 
+            has_pending_ocr = False
+            with confirmation_manager.lock:
+                has_pending_ocr = any(getattr(t, 'ocr_pending', False) for t in confirmation_manager.tracks.values())
+            if has_pending_ocr:
+                time.sleep(0.04)
+
             t0 = time.time()
             try:
                 result = run_anpr(frame, is_stream=True, frame_id=frame_id, capture_timestamp=frame_capture_time)
@@ -4447,7 +4454,7 @@ class StreamInferenceWorker:
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
-                time.sleep(0.04)
+                time.sleep(0.06 if has_pending_ocr else 0.03)
             except Exception as e:
                 print(f"[STREAM INFERENCE ERROR]: {e}")
                 time.sleep(0.05)
