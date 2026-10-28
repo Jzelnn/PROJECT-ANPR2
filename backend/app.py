@@ -1,8 +1,8 @@
 import os
-# Batasi CPU threads OpenMP / OpenBLAS agar tidak terjadi thrashing di CPU 22-core Windows
-os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "2")
-os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "2")
-os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "2")
+# Batasi CPU threads OpenMP / OpenBLAS agar optimal di CPU multi-core tanpa thrashing
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "4")
+os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "4")
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "4")
 import re
 import time
 import datetime
@@ -69,7 +69,7 @@ def _custom_static_create(self):
             config.disable_onednn()
         if hasattr(config, "disable_mkldnn"):
             config.disable_mkldnn()
-        config.set_cpu_math_library_num_threads(2)
+        config.set_cpu_math_library_num_threads(4)
         if hasattr(config, "enable_new_ir"):
             config.enable_new_ir(False)
     config.disable_glog_info()
@@ -1089,9 +1089,11 @@ def map_vehicle_class_name(cls_id, model=vehicle_model):
     return "car"
 
 
-def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.06, pad_y_ratio=0.05):
-    """Crop plat nomor dengan padding presisi agar membuang background bumper dan mempercepat OCR DBNet."""
+def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.0, pad_y_ratio=0.0):
+    """Crop plat nomor presisi tanpa padding bumper agar karakter OCR tidak terkontaminasi bingkai dan baut."""
     ih, iw = image.shape[:2]
+    if pad_x_ratio == 0.0 and pad_y_ratio == 0.0:
+        return image[max(0, py1):min(ih, py2), max(0, px1):min(iw, px2)]
     pw, ph = px2 - px1, py2 - py1
     pad_x = int(pw * pad_x_ratio)
     pad_y = int(ph * pad_y_ratio)
@@ -1441,9 +1443,17 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     if h == 0 or w == 0:
         return "", 0.0, []
 
+    # Clean inner margin trim: memotong 7% margin atas/bawah dan 4% margin kiri/kanan
+    # untuk menghilangkan bezel hitam bumper dan baut plat yang merusak pembacaan karakter (misal BAJ terbaca 8A3 atau BAE)
+    if h >= 26 and w >= 45:
+        clean_crop = plate_crop[int(h * 0.07):int(h * 0.93), int(w * 0.04):int(w * 0.96)]
+    else:
+        clean_crop = plate_crop
+
     target_h = 48
-    scale = target_h / float(h)
-    proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_CUBIC if h < target_h else cv2.INTER_AREA)
+    ch, cw = clean_crop.shape[:2]
+    scale = target_h / float(ch)
+    proc_crop = cv2.resize(clean_crop, (int(cw * scale), target_h), interpolation=cv2.INTER_CUBIC if ch < target_h else cv2.INTER_AREA)
 
     def _has_valid_complete_plate(item_list):
         if not item_list:
@@ -1471,11 +1481,11 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
         return False
 
     is_realtime_stream = should_skip_fallbacks is not None
-    # Pass 0: Fast Recognition-Only (~200ms) tanpa text detection ulang
+    # Pass 0: Fast Recognition-Only (~600-800ms) tanpa text detection ulang
     items = paddle_engine.run_rec_only(proc_crop)
     if not is_realtime_stream and not _has_valid_complete_plate(items):
         # Fallback ke pipeline lengkap deteksi teks + rekognisi HANYA untuk foto statis!
-        full_items = paddle_engine.run(proc_crop)
+        full_items = paddle_engine.run(clean_crop)
         if full_items:
             items = full_items
 
@@ -1496,18 +1506,20 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     is_realtime_stream = should_skip_fallbacks is not None
     should_try_multipass = allow_multipass and not has_valid_init and not has_strong_partial and not (should_skip_fallbacks and should_skip_fallbacks())
     if is_realtime_stream:
-        should_try_multipass = should_try_multipass and h >= 42 and has_meaningful_pass1
+        # PENTING: Pada real-time video stream, nonaktifkan multi-pass (inverted/CLAHE) secara total
+        # karena setiap pass ekstra memakan 2-4 detik dan menyebabkan queue backlog parah di CPU.
+        should_try_multipass = False
     else:
         should_try_multipass = should_try_multipass and h >= 22
 
     if should_try_multipass:
-        gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(clean_crop, cv2.COLOR_BGR2GRAY)
         mean_brightness = float(gray.mean())
 
         # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau plat hitam < 95 di mode foto statis)
         inv_thresh = 75.0 if is_realtime_stream else 95.0
         if mean_brightness < inv_thresh:
-            inv = cv2.bitwise_not(proc_crop)
+            inv = cv2.bitwise_not(clean_crop)
             inv_items = paddle_engine.run(inv)
             if inv_items:
                 items.extend(inv_items)
@@ -1515,7 +1527,7 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
         # Pass 3: CLAHE contrast enhancement hanya untuk foto statis (bukan stream real-time)
         if not is_realtime_stream and h >= 22 and not _has_valid_complete_plate(items):
             clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-            lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
+            lab = cv2.cvtColor(clean_crop, cv2.COLOR_BGR2LAB)
             l, a, b = cv2.split(lab)
             l2 = clahe.apply(l)
             enhanced = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
