@@ -1702,22 +1702,20 @@ function handleDetectionResult(data, silent=false){
     }
   } else {
     consecutiveEmptyCycles++;
-    if (consecutiveEmptyCycles >= 4) {
-      if (lastActiveTrackId !== null) {
-        console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
-      }
-      lastActiveTrackId = null;
-      clearBoxes();
-      if (!usingBackendAnnotatedImage) {
-        drawRoiBox(currentRoi);
-      }
-      lastDetectionData = null;
-      updateResultCard(null, 0);
-      updateTelemetry(null);
-      if (!silent && consecutiveEmptyCycles === 4){
-        const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-        showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
-      }
+    if (lastActiveTrackId !== null) {
+      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
+    }
+    lastActiveTrackId = null;
+    clearBoxes();
+    if (!usingBackendAnnotatedImage) {
+      drawRoiBox(currentRoi);
+    }
+    lastDetectionData = null;
+    updateResultCard(null, 0);
+    updateTelemetry(null);
+    if (!silent){
+      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
+      showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
     }
   }
 }
@@ -2907,21 +2905,12 @@ function handleWsMessage(msg){
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
     updateResultCard(lastDetectionData);
-    if (!usingBackendAnnotatedImage) {
-      drawBoxes([lastDetectionData]);
-    } else if (lastDetectionData.plate_bbox) {
-      drawPlateBoxOnly(lastDetectionData);
-    }
     const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
     if (pLabel) {
       pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "ocr_update"){
-    if (!lastDetectionData && (lastActiveTrackId === null || lastActiveTrackId === msg.track_id)) {
-      lastActiveTrackId = msg.track_id;
-      lastDetectionData = { track_id: msg.track_id, status: msg.status || 'ANALYZING' };
-    }
-    if (!lastDetectionData || (lastActiveTrackId !== null && lastActiveTrackId !== msg.track_id)) return;
+    if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
 
     // Issue 2 Guard: Check if the active track is already locked in a confirmed state
     const isCurrentTrackConfirmed = (
