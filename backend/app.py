@@ -469,6 +469,33 @@ def draw_annotations_on_image(img, detections, interest_area=None):
     return annotated
 
 
+def _is_similar_plate(p1, p2):
+    """Mengecek apakah dua plat nomor merujuk pada kendaraan yang sama."""
+    if not p1 or not p2:
+        return False
+    parts1 = str(p1).strip().split()
+    parts2 = str(p2).strip().split()
+    if len(parts1) == 3 and len(parts2) == 3:
+        pref1, dig1, suff1 = parts1[0], parts1[1], parts1[2]
+        pref2, dig2, suff2 = parts2[0], parts2[1], parts2[2]
+        if pref1 == pref2:
+            # Subkasus A: Angka sama, suffix selisih <= 1 (misal HA vs HUA)
+            if dig1 == dig2:
+                if suff1 == suff2:
+                    return True
+                if abs(len(suff1) - len(suff2)) <= 1:
+                    diff = sum(c1 != c2 for c1, c2 in zip(suff1, suff2)) + abs(len(suff1) - len(suff2))
+                    if diff <= 1 or suff1 in suff2 or suff2 in suff1:
+                        return True
+            # Subkasus B: Suffix sama/mirip, angka selisih <= 1 (misal 1042 vs 1842, 999 vs 929)
+            if suff1 == suff2 or (abs(len(suff1) - len(suff2)) <= 1 and (suff1 in suff2 or suff2 in suff1)):
+                if abs(len(dig1) - len(dig2)) <= 1:
+                    d_diff = sum(c1 != c2 for c1, c2 in zip(dig1, dig2)) + abs(len(dig1) - len(dig2))
+                    if d_diff <= 1:
+                        return True
+    return False
+
+
 def save_parking_record(det, source_img=None, source_img_path=None):
     """
     Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms).
@@ -522,15 +549,47 @@ def save_parking_record(det, source_img=None, source_img_path=None):
             pass
 
     # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 15 detik lalu, gunakan record yang ada
+    existing_rec = None
     if safe_plate in LAST_RECORDED_PLATES:
         last_entry = LAST_RECORDED_PLATES[safe_plate]
         if (now_epoch - last_entry["time"]) < GATE_COOLDOWN_SEC:
             existing_rec = last_entry["rec"]
-            if det.get("body_style") and not existing_rec.get("body_style"):
-                existing_rec["body_style"] = det.get("body_style")
-                existing_rec["body_style_confidence"] = det.get("body_style_confidence")
-                existing_rec["body_pending"] = False
-            return existing_rec
+    else:
+        # Fuzzy Cooldown: cocokkan dengan plat yang tercatat dalam 15 detik terakhir
+        for prev_safe, prev_entry in list(LAST_RECORDED_PLATES.items()):
+            if (now_epoch - prev_entry["time"]) < GATE_COOLDOWN_SEC:
+                prev_rec = prev_entry["rec"]
+                if _is_similar_plate(plate_text, prev_rec.get("license_plate", "")):
+                    existing_rec = prev_rec
+                    safe_plate = prev_safe
+                    break
+
+    if existing_rec:
+        cur_conf = float(det.get("plate_confidence", 0.0) or det.get("confidence", 0.0) or plate_conf)
+        old_conf = float(existing_rec.get("confidence", 0.0) or 0.0)
+        old_plate = existing_rec.get("license_plate", "")
+        # Jika pembacaan baru lebih baik (confidence lebih tinggi atau plat lebih lengkap), perbarui in-place
+        if (cur_conf > old_conf + 0.03) or (len(plate_text) > len(old_plate) and cur_conf >= old_conf):
+            existing_rec["license_plate"] = plate_text
+            existing_rec["confidence"] = round(max(cur_conf, old_conf), 3)
+            existing_rec["ocr_confidence"] = existing_rec["confidence"]
+            existing_rec["plate_confidence"] = existing_rec["confidence"]
+            LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": existing_rec}
+            ws_broadcaster.broadcast({
+                "type": "ocr_update",
+                "track_id": track_id,
+                "record_id": existing_rec.get("id"),
+                "license_plate": plate_text,
+                "ocr_candidate": plate_text,
+                "ocr_confidence": existing_rec["confidence"],
+                "ocr_status": "CONFIRMED",
+                "status": "CONFIRMED"
+            })
+        if det.get("body_style") and not existing_rec.get("body_style"):
+            existing_rec["body_style"] = det.get("body_style")
+            existing_rec["body_style_confidence"] = det.get("body_style_confidence")
+            existing_rec["body_pending"] = False
+        return existing_rec
 
     snapshot_filename = f"{file_ts}_{safe_plate}.jpg"
     dest_path = os.path.join(CAPTURES_DIR, snapshot_filename)
@@ -1411,10 +1470,11 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
                         return True
         return False
 
+    is_realtime_stream = should_skip_fallbacks is not None
     # Pass 0: Fast Recognition-Only (~200ms) tanpa text detection ulang
     items = paddle_engine.run_rec_only(proc_crop)
-    if not _has_valid_complete_plate(items):
-        # Fallback ke pipeline lengkap deteksi teks + rekognisi jika fast rec belum menangkap plat valid
+    if not is_realtime_stream and not _has_valid_complete_plate(items):
+        # Fallback ke pipeline lengkap deteksi teks + rekognisi HANYA untuk foto statis!
         full_items = paddle_engine.run(proc_crop)
         if full_items:
             items = full_items
@@ -1549,7 +1609,7 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
             s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_tok])
             # Disambiguasi prefix B vs G: Suffix 2-3 huruf wilayah Jabodetabek (Jakarta, Depok, Tangerang, Bekasi)
             # selalu berawalan B jika token pertama berupa karakter ambigu ('6', 'C', '8', 'G')
-            if (p_cand == 'G' or p_tok in ('6', 'C', '8')) and (s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H')) or (c_raw and c_raw.startswith('B'))):
+            if (p_cand == 'G' or p_tok in ('6', 'C', '8')) and (s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')) or (c_raw and c_raw.startswith('B'))):
                 p_cand = 'B'
             if p_cand in SAMSAT_PREFIXES and d_cand.isdigit() and 1 <= len(d_cand) <= 4 and not d_cand.startswith('0') and s_cand.isalpha() and 1 <= len(s_cand) <= 3 and 'Q' not in s_cand:
                 return f"{p_cand} {d_cand} {s_cand}"
@@ -1565,6 +1625,16 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         # Angka '9' DIHAPUS dari sini agar nomor plat diawali 9 (misal 902 JRN) tidak dikonversi salah menjadi B 02 JRN!
         if clean.startswith(('8', '6', 'C')) and len(clean) >= 5 and clean[1].isdigit() and clean[1] != '0':
             clean_variants.insert(0, 'B' + clean[1:])
+
+        # Prefix terpotong di tepi crop (misal "902JRN" -> 1-4 digit angka + 1-3 huruf suffix Jabodetabek)
+        # Tambahkan kandidat prefix 'B' jika diawali digit non-nol dan suffix cocok
+        m_missing_pref = re.match(r'^(\d{1,4})([A-Z]{1,3})$', clean)
+        if m_missing_pref:
+            d_part, s_part = m_missing_pref.groups()
+            if not d_part.startswith('0'):
+                s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_part])
+                if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')) or (c_raw and c_raw.startswith('B')):
+                    clean_variants.insert(0, 'B' + clean)
 
         scored_candidates = []
         for cln in clean_variants:
@@ -2442,6 +2512,19 @@ timestamp={self.first_good_ocr_time:.3f}""")
 
             if not self.is_locked and self.status not in ["CONFIRMED", "HISTORY_SAVED"]:
                 self._evaluate_confirmation()
+            elif self.confirmed_data and self.best_candidate_display:
+                # In-Place Candidate Upgrade untuk track yang sudah terkonfirmasi:
+                # Jika mobil melaju makin dekat dan membaca plat dengan confidence lebih tinggi,
+                # langsung perbarui data track dan entry history tanpa membuat baris baru!
+                old_conf = float(self.confirmed_data.get("confidence", 0.0) or 0.0)
+                old_plate = self.confirmed_data.get("license_plate", "")
+                if (conf > old_conf + 0.03) or (len(self.best_candidate_display) > len(old_plate) and conf >= old_conf):
+                    self.confirmed_data["license_plate"] = self.best_candidate_display
+                    self.confirmed_data["confidence"] = round(max(conf, old_conf), 3)
+                    self.confirmed_data["ocr_confidence"] = self.confirmed_data["confidence"]
+                    self.confirmed_data["plate_confidence"] = self.confirmed_data["confidence"]
+                    if self.history_saved:
+                        save_parking_record(self.confirmed_data)
         else:
             self.consecutive_plate = ""
             self.consecutive_count = 0
@@ -2870,9 +2953,13 @@ class VehicleConfirmationManager:
                 if prev_status != "CONFIRMED" and new_status == "CONFIRMED":
                     newly_confirmed_tracks.append(trk)
 
-                # Hapus track yang sudah lost / tidak terlihat > timeout (0.6s untuk track yang sudah tersimpan agar langsung bersih)
-                max_stale_time = 0.6 if trk.history_saved else LOST_INTEREST_TIMEOUT_SEC
-                if not trk.ocr_pending and not trk.plate_pending and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST", "DISCARDED")) and (now - trk.last_seen) > max_stale_time:
+                # Track HANYA boleh dihapus jika:
+                # 1. Kendaraan sudah keluar dari ROI (inside_interest_area == False) dan tidak terlihat > 1.2 detik, ATAU
+                # 2. Kendaraan sudah tidak terlihat sama sekali (missing) > LOST_INTEREST_TIMEOUT_SEC.
+                # JANGAN hapus track jika kendaraan masih aktif berada di dalam ROI (mencegah duplikasi track ID untuk mobil yang sama)!
+                is_outside_and_gone = (not trk.inside_interest_area or trk.lost_interest) and (now - trk.last_seen) > (1.2 if trk.history_saved else LOST_INTEREST_TIMEOUT_SEC)
+                is_timeout_gone = (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC
+                if not trk.ocr_pending and not trk.plate_pending and (is_outside_and_gone or is_timeout_gone or trk.lifecycle_state == "DISCARDED"):
                     stale_ids.append(tid)
 
             for tid in stale_ids:
@@ -2896,13 +2983,15 @@ class VehicleConfirmationManager:
         best_iou = -1.0
 
         for tid, trk in self.tracks.items():
-            max_stale_time = 0.6 if trk.history_saved else LOST_INTEREST_TIMEOUT_SEC
-            is_stale_time = (now - trk.last_seen) > max_stale_time and not trk.ocr_pending
-            if is_stale_time or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
+            if trk.lifecycle_state in ("EXPIRED", "DISCARDED"):
                 continue
 
-            # JANGAN pernah cocokkan mobil baru ke track yang sudah terkonfirmasi dan keluar ROI / lost
-            if (trk.history_saved or trk.is_locked) and (trk.lost_interest or not trk.inside_interest_area):
+            # JANGAN cocokkan ke track yang sudah terkonfirmasi JIKA mobilnya sudah benar-benar keluar dari ROI / lost
+            if (trk.history_saved or trk.is_locked) and trk.lost_interest and not trk.inside_interest_area:
+                continue
+
+            is_stale_time = (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC and not trk.ocr_pending
+            if is_stale_time:
                 continue
 
             if trk.last_bbox:
