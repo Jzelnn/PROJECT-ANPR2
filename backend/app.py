@@ -163,11 +163,8 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
 
     # 1. Tolak false-positive latar belakang/plafon/deretan motor parkir:
     #    - Lebar bbox melebihi 1.65x lebar ROI atau > 62% lebar frame
-    #    - Rasio lebar:tinggi terlalu pipih/melebar (aspect_wh > 1.85)
     #    - Posisi menggantung di plafon atas (y1 <= 10px dan bagian bawah y2 berada di paruh atas ROI)
     if bw > roi_w * 1.65 or (bw / float(max(1, img_w))) > 0.62:
-        return False, 0.0
-    if aspect_wh > 1.85:
         return False, 0.0
     if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.58):
         return False, 0.0
@@ -186,9 +183,8 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
         cy = (float(y1) + float(y2)) / 2.0
         center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
 
-        # Aktif HANYA jika titik tengah kendaraan berada di dalam ROI DAN minimal 55% bodi kendaraan berada di dalam ROI
-        # (atau minimal 70% bodi kendaraan berada di dalam ROI)
-        if (center_in and overlap_ratio >= 0.55) or overlap_ratio >= 0.70:
+        # Aktif responsif: jika titik tengah masuk ROI (overlap >= 20%) ATAU moncong mobil masuk (overlap >= 25%)
+        if (center_in and overlap_ratio >= 0.20) or overlap_ratio >= 0.25:
             return True, overlap_ratio
 
     return False, 0.0
