@@ -183,8 +183,8 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
         cy = (float(y1) + float(y2)) / 2.0
         center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
 
-        # Aktif responsif: jika titik tengah masuk ROI (overlap >= 20%) ATAU moncong mobil masuk (overlap >= 25%)
-        if (center_in and overlap_ratio >= 0.20) or overlap_ratio >= 0.25:
+        # Aktif di Frame 1: Bumper depan / moncong mobil baru menyentuh ROI (overlap >= 15%)
+        if overlap_ratio >= 0.15 or (center_in and overlap_ratio >= 0.10):
             return True, overlap_ratio
 
     return False, 0.0
@@ -988,8 +988,8 @@ def map_vehicle_class_name(cls_id, model=vehicle_model):
     return "car"
 
 
-def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.06, pad_y_ratio=0.05):
-    """Crop plat nomor dengan padding presisi agar membuang background bumper dan mempercepat OCR DBNet."""
+def crop_plate_with_padding(image, px1, py1, px2, py2, pad_x_ratio=0.0, pad_y_ratio=0.0):
+    """Crop plat nomor tanpa padding bumper luar agar karakter plat nomor bersih dari kontaminasi baut/bezel."""
     ih, iw = image.shape[:2]
     pw, ph = px2 - px1, py2 - py1
     pad_x = int(pw * pad_x_ratio)
@@ -1340,9 +1340,17 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     if h == 0 or w == 0:
         return "", 0.0, []
 
+    # Clean inner margin trim: memotong 7% margin atas/bawah dan 4% margin kiri/kanan
+    # untuk menghilangkan bezel hitam bumper dan baut plat yang merusak pembacaan karakter (misal BAJ terbaca BAE/8A3)
+    if h >= 26 and w >= 45:
+        clean_crop = plate_crop[int(h * 0.07):int(h * 0.93), int(w * 0.04):int(w * 0.96)]
+    else:
+        clean_crop = plate_crop
+
     target_h = 48
-    scale = target_h / float(h)
-    proc_crop = cv2.resize(plate_crop, (int(w * scale), target_h), interpolation=cv2.INTER_CUBIC if h < target_h else cv2.INTER_AREA)
+    ch, cw = clean_crop.shape[:2]
+    scale = target_h / float(ch)
+    proc_crop = cv2.resize(clean_crop, (int(cw * scale), target_h), interpolation=cv2.INTER_CUBIC if ch < target_h else cv2.INTER_AREA)
 
     items = paddle_engine.run(proc_crop)
 
@@ -1388,7 +1396,8 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
     is_realtime_stream = should_skip_fallbacks is not None
     should_try_multipass = allow_multipass and not has_valid_init and not has_strong_partial and not (should_skip_fallbacks and should_skip_fallbacks())
     if is_realtime_stream:
-        should_try_multipass = should_try_multipass and h >= 42 and has_meaningful_pass1
+        # Nonaktifkan multi-pass di real-time stream agar OCR responsif (< 800ms)
+        should_try_multipass = False
     else:
         should_try_multipass = should_try_multipass and h >= 22
 
@@ -3395,10 +3404,10 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     # Queue or prepare OCR job ONLY if NOT alignment_only and track is not locked
                     if not alignment_only and not track.is_locked and track.status not in ('CONFIRMED', 'HISTORY_SAVED'):
                         crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
-                        min_crop_w = 108 if full_img.shape[1] >= 1100 else (80 if full_img.shape[1] >= 800 else 36)
-                        min_crop_h = 58 if full_img.shape[1] >= 1100 else (43 if full_img.shape[1] >= 800 else 18)
-                        # Hanya jalankan OCR jika ukuran plat sudah cukup dekat & terbaca jelas
-                        # sehingga CPU tidak terbuang membaca plat buram saat mobil masih jauh
+                        min_crop_w = 44 if full_img.shape[1] >= 800 else 28
+                        min_crop_h = 16 if full_img.shape[1] >= 800 else 12
+                        # Mulai membaca OCR sejak Frame 1 saat bumper/plat baru masuk area ROI
+                        # agar ketika mobil sudah masuk penuh dan berhenti sejenak, hasil sudah siap
                         if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
                             crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                             if not track.ocr_pending:
@@ -4222,6 +4231,12 @@ class StreamInferenceWorker:
                 time.sleep(0.02)
                 continue
 
+            has_pending_ocr = False
+            with confirmation_manager.lock:
+                has_pending_ocr = any(getattr(t, 'ocr_pending', False) for t in confirmation_manager.tracks.values())
+            if has_pending_ocr:
+                time.sleep(0.04)
+
             t0 = time.time()
             try:
                 result = run_anpr(frame, is_stream=True, frame_id=frame_id, capture_timestamp=frame_capture_time)
@@ -4282,7 +4297,7 @@ class StreamInferenceWorker:
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
-                time.sleep(0.04)
+                time.sleep(0.06 if has_pending_ocr else 0.03)
             except Exception as e:
                 print(f"[STREAM INFERENCE ERROR]: {e}")
                 time.sleep(0.05)
