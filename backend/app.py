@@ -93,10 +93,10 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 384))           # 384 for fast CPU detection (< 150ms)
 VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 384))  # 384 for fast real-time stream vehicle detection (~160ms on CPU)
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.35))
-VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.25))
-MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.30))
-PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.20))
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
+VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.18))
+MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.25))
+PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.15))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
@@ -136,8 +136,8 @@ LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 2))
 # Plate detection refresh: do not queue duplicate/stale plate inference.
 # Re-run only when the cached plate is old enough or the previous attempt failed.
 PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.35))
-PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 192))
-PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.15))
+PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 256))
+PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.12))
 
 
 
@@ -3489,9 +3489,9 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and not alignment_only and (vw < 180 or vh < 180):
+            if not valid_crops and not alignment_only:
                 with plate_infer_lock:
-                    pdet_legacy = plate_model_legacy.predict(padded_crop, conf=PLATE_INFER_CONF, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                    pdet_legacy = plate_model_legacy.predict(padded_crop, conf=min(PLATE_INFER_CONF, 0.12), imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
                     cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                     abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
@@ -3509,6 +3509,38 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         y_factor = 2.4 if rel_y >= 0.50 else (1.2 if rel_y >= 0.35 else 0.6)
                         score = p_conf * y_factor
                         valid_crops.append((abs_box, p_conf, score))
+
+            # Fallback B: Contrast Enhancement (CLAHE) for dark/shadowed vehicles
+            if not valid_crops and not alignment_only and padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+                try:
+                    lab = cv2.cvtColor(padded_crop, cv2.COLOR_BGR2LAB)
+                    l_ch, a_ch, b_ch = cv2.split(lab)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                    l_enhanced = clahe.apply(l_ch)
+                    clahe_crop = cv2.cvtColor(cv2.merge([l_enhanced, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+                    with plate_infer_lock:
+                        pdet_clahe = plate_detector.predict(clahe_crop, conf=0.10, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                    for b in pdet_clahe.boxes:
+                        cls_id = int(b.cls[0])
+                        cname = plate_detector.names.get(cls_id, "")
+                        if cname not in ['plat-nomor', 'license_plate'] and len(plate_detector.names) > 1:
+                            continue
+                        cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
+                        abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
+                        if is_valid_plate_box(abs_box, iw, ih):
+                            p_conf = float(b.conf[0])
+                            rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                            rel_w = (cpx2 - cpx1) / float(vw)
+                            rel_h = (cpy2 - cpy1) / float(vh)
+                            if initial_vtype != "motorcycle" and rel_y < 0.28:
+                                continue
+                            if rel_w < 0.05 or rel_w > 0.65 or rel_h < 0.015 or rel_h > 0.28:
+                                continue
+                            y_factor = 2.4 if rel_y >= 0.50 else (1.2 if rel_y >= 0.35 else 0.6)
+                            score = p_conf * y_factor
+                            valid_crops.append((abs_box, p_conf, score))
+                except Exception:
+                    pass
 
         # 2. Fallback: Full Frame / ROI Plate Detection only if crop is very small
         need_full_fallback = (

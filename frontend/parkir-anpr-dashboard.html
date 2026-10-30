@@ -1560,13 +1560,12 @@ async function performDetectCycle(silent=true){
 }
 
 function handleDetectionResult(data, silent=false){
-  // Anti-Ghosting Guard: Reject stale detection results where capture is older than 650ms
-  // Ini mencegah kotak kendaraan yang sudah lewat digambar di atas video yang jalannya sudah kosong
+  // Anti-Ghosting Guard: Reject stale detection results where capture is older than 1500ms
+  // Ini mencegah frame usang menimpa posisi video tanpa menghapus kotak aktif secara mendadak.
   if (data.capture_timestamp != null && data.capture_timestamp > 0) {
     const ageMs = Date.now() - (data.capture_timestamp * 1000);
-    if (ageMs > 650) {
-      console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing to prevent ghost box.`);
-      clearBoxes();
+    if (ageMs > 1500) {
+      console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing.`);
       return;
     }
   }
@@ -2045,7 +2044,7 @@ function drawBoxes(detOrList){
       }
       if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
         const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
-        const isConfGood = (det.vehicle_confidence || 0) >= 0.35;
+        const isConfGood = (det.vehicle_confidence || 0) >= 0.22;
 
         if (isTrackActive && isConfGood) {
           let frameAgeSec = 0;
