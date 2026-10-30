@@ -261,7 +261,7 @@
     position:absolute;border:3px solid var(--blue);border-radius:4px;
     pointer-events:none;z-index:15;
     box-shadow: 0 0 8px rgba(47, 111, 237, 0.4);
-    transition: none;
+    transition: left 0.08s ease-out, top 0.08s ease-out, width 0.08s ease-out, height 0.08s ease-out;
     will-change: left, top, width, height;
   }
   .det-box.plate-box{border-color:#f2c94c;border-width:2.5px;box-shadow: 0 0 10px rgba(242, 201, 76, 0.45);}
@@ -505,7 +505,7 @@
           <span>Auto-Scan</span>
         </label>
         <label class="auto-scan-wrap" id="motionExtrapWrap" title="Compensate for AI inference delay using linear motion extrapolation">
-          <input type="checkbox" id="chkMotionExtrap" checked onchange="toggleMotionExtrapolation(this.checked)">
+          <input type="checkbox" id="chkMotionExtrap" onchange="toggleMotionExtrapolation(this.checked)">
           <span>Motion Sync</span>
         </label>
 
@@ -1345,7 +1345,7 @@ function startContinuousAutoDetect(){
 // MOTION EXTRAPOLATION FEATURE FLAG & CONTROLS
 // Compensates for AI inference roundtrip latency on moving vehicles
 // ============================================================
-let ENABLE_MOTION_EXTRAPOLATION = true;
+let ENABLE_MOTION_EXTRAPOLATION = false;
 
 function toggleMotionExtrapolation(enable){
   ENABLE_MOTION_EXTRAPOLATION = Boolean(enable);
@@ -1425,12 +1425,37 @@ function projectPlateBbox(vehicleBbox, relPlateBbox){
   if (rx1 < -0.25 || rx2 > 1.25 || rx1 >= rx2 || ry1 < -0.25 || ry2 > 1.25 || ry1 >= ry2){
     return null;
   }
+  const pwRatio = rx2 - rx1;
+  const phRatio = ry2 - ry1;
+  // Validasi proporsi fisik plat mobil normal (lebar 4%-65%, tinggi 1.5%-28% dari bodi)
+  if (pwRatio < 0.04 || pwRatio > 0.65 || phRatio < 0.015 || phRatio > 0.28) {
+    return null;
+  }
   const px1 = Math.round(vx1 + rx1 * vw);
   const py1 = Math.round(vy1 + ry1 * vh);
   const px2 = Math.round(vx1 + rx2 * vw);
   const py2 = Math.round(vy1 + ry2 * vh);
   if (px2 <= px1 || py2 <= py1) return null;
   return [px1, py1, px2, py2];
+}
+
+function isPlateInsideRoi(plateBox, refW, refH, roi){
+  if (!plateBox || !Array.isArray(plateBox) || plateBox.length !== 4) return false;
+  const cfg = roi || currentRoi;
+  if (!cfg) return true;
+  const [px1, py1, px2, py2] = plateBox;
+  const pcx = (px1 + px2) / 2.0;
+  const pcy = (py1 + py2) / 2.0;
+  const w = refW || 1920;
+  const h = refH || 1080;
+  const rx1 = (cfg.x_min != null ? cfg.x_min : 0.0) * w;
+  const ry1 = (cfg.y_min != null ? cfg.y_min : 0.0) * h;
+  const rx2 = (cfg.x_max != null ? cfg.x_max : 1.0) * w;
+  const ry2 = (cfg.y_max != null ? cfg.y_max : 1.0) * h;
+  if (pcy > ry2 || pcy < ry1 || pcx < rx1 || pcx > rx2) {
+    return false;
+  }
+  return true;
 }
 
 function stopContinuousAutoDetect(){
@@ -1466,7 +1491,7 @@ async function runContinuousDetectLoop(){
     if (!isScanning){
       await performDetectCycle(true);
     }
-    await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 60));
   }
 }
 
@@ -1482,9 +1507,9 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 600ms, release it to keep video stream fresh
-    if (nowMs - inFlightFrameTime > 600) {
-      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out, resetting backpressure.`);
+    // Watchdog: If frame in flight took > 2500ms, release it to prevent permanent deadlock
+    if (nowMs - inFlightFrameTime > 2500) {
+      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 2.5s, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
       return;
@@ -1535,6 +1560,17 @@ async function performDetectCycle(silent=true){
 }
 
 function handleDetectionResult(data, silent=false){
+  // Anti-Ghosting Guard: Reject stale detection results where capture is older than 650ms
+  // Ini mencegah kotak kendaraan yang sudah lewat digambar di atas video yang jalannya sudah kosong
+  if (data.capture_timestamp != null && data.capture_timestamp > 0) {
+    const ageMs = Date.now() - (data.capture_timestamp * 1000);
+    if (ageMs > 650) {
+      console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing to prevent ghost box.`);
+      clearBoxes();
+      return;
+    }
+  }
+
   // Check frame freshness / monotonic frame ordering to discard stale out-of-order results
   if (data.frame_id != null && data.frame_id > 0) {
     if (data.frame_id < latestRenderedFrameId) {
@@ -2000,7 +2036,13 @@ function drawBoxes(detOrList){
       let effVxBox = det.bbox;
       let effPlateBox = det.plate_bbox;
 
-      // Motion extrapolation per vehicle
+      // Pastikan rel_plate_bbox selalu diproyeksikan ke effVxBox bahkan saat kendaraan diam atau bergerak lambat
+      if ((!effPlateBox || !Array.isArray(effPlateBox) || effPlateBox.length !== 4) && effVxBox && det.rel_plate_bbox) {
+        effPlateBox = projectPlateBbox(effVxBox, det.rel_plate_bbox);
+      }
+      if (effPlateBox && !isPlateInsideRoi(effPlateBox, refW, refH, currentRoi)) {
+        effPlateBox = null;
+      }
       if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
         const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
         const isConfGood = (det.vehicle_confidence || 0) >= 0.35;
@@ -2014,10 +2056,10 @@ function drawBoxes(detOrList){
             frameAgeSec = det.frame_age_ms / 1000.0;
           }
 
-          const MAX_HORIZON_SEC = 0.70;
+          const MAX_HORIZON_SEC = 0.12;
           const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
 
-          if (horizon > 0.05 && det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
+          if (horizon > 0.03 && det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
             const [vx, vy] = det.velocity;
             if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
               let dx = vx * horizon;
@@ -2025,8 +2067,8 @@ function drawBoxes(detOrList){
               const [bx1, by1, bx2, by2] = det.bbox;
               const bw = bx2 - bx1;
               const bh = by2 - by1;
-              const maxDx = Math.min(refW * 0.12, bw * 0.75);
-              const maxDy = Math.min(refH * 0.12, bh * 0.75);
+              const maxDx = Math.min(refW * 0.04, bw * 0.15);
+              const maxDy = Math.min(refH * 0.04, bh * 0.15);
               dx = Math.max(-maxDx, Math.min(maxDx, dx));
               dy = Math.max(-maxDy, Math.min(maxDy, dy));
 
@@ -2047,6 +2089,9 @@ function drawBoxes(detOrList){
             }
           }
         }
+      }
+      if (effPlateBox && !isPlateInsideRoi(effPlateBox, refW, refH, currentRoi)) {
+        effPlateBox = null;
       }
 
       // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
@@ -2148,6 +2193,12 @@ function drawPlateBoxOnly(det){
   const natH = target.videoHeight || target.naturalHeight;
   if (!refW || !refH){ refW = natW || 1920; refH = natH || 1080; }
   if (!elemW || !elemH || !refW || !refH) return;
+
+  if (!isPlateInsideRoi(det.plate_bbox, refW, refH, currentRoi)) {
+    const existing = wrap.querySelector('#detBoxPlate');
+    if (existing) existing.remove();
+    return;
+  }
 
   const dispRatio = (refW && refH) ? (refW / refH) : ((natW && natH) ? (natW / natH) : (16 / 9));
   const elemRatio = elemW / elemH;
@@ -2550,57 +2601,74 @@ function addLogRow(det, isInit=false){
     return;
   }
 
-  // 2. Cek apakah baris teratas (paling baru) mewakili kendaraan/track aktif yang baru saja masuk (< 15 detik)
-  // JANGAN cari ke seluruh riwayat lama, karena ByteTrack me-reuse track_id untuk mobil baru di sesi berikutnya!
-  const topRow = logList.firstElementChild;
-  if (topRow && topRow.classList && topRow.classList.contains('log-row') && !isInit) {
-    const topTrack = topRow.getAttribute('data-track-id');
-    const topPlate = topRow.getAttribute('data-plate');
-    const topTime = parseInt(topRow.getAttribute('data-created-epoch') || '0', 10);
-    const nowEpoch = Math.floor(Date.now() / 1000);
+  // 2. Cek apakah record dengan plat yang sama, mirip (typo 1-2 huruf), atau track ID yang sama sudah tercatat dalam 30 detik terakhir
+  const cleanP = (str) => (str || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  const targetClean = cleanP(plateText);
+  const nowEpoch = Math.floor(Date.now() / 1000);
 
-    const isSameRecentTrack = (det.track_id && topTrack && String(topTrack) === String(det.track_id) && (nowEpoch - topTime < 15));
-    const isSameRecentPlate = (plateText && topPlate && topPlate === plateText && (nowEpoch - topTime < 15));
+  const isSimilarPlate = (c1, c2) => {
+    if (!c1 || !c2) return false;
+    if (c1 === c2) return true;
+    if (c1.length < 4 || c2.length < 4) return false;
+    if (Math.abs(c1.length - c2.length) > 2) return false;
+    let matches = 0;
+    const minL = Math.min(c1.length, c2.length);
+    const maxL = Math.max(c1.length, c2.length);
+    for (let i = 0; i < minL; i++) {
+      if (c1[i] === c2[i]) matches++;
+    }
+    return (matches / maxL) >= 0.70 || ((maxL - matches) <= 2 && Math.abs(c1.length - c2.length) <= 1);
+  };
+
+  const candidateRows = logList.querySelectorAll('.log-row');
+  for (const targetRow of candidateRows) {
+    if (isInit) break;
+    const rowTrack = targetRow.getAttribute('data-track-id');
+    const rowPlate = targetRow.getAttribute('data-plate');
+    const rowTime = parseInt(targetRow.getAttribute('data-created-epoch') || '0', 10);
+
+    const isSameRecentTrack = (det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 30));
+    const isSameRecentPlate = (targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean) && (nowEpoch - rowTime < 30));
 
     if (isSameRecentTrack || isSameRecentPlate) {
-      // Perbarui baris teratas jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
-      const plateEl = topRow.querySelector('.log-plate');
+      // Perbarui baris yang sudah ada jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
+      const plateEl = targetRow.querySelector('.log-plate');
       if (plateEl && (plateEl.textContent.includes('-') || !plateEl.textContent.includes(plateText))) {
         plateEl.innerHTML = `${trackPrefix}<span>${plateText}</span>${plateConfBadge}`;
-        topRow.setAttribute('data-plate', plateText);
+        targetRow.setAttribute('data-plate', plateText);
       }
-      const existingVehConf = topRow.getAttribute('data-veh-conf');
+      const existingVehConf = targetRow.getAttribute('data-veh-conf');
       if (det.id != null && det.vehicle_confidence != null) {
-        topRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+        targetRow.setAttribute('data-veh-conf', det.vehicle_confidence);
       } else if (!existingVehConf && det.vehicle_confidence != null) {
-        topRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+        targetRow.setAttribute('data-veh-conf', det.vehicle_confidence);
       }
-      const currentVehConfAttr = topRow.getAttribute('data-veh-conf');
+      const currentVehConfAttr = targetRow.getAttribute('data-veh-conf');
       const resolvedVehConf = currentVehConfAttr ? parseFloat(currentVehConfAttr) : ((vehConf != null) ? vehConf : null);
       const resolvedVehConfBadge = (resolvedVehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(resolvedVehConf)}">Veh ${formatPercent(resolvedVehConf)}</span>` : '';
 
-      const existingBs = topRow.getAttribute('data-body-style') || '';
+      const existingBs = targetRow.getAttribute('data-body-style') || '';
       const resolvedBs = (det.body_style && String(det.body_style).trim()) ? String(det.body_style).trim() : (existingBs || bodyOrType);
-      topRow.setAttribute('data-body-style', resolvedBs);
-      const typeEl = topRow.querySelector('.log-type');
+      targetRow.setAttribute('data-body-style', resolvedBs);
+      const typeEl = targetRow.querySelector('.log-type');
       if (typeEl) {
         typeEl.innerHTML = `
           <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}${resolvedVehConfBadge}</span>
           ${procDisplay}
         `;
       }
-      if (det.id) topRow.setAttribute('data-id', det.id);
-      topRow.style.cursor = 'pointer';
-      topRow.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
-      topRow.onclick = () => {
+      if (det.id) targetRow.setAttribute('data-id', det.id);
+      targetRow.style.cursor = 'pointer';
+      targetRow.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
+      targetRow.onclick = () => {
         selectHistoryRecord(det);
         const allRows = logList.querySelectorAll('.log-row');
         allRows.forEach(r => r.style.outline = 'none');
-        topRow.style.outline = '2px solid #2f6fed';
+        targetRow.style.outline = '2px solid #2f6fed';
       };
       if (det.snapshot_url) {
-        topRow.setAttribute('data-snapshot', det.snapshot_url);
-        topRow.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+        targetRow.setAttribute('data-snapshot', det.snapshot_url);
+        targetRow.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
       }
       return;
     }
@@ -2876,8 +2944,9 @@ function handleWsMessage(msg){
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
-    if (msg.frame_id != null && latestRenderedFrameId > 0 && msg.frame_id < latestRenderedFrameId){
-      console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < latestRendered=${latestRenderedFrameId}`);
+    // Guard terhadap frame yang terlampau usang (> 15 frame / ~1 detik di masa lalu) untuk track ini
+    if (msg.frame_id != null && latestRenderedFrameId > 0 && (latestRenderedFrameId - msg.frame_id) > 15){
+      console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} too far behind latestRendered=${latestRenderedFrameId}`);
       return;
     }
     if (msg.frame_id != null && lastDetectionData._last_plate_frame_id != null && msg.frame_id < lastDetectionData._last_plate_frame_id){
@@ -2898,7 +2967,13 @@ function handleWsMessage(msg){
       resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
     }
     if (resolvedPlateBox) {
-      lastDetectionData.plate_bbox = resolvedPlateBox;
+      const rw = lastDetectionData.image_width || 1920;
+      const rh = lastDetectionData.image_height || 1080;
+      if (isPlateInsideRoi(resolvedPlateBox, rw, rh, currentRoi)) {
+        lastDetectionData.plate_bbox = resolvedPlateBox;
+      } else {
+        lastDetectionData.plate_bbox = null;
+      }
     }
     lastDetectionData.plate_confidence = msg.plate_confidence;
     lastDetectionData.plate_detected = true;

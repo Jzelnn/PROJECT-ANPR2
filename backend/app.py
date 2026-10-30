@@ -102,7 +102,7 @@ FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of ev
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = False  # Keep false on CPU to prevent warnings
 if not HAS_CUDA:
-    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 2)))
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 4)))
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3
@@ -161,12 +161,12 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
     bh = max(1.0, float(y2 - y1))
     aspect_wh = bw / bh
 
-    # 1. Tolak false-positive latar belakang/plafon/deretan motor parkir:
-    #    - Lebar bbox melebihi 1.65x lebar ROI atau > 62% lebar frame
-    #    - Posisi menggantung di plafon atas (y1 <= 10px dan bagian bawah y2 berada di paruh atas ROI)
-    if bw > roi_w * 1.65 or (bw / float(max(1, img_w))) > 0.62:
+    # 1. Tolak false-positive latar belakang/plafon/artefak anomali:
+    #    - Posisi menggantung di plafon atas di luar paruh atas ROI
+    #    - Kotak artifak ekstrem yang mencakup hampir seluruh frame (> 95% lebar) dengan rasio lebar abnormal (> 2.8)
+    if (bw / float(max(1, img_w))) > 0.95 and aspect_wh > 2.8:
         return False, 0.0
-    if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.58):
+    if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.30):
         return False, 0.0
 
     # 2. Cek perpotongan bounding box dengan area deteksi
@@ -178,16 +178,52 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
     if ix2 > ix1 and iy2 > iy1:
         inter_area = (ix2 - ix1) * (iy2 - iy1)
         veh_area = bw * bh
-        overlap_ratio = inter_area / veh_area
+        roi_area = roi_w * roi_h
+        overlap_veh = inter_area / veh_area
+        overlap_roi = inter_area / roi_area
         cx = (float(x1) + float(x2)) / 2.0
         cy = (float(y1) + float(y2)) / 2.0
         center_in = (rx1 <= cx <= rx2) and (ry1 <= cy <= ry2)
 
-        # Aktif di Frame 1: Bumper depan / moncong mobil baru menyentuh ROI (overlap >= 15%)
-        if overlap_ratio >= 0.15 or (center_in and overlap_ratio >= 0.10):
-            return True, overlap_ratio
+        # Aktif di Frame 1: Bumper depan / moncong mobil mulai menyentuh area deteksi (ROI)
+        if overlap_veh >= 0.03 or overlap_roi >= 0.02 or center_in:
+            return True, max(overlap_veh, overlap_roi)
 
     return False, 0.0
+
+
+def is_plate_inside_roi(plate_bbox, img_w, img_h, roi=None):
+    """
+    Mengecek apakah posisi bounding box plat nomor berada di dalam AREA DETEKTOR (ROI).
+    Mengembalikan True jika plat berada di dalam area deteksi, False jika sudah keluar/lewat.
+    """
+    if not plate_bbox or len(plate_bbox) != 4:
+        return False
+    if roi is None:
+        roi = INTEREST_AREA
+
+    px1, py1, px2, py2 = plate_bbox
+    pcx = (px1 + px2) / 2.0
+    pcy = (py1 + py2) / 2.0
+
+    # 1. Cek polygon jika ROI didefinisikan sebagai polygon
+    if roi and "points" in roi and isinstance(roi["points"], list) and len(roi["points"]) >= 3:
+        pts = np.array([[float(p[0] * img_w), float(p[1] * img_h)] for p in roi["points"]], np.float32)
+        dist = cv2.pointPolygonTest(pts, (float(pcx), float(pcy)), False)
+        if dist < 0:
+            return False
+
+    # 2. Cek rectangle boundary
+    rx1 = roi.get("x_min", 0.0) * img_w
+    ry1 = roi.get("y_min", 0.0) * img_h
+    rx2 = roi.get("x_max", 1.0) * img_w
+    ry2 = roi.get("y_max", 1.0) * img_h
+
+    # Jika titik tengah plat melewati batas keluar (misal pcy > ry2 pada kamera gate) atau keluar kotak:
+    if pcy > ry2 or pcy < ry1 or pcx < rx1 or pcx > rx2:
+        return False
+
+    return True
 
 
 # ============================================================
@@ -335,6 +371,7 @@ def load_initial_history():
 
 LATEST_RECORDS = load_initial_history()
 LAST_RECORDED_PLATES = {}  # {safe_plate: {"time": float, "rec": dict}}
+LAST_RECORDED_TRACK_IDS = {}  # {track_id: {"time": float, "rec": dict}}
 GATE_COOLDOWN_SEC = 15.0
 
 
@@ -452,15 +489,34 @@ def draw_annotations_on_image(img, detections, interest_area=None):
     return annotated
 
 
+def _is_plate_similar(p1, p2):
+    """Mengecek apakah dua teks plat nomor identik atau sangat mirip (typo 1-2 huruf akibat OCR)."""
+    if not p1 or not p2:
+        return False
+    c1 = re.sub(r'[^A-Z0-9]', '', str(p1).upper())
+    c2 = re.sub(r'[^A-Z0-9]', '', str(p2).upper())
+    if c1 == c2:
+        return True
+    if len(c1) < 4 or len(c2) < 4:
+        return False
+    if abs(len(c1) - len(c2)) > 2:
+        return False
+    min_l = min(len(c1), len(c2))
+    max_l = max(len(c1), len(c2))
+    matches = sum(1 for i in range(min_l) if c1[i] == c2[i])
+    # Jika kecocokan >= 70% atau hanya berbeda 1-2 karakter
+    return (matches / float(max_l)) >= 0.70 or ((max_l - matches) <= 2 and abs(len(c1) - len(c2)) <= 1)
+
+
 def save_parking_record(det, source_img=None, source_img_path=None):
     """
     Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms).
     Persyaratan ketat Entry History:
     - Plat harus valid (format nomor polisi Indonesia atau militer)
     - Confidence plat minimal 80% (>= 0.80)
-    - Anti-Passback Gate Cooldown (15 detik) untuk mencegah duplikasi catatan.
+    - Anti-Passback Gate Cooldown (30 detik) dan Fuzzy Deduplication untuk mencegah duplikasi catatan.
     """
-    global LATEST_RECORDS, LAST_RECORDED_PLATES
+    global LATEST_RECORDS, LAST_RECORDED_PLATES, LAST_RECORDED_TRACK_IDS
 
     plate_text = det.get("license_plate")
     if not plate_text or plate_text in ["TIDAK_TERBACA", "UNKNOWN", ""]:
@@ -504,16 +560,32 @@ def save_parking_record(det, source_img=None, source_img_path=None):
         except Exception:
             pass
 
-    # Anti-Passback Gate Cooldown: Jika plat yang sama baru tercatat < 15 detik lalu, gunakan record yang ada
-    if safe_plate in LAST_RECORDED_PLATES:
-        last_entry = LAST_RECORDED_PLATES[safe_plate]
-        if (now_epoch - last_entry["time"]) < GATE_COOLDOWN_SEC:
-            existing_rec = last_entry["rec"]
+    # Anti-Duplicate Gate Cooldown per Track ID: Setiap track ID kendaraan hanya boleh dicatat 1x
+    if track_id is not None and track_id in LAST_RECORDED_TRACK_IDS:
+        last_track_entry = LAST_RECORDED_TRACK_IDS[track_id]
+        if (now_epoch - last_track_entry["time"]) < 30.0:
+            existing_rec = last_track_entry["rec"]
             if det.get("body_style") and not existing_rec.get("body_style"):
                 existing_rec["body_style"] = det.get("body_style")
                 existing_rec["body_style_confidence"] = det.get("body_style_confidence")
                 existing_rec["body_pending"] = False
             return existing_rec
+
+    # Anti-Passback Gate Cooldown + Fuzzy Similarity Deduplication (30 detik):
+    # Jika ada plat yang sama atau mirip (typo 1-2 huruf OCR) dalam 30 detik terakhir di gate ini, perbarui record lama
+    for prev_safe, prev_entry in list(LAST_RECORDED_PLATES.items()):
+        if (now_epoch - prev_entry["time"]) < 30.0:
+            if _is_plate_similar(safe_plate, prev_safe):
+                existing_rec = prev_entry["rec"]
+                if det.get("body_style") and not existing_rec.get("body_style"):
+                    existing_rec["body_style"] = det.get("body_style")
+                    existing_rec["body_style_confidence"] = det.get("body_style_confidence")
+                    existing_rec["body_pending"] = False
+                # Jika pembacaan baru memiliki confidence lebih tinggi, perbarui teks platnya
+                if plate_conf > (existing_rec.get("plate_confidence") or 0.0):
+                    existing_rec["license_plate"] = plate_text
+                    existing_rec["plate_confidence"] = round(float(plate_conf), 3)
+                return existing_rec
 
     snapshot_filename = f"{file_ts}_{safe_plate}.jpg"
     dest_path = os.path.join(CAPTURES_DIR, snapshot_filename)
@@ -614,6 +686,8 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     # Simpan langsung ke RAM (0 milidetik, tanpa overhead disk I/O)
     LATEST_RECORDS.appendleft(rec)
     LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": rec}
+    if track_id is not None:
+        LAST_RECORDED_TRACK_IDS[track_id] = {"time": now_epoch, "rec": rec}
     
     # Broadcast langsung ke WebSocket clients seketika
     ws_broadcaster.broadcast({
@@ -970,6 +1044,8 @@ def warmup_models():
         print(f"[WARN] Warmup error: {e}", flush=True)
 
 warmup_models()
+if not HAS_CUDA:
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 4)))
 
 print("[INFO] Semua model AI, PaddleOCR & Thread Pools siap digunakan!")
 
@@ -1725,7 +1801,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             "paddle_raw": paddle_raw,
             "paddle_conf": paddle_conf,
             "confidence": paddle_conf if final_formatted else 0.0,
-            "method": "fast_deadline_guarded"
+            "method": "fast_preempted_by_better_crop"
         }
 
     # 1b. Fallback Enhancement untuk plat bergerak / berbayang (HANYA untuk foto statis, lewati di video stream)
@@ -2069,7 +2145,7 @@ class VehicleTrack:
         self.confirmation_score = 0.0
         self.history_saved = False
         self.is_locked = False
-        self.last_bbox = None
+        self.last_bbox = list(initial_det.get("bbox")) if (initial_det and initial_det.get("bbox")) else None
         self.last_plate_bbox = None
         self.last_plate_vbbox = None
         self.last_plate_frame_id = None
@@ -2080,6 +2156,9 @@ class VehicleTrack:
         is_inside = initial_det.get("inside_interest_area", False) if initial_det else False
         self.inside_interest_area = is_inside
         self.ever_inside_roi = is_inside
+        self.ever_plate_inside_roi = False
+        self.img_w = initial_det.get("image_width", 1920) if initial_det else 1920
+        self.img_h = initial_det.get("image_height", 1080) if initial_det else 1080
         self.first_roi_time = self.created_at if is_inside else None
         self.frames_outside_after_inside = 0
         self.lost_interest = False
@@ -2565,15 +2644,16 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             style_weights[bs] = style_weights.get(bs, 0.0) + w
             total_style_weight += w
 
+        last_frame = self.frames[-1] if self.frames else {}
         if style_weights:
             best_style = max(style_weights, key=style_weights.get)
             consistency_score = style_weights[best_style] / max(1e-5, total_style_weight)
             style_confs = [f["body_conf"] for f in self.frames if f["body_style"] == best_style and f["body_conf"] > 0]
             avg_style_conf = float(np.mean(style_confs)) if style_confs else 0.85
         else:
-            best_style = self.cached_body_style or self.frames[-1]["body_style"]
+            best_style = self.cached_body_style or last_frame.get("body_style", "Mobil")
             consistency_score = 1.0
-            avg_style_conf = self.cached_body_conf or self.frames[-1]["body_conf"]
+            avg_style_conf = self.cached_body_conf or last_frame.get("body_conf", 0.85)
 
         # B. Voting Vehicle Type
         type_weights = {}
@@ -2583,14 +2663,16 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
                 continue
             w = max(0.1, f["v_conf"])
             type_weights[vt] = type_weights.get(vt, 0.0) + w
-        best_type = max(type_weights, key=type_weights.get) if type_weights else (self.cached_vtype or self.frames[-1]["vehicle_type"])
+        best_type = max(type_weights, key=type_weights.get) if type_weights else (self.cached_vtype or last_frame.get("vehicle_type", "Mobil"))
 
         # Frame terbaik untuk snapshot / bounding box (prioritaskan frame dengan plate_bbox valid)
         frames_with_plate = [f for f in self.frames if f.get("plate_bbox")]
         if frames_with_plate:
             best_f = max(frames_with_plate, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
-        else:
+        elif self.frames:
             best_f = max(self.frames, key=lambda f: (f["plate_conf"] if f["plate_conf"] else 0.0) + f["body_conf"])
+        else:
+            best_f = {}
 
         resolved_plate_bbox = best_f.get("plate_bbox") or self.last_plate_bbox
         resolved_vehicle_bbox = best_f.get("bbox") or self.last_bbox
@@ -2719,6 +2801,23 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         self.last_plate_bbox = list(abs_box) if abs_box else None
         self.last_plate_update_time = time.time()
         self.frames_since_plate_det = 0
+        if abs_box:
+            iw = getattr(self, 'img_w', 1920)
+            ih = getattr(self, 'img_h', 1080)
+            if is_plate_inside_roi(abs_box, iw, ih):
+                self.ever_plate_inside_roi = True
+            elif self.ever_plate_inside_roi:
+                # Plat sebelumnya pernah berada di dalam ROI, periksa apakah titik keluarnya valid
+                ry2 = INTEREST_AREA.get("y_max", 1.0) * ih
+                pcy = (abs_box[1] + abs_box[3]) / 2.0
+                if abs_box[1] >= ry2 or pcy >= ry2:
+                    self.inside_interest_area = False
+                    self.lost_interest = True
+                    self.lifecycle_state = "EXITING"
+                    if self.lost_interest_time is None:
+                        self.lost_interest_time = time.time()
+                    return False
+
         if abs_box and frame_id is not None:
             for f in reversed(self.frames):
                 if f.get("frame_id") == frame_id:
@@ -2737,9 +2836,9 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             return None
 
         # Validasi keaktifan plat:
-        # Jika plat tidak terdeteksi dalam 2 frame terakhir, jangan tampilkan box plat
-        # bahkan jika track sudah CONFIRMED/HISTORY_SAVED (box hanya untuk plat yang aktif terdeteksi di frame terkini).
-        if self.frames_since_plate_det > 2:
+        # Sinkronkan posisi plat selama kendaraan masih aktif di dalam ROI.
+        # Hindari flicker/hilang tiap frame akibat interval deteksi berkala (toleransi hingga 30 frame / ~1 detik).
+        if self.frames_since_plate_det > 30:
             return None
 
         # Batas pengaman: jika kendaraan sudah tidak terdeteksi > 2.0 detik (video pause / stop), jangan tampilkan
@@ -2755,19 +2854,71 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             if -0.25 <= rx1 < rx2 <= 1.25 and -0.25 <= ry1 < ry2 <= 1.25:
                 pw_ratio = rx2 - rx1
                 ph_ratio = ry2 - ry1
-                # Rasio dimensi fisik plat mobil normal (lebar 4%-85%, tinggi 2%-40% dari bodi)
-                if 0.04 <= pw_ratio <= 0.85 and 0.02 <= ph_ratio <= 0.40:
+                # Rasio dimensi fisik plat mobil normal (lebar 4%-65%, tinggi 1.5%-28% dari bodi)
+                if 0.04 <= pw_ratio <= 0.65 and 0.015 <= ph_ratio <= 0.28:
                     px1 = int(round(vx1 + rx1 * vw))
                     py1 = int(round(vy1 + ry1 * vh))
                     px2 = int(round(vx1 + rx2 * vw))
                     py2 = int(round(vy1 + ry2 * vh))
                     if px2 > px1 and py2 > py1:
+                        iw = getattr(self, 'img_w', 1920)
+                        ih = getattr(self, 'img_h', 1080)
+                        if not is_plate_inside_roi([px1, py1, px2, py2], iw, ih):
+                            return None
                         return [px1, py1, px2, py2]
 
         # Fallback last_plate_bbox HANYA digunakan jika cur_vbbox tidak ada dan data masih segar (<= 0.5 detik).
         if cur_vbbox is None and self.last_plate_bbox and self.last_plate_update_time > 0 and (now - self.last_plate_update_time) <= 0.5:
+            iw = getattr(self, 'img_w', 1920)
+            ih = getattr(self, 'img_h', 1080)
+            if not is_plate_inside_roi(self.last_plate_bbox, iw, ih):
+                return None
             return self.last_plate_bbox
         return None
+
+    def has_plate_exited_roi(self, cur_vbbox=None, img_w=None, img_h=None):
+        """
+        Mengecek apakah plat nomor kendaraan ini sudah keluar dari Area Deteksi (ROI).
+        Hanya berlaku jika kendaraan pernah memiliki plat di dalam ROI atau sudah terkonfirmasi.
+        """
+        is_confirmed = bool(self.is_locked or self.history_saved or self.status in ("CONFIRMED", "HISTORY_SAVED"))
+        if not (self.ever_plate_inside_roi or is_confirmed or self.rel_plate_bbox is not None):
+            return False
+
+        iw = img_w or getattr(self, 'img_w', 1920)
+        ih = img_h or getattr(self, 'img_h', 1080)
+
+        # Hitung posisi plat saat ini
+        p_box = None
+        if cur_vbbox and len(cur_vbbox) == 4 and self.rel_plate_bbox and len(self.rel_plate_bbox) == 4:
+            vx1, vy1, vx2, vy2 = cur_vbbox
+            vw = max(1.0, float(vx2 - vx1))
+            vh = max(1.0, float(vy2 - vy1))
+            rx1, ry1, rx2, ry2 = self.rel_plate_bbox
+            px1 = int(round(vx1 + rx1 * vw))
+            py1 = int(round(vy1 + ry1 * vh))
+            px2 = int(round(vx1 + rx2 * vw))
+            py2 = int(round(vy1 + ry2 * vh))
+            p_box = [px1, py1, px2, py2]
+        elif self.last_plate_bbox:
+            p_box = self.last_plate_bbox
+
+        # Plat dinyatakan keluar jika plat pernah berada di dalam ROI,
+        # dan sekarang posisi plat sudah keluar (p_box berada di bawah ry2 atau tidak lagi di dalam ROI):
+        if p_box and self.ever_plate_inside_roi:
+            pcy = (p_box[1] + p_box[3]) / 2.0
+            ry2 = INTEREST_AREA.get("y_max", 1.0) * ih
+            if p_box[1] >= ry2 or pcy >= ry2 or not is_plate_inside_roi(p_box, iw, ih):
+                return True
+
+        # Jika mobil sudah terkonfirmasi dan seluruh bodi kendaraan telah melewati garis keluar gate:
+        if is_confirmed and cur_vbbox and len(cur_vbbox) == 4:
+            ry2 = INTEREST_AREA.get("y_max", 1.0) * ih
+            vy1 = cur_vbbox[1]
+            if vy1 >= ry2:
+                return True
+
+        return False
 
 
 class VehicleConfirmationManager:
@@ -2791,14 +2942,12 @@ class VehicleConfirmationManager:
     def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080, frame_id=None):
         """Ambil atau buat track sebelum plate/OCR agar job asinkron tidak kehilangan target."""
         with self.lock:
-            if raw_tid is not None and raw_tid in self.tracks:
+            if raw_tid is not None:
                 tid = raw_tid
             else:
                 matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h, iou_thresh=0.20)
                 if matched_id is not None:
                     tid = matched_id
-                elif raw_tid is not None:
-                    tid = raw_tid
                 else:
                     tid = self.next_fallback_id
                     self.next_fallback_id += 1
@@ -2847,24 +2996,37 @@ class VehicleConfirmationManager:
 
         return newly_confirmed_tracks, newly_lost_tracks
 
-    def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.35):
+    def _match_track(self, bbox, curr_plate=None, img_w=1920, img_h=1080, iou_thresh=0.20):
         if not bbox:
             return None
         now = time.time()
 
         best_id = None
-        best_iou = -1.0
+        best_score = -1.0
+        bx1, by1, bx2, by2 = bbox
+        bcx = (bx1 + bx2) / 2.0
+        bcy = (by1 + by2) / 2.0
+        bw = max(1.0, float(bx2 - bx1))
+        bh = max(1.0, float(by2 - by1))
 
         for tid, trk in self.tracks.items():
-            # Cocokkan dengan track yang aktif dalam LOST_INTEREST_TIMEOUT_SEC detik terakhir dan TIDAK expired/discarded
+            # Cocokkan dengan seluruh track (termasuk yang exiting/lost_interest) agar mobil yang sama tidak melahirkan track baru
             is_stale_time = (now - trk.last_seen) > LOST_INTEREST_TIMEOUT_SEC and not trk.ocr_pending
-            if is_stale_time or trk.lost_interest or trk.lifecycle_state in ("LOST", "EXPIRED", "DISCARDED"):
+            if is_stale_time or trk.lifecycle_state in ("EXPIRED", "DISCARDED"):
                 continue
 
             if trk.last_bbox:
                 iou = compute_iou(bbox, trk.last_bbox)
-                if iou >= iou_thresh and iou > best_iou:
-                    best_iou = iou
+                tx1, ty1, tx2, ty2 = trk.last_bbox
+                tcx = (tx1 + tx2) / 2.0
+                tcy = (ty1 + ty2) / 2.0
+                dx = abs(bcx - tcx) / bw
+                dy = abs(bcy - tcy) / bh
+                
+                # Match via IoU >= thresh OR spatial proximity (center distance < 40% width and 30% height)
+                is_proximate = (dx < 0.40 and dy < 0.30)
+                if (iou >= iou_thresh or is_proximate) and (iou > best_score or (best_score <= 0 and is_proximate)):
+                    best_score = max(iou, 0.25)
                     best_id = tid
         return best_id
 
@@ -2883,7 +3045,7 @@ class VehicleConfirmationManager:
     def update(self, detections, is_stream=False):
         with self.lock:
             now = time.time()
-            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 1.5 and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST"))]
+            stale_ids = [tid for tid, trk in self.tracks.items() if (now - trk.last_seen) > 5.0 and (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST"))]
             for tid in stale_ids:
                 trk = self.tracks[tid]
                 trk.lifecycle_state = "EXPIRED"
@@ -3301,7 +3463,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
 
         if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
             with plate_infer_lock:
-                pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                pdet_crop = plate_detector.predict(padded_crop, conf=PLATE_INFER_CONF, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
             for b in pdet_crop.boxes:
                 cls_id = int(b.cls[0])
                 cname = plate_detector.names.get(cls_id, "")
@@ -3312,30 +3474,39 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 if is_valid_plate_box(abs_box, iw, ih):
                     p_conf = float(b.conf[0])
                     rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
+                    rel_w = (cpx2 - cpx1) / float(vw)
+                    rel_h = (cpy2 - cpy1) / float(vh)
                     # Filter out hood/windshield false positives for cars/trucks
-                    if initial_vtype != "motorcycle" and rel_y < 0.25:
+                    if initial_vtype != "motorcycle" and rel_y < 0.28:
                         continue
-                    if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
+                    # Geometric sanity check: Indonesian plate is 5%-65% of car width, 1.5%-28% of car height
+                    if rel_w < 0.05 or rel_w > 0.65 or rel_h < 0.015 or rel_h > 0.28:
                         continue
-                    # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.55): plat bumper mendapat bobot 2.4x
-                    y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
+                    if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.10:
+                        continue
+                    # Prioritas posisi bumper bawah kendaraan (rel_y >= 0.50): plat bumper mendapat bobot 2.4x
+                    y_factor = 2.4 if rel_y >= 0.50 else (1.2 if rel_y >= 0.35 else 0.6)
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
             if not valid_crops and not alignment_only and (vw < 180 or vh < 180):
                 with plate_infer_lock:
-                    pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
+                    pdet_legacy = plate_model_legacy.predict(padded_crop, conf=PLATE_INFER_CONF, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
                     cpx1, cpy1, cpx2, cpy2 = map(int, b.xyxy[0].tolist())
                     abs_box = [cx1 + cpx1, cy1 + cpy1, cx1 + cpx2, cy1 + cpy2]
                     if is_valid_plate_box(abs_box, iw, ih):
                         p_conf = float(b.conf[0])
                         rel_y = (cy1 + (cpy1 + cpy2) / 2.0 - vy1) / float(vh)
-                        if initial_vtype != "motorcycle" and rel_y < 0.25:
+                        rel_w = (cpx2 - cpx1) / float(vw)
+                        rel_h = (cpy2 - cpy1) / float(vh)
+                        if initial_vtype != "motorcycle" and rel_y < 0.28:
                             continue
-                        if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.08:
+                        if rel_w < 0.05 or rel_w > 0.65 or rel_h < 0.015 or rel_h > 0.28:
                             continue
-                        y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
+                        if alignment_only and anchor_cy is not None and abs(rel_y - anchor_cy) > 0.10:
+                            continue
+                        y_factor = 2.4 if rel_y >= 0.50 else (1.2 if rel_y >= 0.35 else 0.6)
                         score = p_conf * y_factor
                         valid_crops.append((abs_box, p_conf, score))
 
@@ -3404,8 +3575,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     # Queue or prepare OCR job ONLY if NOT alignment_only and track is not locked
                     if not alignment_only and not track.is_locked and track.status not in ('CONFIRMED', 'HISTORY_SAVED'):
                         crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
-                        min_crop_w = 44 if full_img.shape[1] >= 800 else 28
-                        min_crop_h = 16 if full_img.shape[1] >= 800 else 12
+                        min_crop_w = 64 if full_img.shape[1] >= 800 else 40
+                        min_crop_h = 24 if full_img.shape[1] >= 800 else 16
                         # Mulai membaca OCR sejak Frame 1 saat bumper/plat baru masuk area ROI
                         # agar ketika mobil sudah masuk penuh dan berhenti sejenak, hasil sudah siap
                         if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
@@ -3785,6 +3956,26 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 trk_out.inside_interest_area = False
                                 trk_out.frames_outside_after_inside += 1
                     continue
+
+                # Cek apakah plat kendaraan sudah keluar dari area deteksi (ROI):
+                t_id = c.get("track_id")
+                if t_id is None:
+                    t_id = confirmation_manager._match_track([c["x1"], c["y1"], c["x2"], c["y2"]], img_w=iw, img_h=ih)
+
+                if t_id is not None:
+                    with confirmation_manager.lock:
+                        trk_check = confirmation_manager.tracks.get(t_id)
+                        if trk_check and (trk_check.lost_interest or trk_check.has_plate_exited_roi([c["x1"], c["y1"], c["x2"], c["y2"]], img_w=iw, img_h=ih)):
+                            trk_check.inside_interest_area = False
+                            trk_check.lost_interest = True
+                            trk_check.lifecycle_state = "EXITING"
+                            trk_check.last_bbox = [c["x1"], c["y1"], c["x2"], c["y2"]]
+                            trk_check.last_seen = time.time()
+                            if trk_check.lost_interest_time is None:
+                                trk_check.lost_interest_time = time.time()
+                            print(f"[PLATE_EXITED_ROI] track_id={t_id} frame_id={frame_id} plate={trk_check.best_candidate_display} -> dismissed immediately to focus on trailing vehicle", flush=True)
+                            continue
+
                 c["_inside_roi"] = True
                 c["_roi_overlap"] = overlap
                 s = get_front_of_camera_score(c, global_plates, iw, ih, is_in_roi=True)
@@ -4234,8 +4425,6 @@ class StreamInferenceWorker:
             has_pending_ocr = False
             with confirmation_manager.lock:
                 has_pending_ocr = any(getattr(t, 'ocr_pending', False) for t in confirmation_manager.tracks.values())
-            if has_pending_ocr:
-                time.sleep(0.04)
 
             t0 = time.time()
             try:
@@ -4297,7 +4486,7 @@ class StreamInferenceWorker:
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
                 print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
                 print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
-                time.sleep(0.06 if has_pending_ocr else 0.03)
+                time.sleep(0.05 if has_pending_ocr else 0.01)
             except Exception as e:
                 print(f"[STREAM INFERENCE ERROR]: {e}")
                 time.sleep(0.05)
@@ -4352,6 +4541,23 @@ def live_ws(ws):
                                 break
                         client_frame_id = msg.get("frame_id")
                         client_capture_ts = msg.get("capture_timestamp")
+                        
+                        # Anti-Lag Guard: Jika frame sudah tertahan di antrean socket > 500ms, buang agar latency tidak membengkak
+                        now_recv = time.time()
+                        frame_wait_sec = (now_recv - client_capture_ts) if (client_capture_ts and client_capture_ts > 0) else 0.0
+                        if frame_wait_sec > 0.50:
+                            ws_broadcaster.send(ws, {
+                                "type": "detection_update",
+                                "frame_id": client_frame_id,
+                                "capture_timestamp": client_capture_ts,
+                                "frame_age_ms": int(frame_wait_sec * 1000),
+                                "latency_ms": 0,
+                                "processing_ms": 0,
+                                "detections": [],
+                                "interest_area": INTEREST_AREA
+                            })
+                            continue
+
                         b64_img = msg.get("image", "")
                         if "," in b64_img:
                             b64_img = b64_img.split(",", 1)[1]
