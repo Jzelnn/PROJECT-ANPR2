@@ -261,7 +261,8 @@
     position:absolute;border:3px solid var(--blue);border-radius:4px;
     pointer-events:none;z-index:15;
     box-shadow: 0 0 8px rgba(47, 111, 237, 0.4);
-    transition: none;
+    transition: left 0.08s ease-out, top 0.08s ease-out, width 0.08s ease-out, height 0.08s ease-out;
+    will-change: left, top, width, height;
   }
   .det-box.plate-box{border-color:#f2c94c;border-width:2.5px;box-shadow: 0 0 10px rgba(242, 201, 76, 0.45);}
   .det-box.outside-roi{
@@ -504,7 +505,7 @@
           <span>Auto-Scan</span>
         </label>
         <label class="auto-scan-wrap" id="motionExtrapWrap" title="Compensate for AI inference delay using linear motion extrapolation">
-          <input type="checkbox" id="chkMotionExtrap" checked onchange="toggleMotionExtrapolation(this.checked)">
+          <input type="checkbox" id="chkMotionExtrap" onchange="toggleMotionExtrapolation(this.checked)">
           <span>Motion Sync</span>
         </label>
 
@@ -1326,10 +1327,7 @@ function updateFrameAgeIndicator(frameAgeMs){
 }
 
 function clearBoxes(){
-  const target = document.getElementById('liveVideo') || document.getElementById('liveStreamImg') || document.getElementById('feedImg');
-  if (target && target.parentElement){
-    target.parentElement.querySelectorAll('.det-box').forEach(b => b.remove());
-  }
+  document.querySelectorAll('.det-box').forEach(b => b.remove());
 }
 
 // ============================================================
@@ -1347,14 +1345,67 @@ function startContinuousAutoDetect(){
 // MOTION EXTRAPOLATION FEATURE FLAG & CONTROLS
 // Compensates for AI inference roundtrip latency on moving vehicles
 // ============================================================
-let ENABLE_MOTION_EXTRAPOLATION = true;
+let ENABLE_MOTION_EXTRAPOLATION = false;
 
 function toggleMotionExtrapolation(enable){
   ENABLE_MOTION_EXTRAPOLATION = Boolean(enable);
   const chk = document.getElementById('chkMotionExtrap');
   if (chk) chk.checked = ENABLE_MOTION_EXTRAPOLATION;
-  if (lastDetectionData) drawBoxes(lastDetectionData);
+  if (lastDetectionData && lastDetectionData.inside_interest_area && !lastDetectionData.lost_interest) {
+    drawBoxes(lastDetectionData);
+  }
   showToast(`Motion Sync: ${ENABLE_MOTION_EXTRAPOLATION ? 'ON' : 'OFF'}`);
+}
+
+function formatPercent(val){
+  if (val == null || val === '' || isNaN(val)) return '-';
+  const num = parseFloat(val);
+  const pct = num <= 1.0 ? num * 100 : num;
+  return pct.toFixed(1) + '%';
+}
+
+function formatVehicleBoxLabel(det){
+  if (!det) return 'VEHICLE';
+  const vTypeRaw = String(det.vehicle_type || '').trim();
+  const bStyleRaw = String(det.body_style || '').trim();
+  const vName = (vTypeRaw ? vTypeRaw : 'VEHICLE').toUpperCase();
+  const hasBody = Boolean(bStyleRaw && !['UNKNOWN', 'NONE', 'NULL', 'UNDEFINED', '-'].includes(bStyleRaw.toUpperCase()));
+
+  const vConf = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0)
+    ? formatPercent(det.vehicle_confidence)
+    : '';
+  const vPctStr = vConf ? ` ${vConf}` : '';
+
+  if (hasBody) {
+    const bName = bStyleRaw.toUpperCase();
+    const bConf = (det.body_style_confidence != null && !isNaN(det.body_style_confidence) && det.body_style_confidence > 0)
+      ? formatPercent(det.body_style_confidence)
+      : '';
+    const bText = bConf ? `${bName} ${bConf}` : bName;
+
+    if (bName.toLowerCase() !== vName.toLowerCase()) {
+      return `${vName}${vPctStr} | ${bText}`;
+    } else {
+      return (bText === bName && vPctStr) ? `${bText}${vPctStr}` : bText;
+    }
+  } else {
+    return `${vName}${vPctStr}`;
+  }
+}
+
+function formatPlateBoxLabel(det){
+  if (!det) return 'PLATE DETECTED';
+  const plate = String(det.ocr_text || det.license_plate || '').trim();
+  const hasValidPlate = Boolean(plate && !['UNKNOWN', 'TIDAK_TERBACA', 'NONE', 'NULL', '-', ''].includes(plate.toUpperCase()));
+  const rawOcrConf = det.ocr_confidence != null ? det.ocr_confidence : det.plate_confidence;
+
+  if (hasValidPlate) {
+    if (rawOcrConf != null && !isNaN(rawOcrConf) && Number(rawOcrConf) > 0) {
+      return `${plate} | OCR ${formatPercent(rawOcrConf)}`;
+    }
+    return plate;
+  }
+  return plate || 'PLATE DETECTED';
 }
 
 function isBackendAnnotatedVisible(){
@@ -1374,12 +1425,37 @@ function projectPlateBbox(vehicleBbox, relPlateBbox){
   if (rx1 < -0.25 || rx2 > 1.25 || rx1 >= rx2 || ry1 < -0.25 || ry2 > 1.25 || ry1 >= ry2){
     return null;
   }
+  const pwRatio = rx2 - rx1;
+  const phRatio = ry2 - ry1;
+  // Validasi proporsi fisik plat mobil normal (lebar 4%-65%, tinggi 1.5%-28% dari bodi)
+  if (pwRatio < 0.04 || pwRatio > 0.65 || phRatio < 0.015 || phRatio > 0.28) {
+    return null;
+  }
   const px1 = Math.round(vx1 + rx1 * vw);
   const py1 = Math.round(vy1 + ry1 * vh);
   const px2 = Math.round(vx1 + rx2 * vw);
   const py2 = Math.round(vy1 + ry2 * vh);
   if (px2 <= px1 || py2 <= py1) return null;
   return [px1, py1, px2, py2];
+}
+
+function isPlateInsideRoi(plateBox, refW, refH, roi){
+  if (!plateBox || !Array.isArray(plateBox) || plateBox.length !== 4) return false;
+  const cfg = roi || currentRoi;
+  if (!cfg) return true;
+  const [px1, py1, px2, py2] = plateBox;
+  const pcx = (px1 + px2) / 2.0;
+  const pcy = (py1 + py2) / 2.0;
+  const w = refW || 1920;
+  const h = refH || 1080;
+  const rx1 = (cfg.x_min != null ? cfg.x_min : 0.0) * w;
+  const ry1 = (cfg.y_min != null ? cfg.y_min : 0.0) * h;
+  const rx2 = (cfg.x_max != null ? cfg.x_max : 1.0) * w;
+  const ry2 = (cfg.y_max != null ? cfg.y_max : 1.0) * h;
+  if (pcy > ry2 || pcy < ry1 || pcx < rx1 || pcx > rx2) {
+    return false;
+  }
+  return true;
 }
 
 function stopContinuousAutoDetect(){
@@ -1415,7 +1491,7 @@ async function runContinuousDetectLoop(){
     if (!isScanning){
       await performDetectCycle(true);
     }
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, 85));
   }
 }
 
@@ -1431,9 +1507,9 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 1500ms, release it
-    if (nowMs - inFlightFrameTime > 1500) {
-      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out, resetting backpressure.`);
+    // Watchdog: If frame in flight took > 1800ms, release it to prevent permanent deadlock
+    if (nowMs - inFlightFrameTime > 1800) {
+      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 1.8s, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
       return;
@@ -1449,8 +1525,8 @@ async function performDetectCycle(silent=true){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
-        // Cap resolusi maksimum ke 1280px agar detail karakter plat (seperti M vs H/N) tetap sangat tajam sementara YOLO berjalan di imgsz=320
-        const maxDim = 1280;
+        // Cap resolusi ke 640px untuk latensi encode ultra-cepat (~3ms) dan payload ringan tanpa lag
+        const maxDim = 640;
         let scale = 1.0;
         if (video.videoWidth > maxDim) {
           scale = maxDim / video.videoWidth;
@@ -1465,7 +1541,7 @@ async function performDetectCycle(silent=true){
           const clientCaptureTs = Date.now() / 1000.0;
           inFlightFrameId = clientFrameCounter;
           inFlightFrameTime = Date.now();
-          const b64 = canvas.toDataURL('image/jpeg', 0.75);
+          const b64 = canvas.toDataURL('image/jpeg', 0.65);
           liveWs.send(JSON.stringify({
             type: "detect_frame",
             frame_id: clientFrameCounter,
@@ -1484,20 +1560,64 @@ async function performDetectCycle(silent=true){
 }
 
 function handleDetectionResult(data, silent=false){
+  // Anti-Ghosting Guard: Lewati penggambaran kotak jika frame sudah lebih tua dari 800ms
+  // Jika frame tidak memiliki deteksi, bersihkan kotak segera untuk mencegah ghost box!
+  let skipOverlayDrawing = false;
+  if (data.capture_timestamp != null && data.capture_timestamp > 0) {
+    const ageMs = Date.now() - (data.capture_timestamp * 1000);
+    if (ageMs > 800) {
+      skipOverlayDrawing = true;
+      if (!data.detections || data.detections.length === 0) {
+        console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing to prevent ghost box.`);
+        clearBoxes();
+        return;
+      }
+    }
+  }
+
+  // Filter deteksi aktif yang berada di dalam area deteksi (ROI)
+  const activeDetections = (data.detections || []).filter(d => 
+    d && d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI'
+  );
+
+  // Bersihkan log: HANYA log ke console jika ada kendaraan di dalam area deteksi (ROI)
+  if (activeDetections.length > 0) {
+    const primaryDet = activeDetections.find(d => d.status === 'ANALYZING') || activeDetections[0];
+    const plateText = (primaryDet && primaryDet.license_plate) ? primaryDet.license_plate : '-';
+    const ocrConf = (primaryDet && primaryDet.ocr_confidence != null) ? `${(primaryDet.ocr_confidence * 100).toFixed(1)}%` : '-';
+    const vehType = (primaryDet && primaryDet.vehicle_type) ? primaryDet.vehicle_type : '-';
+    const vehConf = (primaryDet && primaryDet.vehicle_confidence != null) ? `${(primaryDet.vehicle_confidence * 100).toFixed(1)}%` : '-';
+    const yoloTime = (data.perf_breakdown && data.perf_breakdown.yolo_ms != null) ? `${data.perf_breakdown.yolo_ms}ms` : '-';
+    const ocrTime = (data.perf_breakdown && data.perf_breakdown.ocr_ms != null) ? `${data.perf_breakdown.ocr_ms}ms` : '-';
+    const backendProcMs = data.processing_ms != null ? `${data.processing_ms}ms` : (data.detection_time_sec != null ? `${Math.round(data.detection_time_sec * 1000)}ms` : '-');
+    const frameAgeStr = (data.capture_timestamp != null && data.capture_timestamp > 0)
+      ? `${Math.round(Date.now() - (data.capture_timestamp * 1000))}ms`
+      : (data.frame_age_ms != null ? `${data.frame_age_ms}ms` : '-');
+
+    console.log(`[ANPR_LIVE] Frame #${data.frame_id ?? '-'} | Plat: ${plateText} (${ocrConf}) | Kendaraan: ${vehType} (${vehConf}) | YOLO: ${yoloTime} | OCR: ${ocrTime} | Total BE: ${backendProcMs} | Age: ${frameAgeStr}`);
+  }
+
   // Check frame freshness / monotonic frame ordering to discard stale out-of-order results
   if (data.frame_id != null && data.frame_id > 0) {
     if (data.frame_id < latestRenderedFrameId) {
-      // Discard stale result that arrived after a newer frame was already processed
-      console.warn(`[STALE_FRAME_DISCARDED] frame_id=${data.frame_id} latest=${latestRenderedFrameId}`);
-      return;
+      if (activeDetections.length === 0) {
+        console.warn(`[STALE_FRAME_DISCARDED] frame_id=${data.frame_id} latest=${latestRenderedFrameId}`);
+        return;
+      }
+      skipOverlayDrawing = true;
+    } else {
+      latestRenderedFrameId = data.frame_id;
     }
-    latestRenderedFrameId = data.frame_id;
   }
   if (data.capture_timestamp != null && data.capture_timestamp > 0) {
     if (data.capture_timestamp < latestRenderedCaptureTime) {
-      return;
+      if (activeDetections.length === 0) {
+        return;
+      }
+      skipOverlayDrawing = true;
+    } else {
+      latestRenderedCaptureTime = data.capture_timestamp;
     }
-    latestRenderedCaptureTime = data.capture_timestamp;
   }
 
   // Update Frame Age UI indicator if available
@@ -1528,10 +1648,10 @@ function handleDetectionResult(data, silent=false){
   }
 
   let activeDet = null;
-  if (data.detections && data.detections.length > 0){
+  if (activeDetections.length > 0){
     // Prioritaskan kendaraan yang sedang di-ANALYZING (mobil antre baru di ROI), baru mobil yang sudah CONFIRMED
-    const unconfirmed = data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status === 'ANALYZING');
-    activeDet = unconfirmed || data.detections.find(d => d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI');
+    const unconfirmed = activeDetections.find(d => d.status === 'ANALYZING');
+    activeDet = unconfirmed || activeDetections[0];
   }
 
   if (activeDet){
@@ -1539,25 +1659,19 @@ function handleDetectionResult(data, silent=false){
     activeDet.latency_ms = detMs;
     activeDet.frame_id = data.frame_id;
     activeDet._hasBakedPlateBox = Boolean(usingBackendAnnotatedImage && activeDet.plate_bbox);
-    // Primary track switch: clean old boxes immediately if tracking a new vehicle
+    // Primary track switch:
     if (lastActiveTrackId !== null && lastActiveTrackId !== activeDet.track_id) {
       console.log(`[PRIMARY_SWITCH] previous_track_id=${lastActiveTrackId} new_track_id=${activeDet.track_id}`);
-      clearBoxes();
-      lastDetectionData = null; // Reset total data mobil sebelumnya agar tidak bocor ke mobil baru
+      const prevStillPresent = activeDetections.some(d => d.track_id === lastActiveTrackId);
+      if (!prevStillPresent) {
+        lastDetectionData = null; // Reset data mobil sebelumnya yang sudah pergi
+      }
     } else if (lastActiveTrackId === activeDet.track_id && lastDetectionData) {
       // Retain relative plate & OCR knowledge across fast detection frames for the SAME track
       activeDet._last_plate_frame_id = lastDetectionData._last_plate_frame_id;
       activeDet._last_ocr_frame_id = lastDetectionData._last_ocr_frame_id;
       if (!activeDet.rel_plate_bbox && lastDetectionData.rel_plate_bbox) {
         activeDet.rel_plate_bbox = lastDetectionData.rel_plate_bbox;
-      }
-      if (!activeDet.plate_bbox && activeDet.rel_plate_bbox && activeDet.bbox) {
-        const projected = projectPlateBbox(activeDet.bbox, activeDet.rel_plate_bbox);
-        if (projected) {
-          activeDet.plate_bbox = projected;
-          activeDet.plate_confidence = lastDetectionData.plate_confidence;
-          activeDet.plate_detected = lastDetectionData.plate_detected;
-        }
       }
       const hasNewerOcrState = Boolean(
         lastDetectionData.license_plate && (
@@ -1582,6 +1696,9 @@ function handleDetectionResult(data, silent=false){
         activeDet.body_style = lastDetectionData.body_style;
         activeDet.body_style_confidence = lastDetectionData.body_style_confidence;
       }
+      if (activeDet.vehicle_confidence == null && lastDetectionData.vehicle_confidence != null) {
+        activeDet.vehicle_confidence = lastDetectionData.vehicle_confidence;
+      }
       // Retain locked confirmed status across fast detection frames for the SAME track
       const isPrevConfirmed = (
         lastDetectionData.status === 'CONFIRMED' ||
@@ -1598,17 +1715,46 @@ function handleDetectionResult(data, silent=false){
           activeDet.ocr_text = lastDetectionData.ocr_text || lastDetectionData.license_plate;
           activeDet.ocr_confidence = lastDetectionData.ocr_confidence;
         }
+        if (lastDetectionData.record_id) {
+          activeDet.record_id = lastDetectionData.record_id;
+        }
+      }
+
+      // If track is confirmed, enforce authoritative confirmed vehicle confidence consistently across all UI components!
+      const isTrackConfirmed = (
+        activeDet.status === 'CONFIRMED' ||
+        activeDet.status === 'HISTORY_SAVED' ||
+        activeDet.confirmation_status === 'CONFIRMED' ||
+        activeDet.confirmation_status === 'HISTORY_SAVED' ||
+        isPrevConfirmed
+      );
+      if (isTrackConfirmed) {
+        const confVeh = activeDet.confirmed_vehicle_confidence != null
+          ? activeDet.confirmed_vehicle_confidence
+          : (lastDetectionData.confirmed_vehicle_confidence != null ? lastDetectionData.confirmed_vehicle_confidence : lastDetectionData.vehicle_confidence);
+        if (confVeh != null) {
+          activeDet.vehicle_confidence = confVeh;
+          activeDet.confirmed_vehicle_confidence = confVeh;
+        }
       }
     }
     lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
-    if (usingBackendAnnotatedImage) {
-      clearBoxes();
-      if (!activeDet._hasBakedPlateBox && activeDet.plate_bbox) {
-        drawPlateBoxOnly(activeDet);
+    if (!skipOverlayDrawing) {
+      if (usingBackendAnnotatedImage) {
+        clearBoxes();
+        if (!activeDet._hasBakedPlateBox && activeDet.plate_bbox) {
+          drawPlateBoxOnly(activeDet);
+        }
+      } else {
+        drawBoxes(activeDetections);
       }
     } else {
-      drawBoxes(activeDet);
+      // Frame kedaluwarsa/stale: bersihkan kotak agar tidak terjadi ghost box
+      clearBoxes();
+      if (!usingBackendAnnotatedImage) {
+        drawRoiBox(currentRoi);
+      }
     }
     updateResultCard(activeDet, detMs);
 
@@ -1629,32 +1775,22 @@ function handleDetectionResult(data, silent=false){
     }
   } else {
     consecutiveEmptyCycles++;
-    // 2-frame persistence buffer: allow up to 2 momentary missed frames without flickering boxes off
-    const hasActiveBufferedTrack = (consecutiveEmptyCycles <= 2 && lastActiveTrackId !== null && lastDetectionData !== null);
-
-    if (hasActiveBufferedTrack) {
-      // Keep displaying the last known bounding boxes on screen to avoid 1-frame visual flash/disappearance.
-      // Do NOT trigger any OCR call, do NOT add Entry History rows, do NOT increase confidence.
-      if (!usingBackendAnnotatedImage) {
-        drawBoxes(lastDetectionData);
-      }
-    } else {
-      // Exceeded persistence buffer (vehicle genuinely left ROI) or no prior track: clear immediately
-      if (lastActiveTrackId !== null) {
-        console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId} after ${consecutiveEmptyCycles} empty cycles`);
-      }
-      lastActiveTrackId = null;
-      clearBoxes();
-      if (!usingBackendAnnotatedImage) {
-        drawRoiBox(currentRoi);
-      }
+    if (lastActiveTrackId !== null) {
+      console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
+    }
+    lastActiveTrackId = null;
+    clearBoxes();
+    if (!usingBackendAnnotatedImage) {
+      drawRoiBox(currentRoi);
+    }
+    if (consecutiveEmptyCycles >= 2) {
       lastDetectionData = null;
       updateResultCard(null, 0);
       updateTelemetry(null);
-      if (!silent){
-        const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
-        showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
-      }
+    }
+    if (!silent){
+      const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
+      showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
     }
   }
 }
@@ -1867,15 +2003,19 @@ function drawRoiBox(roi){
 // ============================================================
 // DRAW BOUNDING BOXES WITH PRECISE LETTERBOXING
 // ============================================================
-function drawBoxes(det){
-  if (!det || det.inside_interest_area === false || det.status === 'OUTSIDE_ROI' || det.lost_interest){
+function drawBoxes(detOrList){
+  const rawList = Array.isArray(detOrList) ? detOrList : (detOrList ? [detOrList] : []);
+  const detList = rawList.filter(d => d && d.inside_interest_area !== false && d.status !== 'OUTSIDE_ROI' && !d.lost_interest);
+
+  if (detList.length === 0){
     clearBoxes();
     return;
   }
   if (isBackendAnnotatedVisible()){
     clearBoxes();
-    if (!det._hasBakedPlateBox && det.plate_bbox){
-      drawPlateBoxOnly(det);
+    const primary = detList[0];
+    if (primary && !primary._hasBakedPlateBox && primary.plate_bbox){
+      drawPlateBoxOnly(primary);
     }
     return;
   }
@@ -1889,26 +2029,23 @@ function drawBoxes(det){
     const elemW = target.clientWidth;
     const elemH = target.clientHeight;
 
-    // Resolusi asli frame saat diproses oleh AI (misal 1280x674 atau 1920x1080)
-    let refW = (det && det.image_width) || (lastDetectionData && lastDetectionData.image_width);
-    let refH = (det && det.image_height) || (lastDetectionData && lastDetectionData.image_height);
+    const primary = detList[0];
+    let refW = (primary && primary.image_width) || (lastDetectionData && lastDetectionData.image_width);
+    let refH = (primary && primary.image_height) || (lastDetectionData && lastDetectionData.image_height);
 
     const natW = target.videoWidth || target.naturalWidth;
     const natH = target.videoHeight || target.naturalHeight;
 
-    // Jika resolusi dari backend belum tersedia, fallback ke naturalWidth / videoWidth
     if (!refW || !refH){
       refW = natW;
       refH = natH;
     }
 
-    // Jika elemen belum selesai di-render browser atau ukuran asli belum siap
     if (!elemW || !elemH || !refW || !refH){
       setTimeout(place, 40);
       return;
     }
 
-    // Aspek rasio tampilan sebenarnya dari gambar/video di browser
     const dispRatio = (refW && refH) ? (refW / refH) : ((natW && natH) ? (natW / natH) : (16 / 9));
     const elemRatio = elemW / elemH;
 
@@ -1925,162 +2062,149 @@ function drawBoxes(det){
       offsetY = (elemH - renderH) / 2;
     }
 
-    // Skala pemetaan terpisah (scaleX & scaleY) dari koordinat citra AI (refW x refH) ke ukuran render di browser
     const scaleX = renderW / refW;
     const scaleY = renderH / refH;
 
-    // ------------------------------------------------------------
-    // MOTION EXTRAPOLATION WITH SAFEGUARDS (Feature Flag: ENABLE_MOTION_EXTRAPOLATION)
-    // Synchronizes 1.5 FPS AI bounding boxes with 25/30 FPS real-time moving video
-    // ------------------------------------------------------------
-    let effVxBox = det.bbox;
-    let effPlateBox = det.plate_bbox;
+    const activeBoxIds = new Set();
 
-    if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
-      const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
-      const isConfGood = (det.vehicle_confidence || 0) >= 0.40;
+    detList.forEach((det, idx) => {
+      const tid = det.track_id != null ? det.track_id : `idx_${idx}`;
+      const vehBoxId = `detBoxVehicle_${tid}`;
+      const plateBoxId = `detBoxPlate_${tid}`;
 
-      if (isTrackActive && isConfGood) {
-        // Frame age calculation with matching timestamps
-        let frameAgeSec = 0;
-        if (det.capture_timestamp && det.capture_timestamp > 0) {
-          const nowSec = Date.now() / 1000.0;
-          frameAgeSec = Math.max(0, nowSec - det.capture_timestamp);
-        } else if (det.frame_age_ms != null && det.frame_age_ms > 0) {
-          frameAgeSec = det.frame_age_ms / 1000.0;
-        }
+      let effVxBox = det.bbox;
+      let effPlateBox = det.plate_bbox;
 
-        // Safeguard 1: Clamp prediction horizon (max 0.70s = 700ms)
-        const MAX_HORIZON_SEC = 0.70;
-        const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
+      // Pastikan rel_plate_bbox selalu diproyeksikan ke effVxBox bahkan saat kendaraan diam atau bergerak lambat
+      if ((!effPlateBox || !Array.isArray(effPlateBox) || effPlateBox.length !== 4) && effVxBox && det.rel_plate_bbox) {
+        effPlateBox = projectPlateBbox(effVxBox, det.rel_plate_bbox);
+      }
+      if (effPlateBox && !isPlateInsideRoi(effPlateBox, refW, refH, currentRoi)) {
+        effPlateBox = null;
+      }
+      if (ENABLE_MOTION_EXTRAPOLATION && det.bbox && Array.isArray(det.bbox) && det.bbox.length === 4) {
+        const isTrackActive = !det.lost_interest && det.status !== 'OUTSIDE_ROI' && (det.frames_missing == null || det.frames_missing === 0);
+        const isConfGood = (det.vehicle_confidence || 0) >= 0.22;
 
-        if (horizon > 0.05) { // Only extrapolate when latency is noticeable (>50ms)
-          let vx = 0, vy = 0;
-          if (det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
-            vx = det.velocity[0];
-            vy = det.velocity[1];
-          } else if (lastDetectionData && lastDetectionData.track_id === det.track_id && lastDetectionData.bbox) {
-            const dt = (det.capture_timestamp && lastDetectionData.capture_timestamp)
-              ? (det.capture_timestamp - lastDetectionData.capture_timestamp)
-              : 0;
-            if (dt > 0.05 && dt < 1.5) {
-              const prevCx = (lastDetectionData.bbox[0] + lastDetectionData.bbox[2]) / 2.0;
-              const prevCy = (lastDetectionData.bbox[1] + lastDetectionData.bbox[3]) / 2.0;
-              const curCx = (det.bbox[0] + det.bbox[2]) / 2.0;
-              const curCy = (det.bbox[1] + det.bbox[3]) / 2.0;
-              vx = (curCx - prevCx) / dt;
-              vy = (curCy - prevCy) / dt;
-            }
+        if (isTrackActive && isConfGood) {
+          let frameAgeSec = 0;
+          if (det.capture_timestamp && det.capture_timestamp > 0) {
+            const nowSec = Date.now() / 1000.0;
+            frameAgeSec = Math.max(0, nowSec - det.capture_timestamp);
+          } else if (det.frame_age_ms != null && det.frame_age_ms > 0) {
+            frameAgeSec = det.frame_age_ms / 1000.0;
           }
 
-          if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
-            let dx = vx * horizon;
-            let dy = vy * horizon;
+          const MAX_HORIZON_SEC = 0.12;
+          const horizon = Math.min(frameAgeSec, MAX_HORIZON_SEC);
 
-            // Safeguard 2: Clamp maximum displacement (max 12% frame dimension or 75% bbox dimension)
-            const [bx1, by1, bx2, by2] = det.bbox;
-            const bw = bx2 - bx1;
-            const bh = by2 - by1;
-            const maxDx = Math.min(refW * 0.12, bw * 0.75);
-            const maxDy = Math.min(refH * 0.12, bh * 0.75);
-            dx = Math.max(-maxDx, Math.min(maxDx, dx));
-            dy = Math.max(-maxDy, Math.min(maxDy, dy));
+          if (horizon > 0.03 && det.velocity && Array.isArray(det.velocity) && det.velocity.length === 2) {
+            const [vx, vy] = det.velocity;
+            if (Math.abs(vx) > 5 || Math.abs(vy) > 5) {
+              let dx = vx * horizon;
+              let dy = vy * horizon;
+              const [bx1, by1, bx2, by2] = det.bbox;
+              const bw = bx2 - bx1;
+              const bh = by2 - by1;
+              const maxDx = Math.min(refW * 0.04, bw * 0.15);
+              const maxDy = Math.min(refH * 0.04, bh * 0.15);
+              dx = Math.max(-maxDx, Math.min(maxDx, dx));
+              dy = Math.max(-maxDy, Math.min(maxDy, dy));
 
-            // Apply displacement clamped within image boundaries
-            const nx1 = Math.max(0, Math.min(refW - bw, bx1 + dx));
-            const ny1 = Math.max(0, Math.min(refH - bh, by1 + dy));
-            effVxBox = [nx1, ny1, nx1 + bw, ny1 + bh];
+              const nx1 = Math.max(0, Math.min(refW - bw, bx1 + dx));
+              const ny1 = Math.max(0, Math.min(refH - bh, by1 + dy));
+              effVxBox = [nx1, ny1, nx1 + bw, ny1 + bh];
 
-            // Synchronized plate bounding box extrapolation (anchored rigidly to vehicle bumper)
-            if (det.rel_plate_bbox) {
-              const projected = projectPlateBbox(effVxBox, det.rel_plate_bbox);
-              if (projected) effPlateBox = projected;
-            } else if (det.plate_bbox) {
-              const pw = det.plate_bbox[2] - det.plate_bbox[0];
-              const ph = det.plate_bbox[3] - det.plate_bbox[1];
-              const px1 = Math.max(0, Math.min(refW - pw, det.plate_bbox[0] + dx));
-              const py1 = Math.max(0, Math.min(refH - ph, det.plate_bbox[1] + dy));
-              effPlateBox = [px1, py1, px1 + pw, py1 + ph];
+              if (det.rel_plate_bbox) {
+                const projected = projectPlateBbox(effVxBox, det.rel_plate_bbox);
+                if (projected) effPlateBox = projected;
+              } else if (det.plate_bbox) {
+                const pw = det.plate_bbox[2] - det.plate_bbox[0];
+                const ph = det.plate_bbox[3] - det.plate_bbox[1];
+                const px1 = Math.max(0, Math.min(refW - pw, det.plate_bbox[0] + dx));
+                const py1 = Math.max(0, Math.min(refH - ph, det.plate_bbox[1] + dy));
+                effPlateBox = [px1, py1, px1 + pw, py1 + ph];
+              }
             }
           }
         }
       }
-    }
-
-    // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
-    let boxVeh = wrap.querySelector('#detBoxVehicle');
-    if (effVxBox){
-      const [x1,y1,x2,y2] = effVxBox;
-      if (!boxVeh){
-        boxVeh = document.createElement('div');
-        boxVeh.id = 'detBoxVehicle';
-        boxVeh.className = 'det-box';
-        const label = document.createElement('div');
-        label.className = 'det-label';
-        boxVeh.appendChild(label);
-        wrap.appendChild(boxVeh);
+      if (effPlateBox && !isPlateInsideRoi(effPlateBox, refW, refH, currentRoi)) {
+        effPlateBox = null;
       }
-      const vPad = 4;
-      boxVeh.style.display = 'block';
-      boxVeh.style.left = Math.max(0, Math.round(offsetX + x1 * scaleX - vPad)) + 'px';
-      boxVeh.style.top = Math.max(0, Math.round(offsetY + y1 * scaleY - vPad)) + 'px';
-      boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
-      boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
-      const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
-      const vName = typeLabel[det.vehicle_type] || det.vehicle_type || 'Vehicle';
-      const bStyle = det.body_style;
-      let baseLabel = vName;
-      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
-      } else if (bStyle) {
-        baseLabel = bStyle;
-      }
-      const vehConf = det.vehicle_confidence ? ` (${Math.round(det.vehicle_confidence * 100)}%)` : '';
+      // 1. Kotak Bounding Box Kendaraan (Biru / Hijau jika Terkonfirmasi)
+      if (effVxBox && Array.isArray(effVxBox) && effVxBox.length === 4) {
+        activeBoxIds.add(vehBoxId);
+        let boxVeh = wrap.querySelector(`#${vehBoxId}`);
+        if (!boxVeh) {
+          boxVeh = document.createElement('div');
+          boxVeh.id = vehBoxId;
+          boxVeh.className = 'det-box';
+          boxVeh.dataset.trackId = String(tid);
+          const label = document.createElement('div');
+          label.className = 'det-label';
+          boxVeh.appendChild(label);
+          wrap.appendChild(boxVeh);
+        }
+        const [x1, y1, x2, y2] = effVxBox;
+        const vPad = 4;
+        boxVeh.style.display = 'block';
+        boxVeh.style.left = Math.max(0, Math.round(offsetX + x1 * scaleX - vPad)) + 'px';
+        boxVeh.style.top = Math.max(0, Math.round(offsetY + y1 * scaleY - vPad)) + 'px';
+        boxVeh.style.width = Math.round((x2 - x1) * scaleX + vPad * 2) + 'px';
+        boxVeh.style.height = Math.round((y2 - y1) * scaleY + vPad * 2) + 'px';
 
-      const labelElem = boxVeh.querySelector('.det-label');
-      boxVeh.className = 'det-box';
-      const labelText = `${baseLabel}${vehConf}`;
-      labelElem.textContent = labelText;
-      if (isConfirmed) {
-        boxVeh.style.borderColor = '#10b981';
-        boxVeh.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
-        labelElem.style.background = '#10b981';
-      } else {
-        boxVeh.style.borderColor = '#2f6fed';
-        boxVeh.style.boxShadow = '0 0 8px rgba(47, 111, 237, 0.4)';
-        labelElem.style.background = '#2f6fed';
+        const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+        const labelElem = boxVeh.querySelector('.det-label');
+        const labelText = formatVehicleBoxLabel(det);
+        if (labelElem) labelElem.textContent = labelText;
+        if (isConfirmed) {
+          boxVeh.style.borderColor = '#10b981';
+          boxVeh.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
+          if (labelElem) labelElem.style.background = '#10b981';
+        } else {
+          boxVeh.style.borderColor = '#2f6fed';
+          boxVeh.style.boxShadow = '0 0 8px rgba(47, 111, 237, 0.4)';
+          if (labelElem) labelElem.style.background = '#2f6fed';
+        }
       }
-    } else if (boxVeh){
-      boxVeh.style.display = 'none';
-    }
 
-    // 2. Kotak Bounding Box Plat Nomor (Kuning) - Hanya jika dideteksi dan di dalam ROI
-    let boxPlate = wrap.querySelector('#detBoxPlate');
-    if (effPlateBox){
-      const [x1,y1,x2,y2] = effPlateBox;
-      if (!boxPlate){
-        boxPlate = document.createElement('div');
-        boxPlate.id = 'detBoxPlate';
-        boxPlate.className = 'det-box plate-box';
-        const pLabel = document.createElement('div');
-        pLabel.className = 'det-label';
-        pLabel.style.background = '#f2c94c';
-        pLabel.style.color = '#000';
-        pLabel.style.fontWeight = '700';
-        boxPlate.appendChild(pLabel);
-        wrap.appendChild(boxPlate);
+      // 2. Kotak Bounding Box Plat Nomor (Kuning) - Hanya jika dideteksi dan di dalam ROI
+      if (effPlateBox && Array.isArray(effPlateBox) && effPlateBox.length === 4) {
+        activeBoxIds.add(plateBoxId);
+        let boxPlate = wrap.querySelector(`#${plateBoxId}`);
+        if (!boxPlate) {
+          boxPlate = document.createElement('div');
+          boxPlate.id = plateBoxId;
+          boxPlate.className = 'det-box plate-box';
+          boxPlate.dataset.trackId = String(tid);
+          const pLabel = document.createElement('div');
+          pLabel.className = 'det-label';
+          pLabel.style.background = '#f2c94c';
+          pLabel.style.color = '#000';
+          pLabel.style.fontWeight = '700';
+          boxPlate.appendChild(pLabel);
+          wrap.appendChild(boxPlate);
+        }
+        const [px1, py1, px2, py2] = effPlateBox;
+        boxPlate.style.display = 'block';
+        boxPlate.style.left = Math.round(offsetX + px1 * scaleX) + 'px';
+        boxPlate.style.top = Math.round(offsetY + py1 * scaleY) + 'px';
+        boxPlate.style.width = Math.round((px2 - px1) * scaleX) + 'px';
+        boxPlate.style.height = Math.round((py2 - py1) * scaleY) + 'px';
+        const plateLabel = formatPlateBoxLabel(det);
+        const pLabelElem = boxPlate.querySelector('.det-label');
+        if (pLabelElem) pLabelElem.textContent = plateLabel;
       }
-      boxPlate.style.display = 'block';
-      boxPlate.style.left = Math.round(offsetX + x1 * scaleX) + 'px';
-      boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
-      boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
-      boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-      const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
-      boxPlate.querySelector('.det-label').textContent = plateLabel;
-    } else if (boxPlate){
-      boxPlate.style.display = 'none';
-    }
+    });
+
+    // Clean up stale boxes for tracks that are no longer in active detList
+    wrap.querySelectorAll('.det-box').forEach(box => {
+      if (!activeBoxIds.has(box.id)) {
+        box.remove();
+      }
+    });
   };
 
   if (target.tagName === 'IMG' && (!target.complete || target.naturalWidth === 0)){
@@ -2108,6 +2232,12 @@ function drawPlateBoxOnly(det){
   const natH = target.videoHeight || target.naturalHeight;
   if (!refW || !refH){ refW = natW || 1920; refH = natH || 1080; }
   if (!elemW || !elemH || !refW || !refH) return;
+
+  if (!isPlateInsideRoi(det.plate_bbox, refW, refH, currentRoi)) {
+    const existing = wrap.querySelector('#detBoxPlate');
+    if (existing) existing.remove();
+    return;
+  }
 
   const dispRatio = (refW && refH) ? (refW / refH) : ((natW && natH) ? (natW / natH) : (16 / 9));
   const elemRatio = elemW / elemH;
@@ -2146,13 +2276,15 @@ function drawPlateBoxOnly(det){
   boxPlate.style.top = Math.round(offsetY + y1 * scaleY) + 'px';
   boxPlate.style.width = Math.round((x2 - x1) * scaleX) + 'px';
   boxPlate.style.height = Math.round((y2 - y1) * scaleY) + 'px';
-  const plateLabel = det.ocr_text || det.license_plate || 'PLATE DETECTED';
+  const plateLabel = formatPlateBoxLabel(det);
   boxPlate.querySelector('.det-label').textContent = plateLabel;
 }
 
 // Reposition bounding boxes on window resize
 window.addEventListener('resize', () => {
-  if (lastDetectionData) drawBoxes(lastDetectionData);
+  if (lastDetectionData && lastDetectionData.inside_interest_area && !lastDetectionData.lost_interest) {
+    drawBoxes(lastDetectionData);
+  }
 });
 
 // ============================================================
@@ -2199,8 +2331,8 @@ function updateResultCard(det, detMs){
       tagStatus.style.color = '#065f46';
       tagStatus.style.borderColor = '#a7f3d0';
       const confScore = det.ocr_confidence || det.confirmation_score || det.plate_confidence;
-      const pct = confScore ? Math.round(confScore * 100) : 100;
-      tagStatus.textContent = `CONFIRMED (${pct}%)`;
+      const pct = confScore ? formatPercent(confScore) : '100%';
+      tagStatus.textContent = `CONFIRMED (${pct})`;
     } else if (isConfirming) {
       tagStatus.style.background = '#fef3c7';
       tagStatus.style.color = '#92400e';
@@ -2230,12 +2362,13 @@ function updateResultCard(det, detMs){
   document.getElementById('plateText').textContent = plateDisplay;
 
   // Strict OCR confidence: NEVER fall back to vehicle confidence or YOLO plate bbox confidence when analyzing!
-  const confPct = (det.ocr_confidence && det.ocr_confidence > 0)
-    ? Math.round(det.ocr_confidence * 100) + '%'
-    : (isConfirmed && det.plate_confidence ? Math.round(det.plate_confidence * 100) + '%' : '-');
+  const rawOcr = (det.ocr_confidence != null && det.ocr_confidence > 0)
+    ? det.ocr_confidence
+    : ((isConfirmed && det.plate_confidence != null && det.plate_confidence > 0) ? det.plate_confidence : null);
+  const confPct = rawOcr != null ? formatPercent(rawOcr) : '-';
   document.getElementById('pctConf').textContent = confPct;
 
-  const vehPct = det.vehicle_confidence ? Math.round(det.vehicle_confidence * 100) + '%' : '-';
+  const vehPct = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? formatPercent(det.vehicle_confidence) : '-';
   const vehElem = document.getElementById('pctVehConf');
   if (vehElem) vehElem.textContent = vehPct;
 
@@ -2304,7 +2437,7 @@ function updateTelemetry(det){
 
   // 3. Plate Detect
   if (telemPlate) {
-    if (det.plate_bbox || det.plate_detected) {
+    if (det.plate_bbox || det.plate_detected || det.license_plate || det.ocr_text) {
       telemPlate.textContent = 'DETECTED';
       telemPlate.className = 'telem-val warn-amber';
     } else if (det.inside_interest_area === false || det.status === 'OUTSIDE_ROI') {
@@ -2345,12 +2478,12 @@ function updateTelemetry(det){
   // 6. OCR Conf
   if (telemOcrConf) {
     const oConf = (det.ocr_confidence && det.ocr_confidence > 0) ? det.ocr_confidence : det.candidate_confidence;
-    telemOcrConf.textContent = oConf ? Math.round(oConf * 100) + '%' : '-';
+    telemOcrConf.textContent = oConf ? formatPercent(oConf) : '-';
   }
 
   // 7. Vehicle Conf
   if (telemVehConf) {
-    telemVehConf.textContent = det.vehicle_confidence ? Math.round(det.vehicle_confidence * 100) + '%' : '-';
+    telemVehConf.textContent = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? formatPercent(det.vehicle_confidence) : '-';
   }
 
   // 8. Interest / Age
@@ -2380,7 +2513,7 @@ function formatEntryHistoryBodyStyle(det){
   return 'Unknown';
 }
 
-function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null){
+function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null, vehConf=null){
   const cleanBody = bodyStyle != null ? String(bodyStyle).trim() : '';
   if (!cleanBody || cleanBody === '-' || cleanBody.toUpperCase() === 'UNKNOWN') return;
   const logList = document.getElementById('logList');
@@ -2420,7 +2553,45 @@ function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null
     } else if (bConfEl) {
       bConfEl.remove();
     }
+
+    const vConfVal = (vehConf != null && !isNaN(vehConf) && vehConf > 0) ? vehConf : null;
+    if (vConfVal != null) {
+      targetRow.setAttribute('data-veh-conf', vConfVal);
+      const vehConfBadge = `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(vConfVal)}">Veh ${formatPercent(vConfVal)}</span>`;
+      let vConfEl = targetRow.querySelector('.log-veh-conf');
+      if (vConfEl) {
+        vConfEl.outerHTML = vehConfBadge;
+      } else {
+        const typeEl = targetRow.querySelector('.log-type');
+        if (typeEl && typeEl.firstElementChild) {
+          typeEl.firstElementChild.insertAdjacentHTML('beforeend', vehConfBadge);
+        }
+      }
+    }
   }
+}
+
+function selectHistoryRecord(rec){
+  if (!rec) return;
+  const pConf = rec.ocr_confidence != null ? rec.ocr_confidence : (rec.plate_confidence != null ? rec.plate_confidence : rec.confidence);
+  const detLike = {
+    track_id: rec.track_id,
+    record_id: rec.id,
+    license_plate: rec.license_plate,
+    ocr_text: rec.license_plate,
+    ocr_confidence: pConf,
+    plate_confidence: rec.plate_confidence || pConf,
+    vehicle_type: rec.vehicle_type,
+    vehicle_confidence: rec.vehicle_confidence,
+    confirmed_vehicle_confidence: rec.vehicle_confidence,
+    body_style: rec.body_style,
+    body_style_confidence: rec.body_style_confidence,
+    status: 'CONFIRMED',
+    confirmation_status: 'CONFIRMED',
+    ocr_status: 'CONFIRMED',
+    latency_ms: rec.processing_ms || rec.latency_ms
+  };
+  updateResultCard(detLike);
 }
 
 function addLogRow(det, isInit=false){
@@ -2450,11 +2621,14 @@ function addLogRow(det, isInit=false){
   
   // Pisahkan secara eksplisit Akurasi OCR Plat Nomor dan Confidence Tipe Bodi
   const plateConf = det.ocr_confidence != null ? det.ocr_confidence : (det.plate_confidence != null ? det.plate_confidence : det.confidence);
-  const plateConfBadge = (plateConf != null && plateConf > 0) ? `<span class="log-plate-conf" style="font-size:10.5px; background:#eff6ff; color:#1d4ed8; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Akurasi Pembacaan Plat (OCR): ${Math.round(plateConf * 100)}%">OCR ${Math.round(plateConf * 100)}%</span>` : '';
+  const plateConfBadge = (plateConf != null && plateConf > 0) ? `<span class="log-plate-conf" style="font-size:10.5px; background:#eff6ff; color:#1d4ed8; padding:1px 5px; border-radius:4px; margin-left:4px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Akurasi Pembacaan Plat (OCR): ${formatPercent(plateConf)}">OCR ${formatPercent(plateConf)}</span>` : '';
   
   const bodyOrType = formatEntryHistoryBodyStyle(det);
   const bodyConf = (det.body_style_confidence != null && det.body_style_confidence > 0) ? det.body_style_confidence : null;
   const bodyConfBadge = (bodyConf != null && bodyOrType !== 'Classifying...' && bodyOrType !== 'Unknown') ? `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bodyConf * 100)}%">${Math.round(bodyConf * 100)}%</span>` : '';
+
+  const vehConf = (det.vehicle_confidence != null && !isNaN(det.vehicle_confidence) && det.vehicle_confidence > 0) ? det.vehicle_confidence : null;
+  const vehConfBadge = (vehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(vehConf)}">Veh ${formatPercent(vehConf)}</span>` : '';
 
   // 1. Cek apakah record persis ini (berdasarkan id atau snapshot_url) sudah ada di logList
   if (det.id && logList.querySelector(`.log-row[data-id="${det.id}"]`)) {
@@ -2466,41 +2640,73 @@ function addLogRow(det, isInit=false){
     return;
   }
 
-  // 2. Cek apakah baris teratas (paling baru) mewakili kendaraan/track aktif yang baru saja masuk (< 15 detik)
-  // JANGAN cari ke seluruh riwayat lama, karena ByteTrack me-reuse track_id untuk mobil baru di sesi berikutnya!
-  const topRow = logList.firstElementChild;
-  if (topRow && topRow.classList && topRow.classList.contains('log-row') && !isInit) {
-    const topTrack = topRow.getAttribute('data-track-id');
-    const topPlate = topRow.getAttribute('data-plate');
-    const topTime = parseInt(topRow.getAttribute('data-created-epoch') || '0', 10);
-    const nowEpoch = Math.floor(Date.now() / 1000);
+  // 2. Cek apakah record dengan plat yang sama, mirip (typo 1-2 huruf), atau track ID yang sama sudah tercatat dalam 30 detik terakhir
+  const cleanP = (str) => (str || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  const targetClean = cleanP(plateText);
+  const nowEpoch = Math.floor(Date.now() / 1000);
 
-    const isSameRecentTrack = (det.track_id && topTrack && String(topTrack) === String(det.track_id) && (nowEpoch - topTime < 15));
-    const isSameRecentPlate = (plateText && topPlate && topPlate === plateText && (nowEpoch - topTime < 15));
+  const isSimilarPlate = (c1, c2) => {
+    if (!c1 || !c2) return false;
+    if (c1 === c2) return true;
+    if (c1.length < 4 || c2.length < 4) return false;
+    if (Math.abs(c1.length - c2.length) > 2) return false;
+    let matches = 0;
+    const minL = Math.min(c1.length, c2.length);
+    const maxL = Math.max(c1.length, c2.length);
+    for (let i = 0; i < minL; i++) {
+      if (c1[i] === c2[i]) matches++;
+    }
+    return (matches / maxL) >= 0.70 || ((maxL - matches) <= 2 && Math.abs(c1.length - c2.length) <= 1);
+  };
+
+  const candidateRows = logList.querySelectorAll('.log-row');
+  for (const targetRow of candidateRows) {
+    const rowTrack = targetRow.getAttribute('data-track-id');
+    const rowPlate = targetRow.getAttribute('data-plate');
+    const rowTime = parseInt(targetRow.getAttribute('data-created-epoch') || '0', 10);
+
+    const isSameRecentTrack = (!isInit && det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 45 && rowTime > 0));
+    const isSameRecentPlate = (targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean) && (!isInit ? (nowEpoch - rowTime < 45 && rowTime > 0) : cleanP(rowPlate) === targetClean));
 
     if (isSameRecentTrack || isSameRecentPlate) {
-      // Perbarui baris teratas jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
-      const plateEl = topRow.querySelector('.log-plate');
+      // Perbarui baris yang sudah ada jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
+      const plateEl = targetRow.querySelector('.log-plate');
       if (plateEl && (plateEl.textContent.includes('-') || !plateEl.textContent.includes(plateText))) {
         plateEl.innerHTML = `${trackPrefix}<span>${plateText}</span>${plateConfBadge}`;
-        topRow.setAttribute('data-plate', plateText);
+        targetRow.setAttribute('data-plate', plateText);
       }
-      const existingBs = topRow.getAttribute('data-body-style') || '';
+      const existingVehConf = targetRow.getAttribute('data-veh-conf');
+      if (det.id != null && det.vehicle_confidence != null) {
+        targetRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+      } else if (!existingVehConf && det.vehicle_confidence != null) {
+        targetRow.setAttribute('data-veh-conf', det.vehicle_confidence);
+      }
+      const currentVehConfAttr = targetRow.getAttribute('data-veh-conf');
+      const resolvedVehConf = currentVehConfAttr ? parseFloat(currentVehConfAttr) : ((vehConf != null) ? vehConf : null);
+      const resolvedVehConfBadge = (resolvedVehConf != null) ? `<span class="log-veh-conf" style="font-size:10.5px; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Kendaraan: ${formatPercent(resolvedVehConf)}">Veh ${formatPercent(resolvedVehConf)}</span>` : '';
+
+      const existingBs = targetRow.getAttribute('data-body-style') || '';
       const resolvedBs = (det.body_style && String(det.body_style).trim()) ? String(det.body_style).trim() : (existingBs || bodyOrType);
-      topRow.setAttribute('data-body-style', resolvedBs);
-      const typeEl = topRow.querySelector('.log-type');
+      targetRow.setAttribute('data-body-style', resolvedBs);
+      const typeEl = targetRow.querySelector('.log-type');
       if (typeEl) {
         typeEl.innerHTML = `
-          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}</span>
+          <span><span class="log-body-label">${resolvedBs}</span>${bodyConfBadge}${resolvedVehConfBadge}</span>
           ${procDisplay}
         `;
       }
-      if (det.id) topRow.setAttribute('data-id', det.id);
+      if (det.id) targetRow.setAttribute('data-id', det.id);
+      targetRow.style.cursor = 'pointer';
+      targetRow.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
+      targetRow.onclick = () => {
+        selectHistoryRecord(det);
+        const allRows = logList.querySelectorAll('.log-row');
+        allRows.forEach(r => r.style.outline = 'none');
+        targetRow.style.outline = '2px solid #2f6fed';
+      };
       if (det.snapshot_url) {
-        topRow.setAttribute('data-snapshot', det.snapshot_url);
-        topRow.style.cursor = 'pointer';
-        topRow.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
-        topRow.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+        targetRow.setAttribute('data-snapshot', det.snapshot_url);
+        targetRow.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
       }
       return;
     }
@@ -2514,20 +2720,27 @@ function addLogRow(det, isInit=false){
   if (det.track_id) row.setAttribute('data-track-id', det.track_id);
   row.setAttribute('data-plate', plateText);
   row.setAttribute('data-body-style', bodyOrType);
-  row.setAttribute('data-created-epoch', Math.floor(Date.now() / 1000));
+  if (vehConf != null) row.setAttribute('data-veh-conf', vehConf);
+  row.setAttribute('data-created-epoch', isInit ? 0 : Math.floor(Date.now() / 1000));
   
+  row.style.cursor = 'pointer';
+  row.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
+  row.onclick = () => {
+    selectHistoryRecord(det);
+    const allRows = logList.querySelectorAll('.log-row');
+    allRows.forEach(r => r.style.outline = 'none');
+    row.style.outline = '2px solid #2f6fed';
+  };
   if (det.snapshot_url) {
     row.setAttribute('data-snapshot', det.snapshot_url);
-    row.style.cursor = 'pointer';
-    row.title = `Klik untuk melihat foto: ${det.snapshot_url}`;
-    row.onclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+    row.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
   }
   
   row.innerHTML = `
     <span class="log-time">${timeStr}</span>
     <span class="log-plate" style="display:inline-flex; align-items:center;">${trackPrefix}<span>${plateText}</span>${plateConfBadge}</span>
     <span class="log-type" style="display:flex; align-items:center; justify-content:flex-end; gap:6px;">
-      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}</span>
+      <span><span class="log-body-label">${bodyOrType}</span>${bodyConfBadge}${vehConfBadge}</span>
       ${procDisplay}
     </span>
   `;
@@ -2573,7 +2786,7 @@ function shareDetection(){
   const now = new Date();
   const vType = typeLabel[d.vehicle_type] || d.vehicle_type || 'Vehicle';
   const bStyle = d.body_style ? ` (${d.body_style})` : '';
-  const conf = d.confidence ? Math.round(d.confidence*100)+'%' : (d.plate_confidence ? Math.round(d.plate_confidence*100)+'%' : '95%');
+  const conf = d.ocr_confidence ? formatPercent(d.ocr_confidence) : (d.plate_confidence ? formatPercent(d.plate_confidence) : (d.confidence ? formatPercent(d.confidence) : '95.0%'));
   
   const shareText = 
 `[Parkour ANPR] Vehicle Entry Report
@@ -2712,6 +2925,28 @@ function handleWsMessage(msg){
   if (!msg || !msg.type) return;
 
   if (msg.type === "init"){
+    // Log inisialisasi backend ke DevTools Console
+    if (msg.startup_status){
+      const s = msg.startup_status;
+      if (s.ready) {
+        console.log(`[BACKEND_STARTUP] Backend mulai & siap menerima request (Port ${location.port || '5001'})`);
+      } else {
+        console.error(`[BACKEND_STARTUP] Inisialisasi Backend Gagal: ${s.error || 'Unknown error'}`);
+      }
+      if (s.models) {
+        const m = s.models;
+        console.log(`[BACKEND_STARTUP] Model YOLO: Vehicle=${m.vehicle?.name || '-'} (${m.vehicle?.classes || 0} kelas, ${m.vehicle?.loaded ? 'OK' : 'FAIL'}) | Plate=${m.plate?.name || '-'} (${m.plate?.classes || 0} kelas, ${m.plate?.loaded ? 'OK' : 'FAIL'}) | Body=${m.body_style?.name || '-'} (${m.body_style?.classes || 0} kelas) | Char=${m.character?.name || '-'} (${m.character?.classes || 0} kelas)`);
+      }
+      if (s.ocr) {
+        console.log(`[BACKEND_STARTUP] Model OCR: ${s.ocr.engine || 'PaddleOCR'} v${s.ocr.version || '-'} (API: ${s.ocr.api || '-'}, Init: ${s.ocr.init_ms || 0}ms, Status: ${s.ocr.loaded ? 'OK' : 'FAIL'})`);
+      }
+      if (s.warmup && s.warmup.warmup_ms) {
+        console.log(`[BACKEND_STARTUP] Graf AI Warmup: ${s.warmup.completed ? 'Selesai' : 'Gagal'} (${s.warmup.warmup_ms}ms)`);
+      }
+      if (s.error) {
+        console.error(`[BACKEND_STARTUP] Error: ${s.error}`);
+      }
+    }
     if (msg.interest_area){
       currentRoi = msg.interest_area;
       drawRoiBox(currentRoi);
@@ -2731,9 +2966,7 @@ function handleWsMessage(msg){
     }
   } else if (msg.type === "detection_update"){
     // Release in-flight backpressure
-    if (inFlightFrameId !== null && (msg.frame_id == null || msg.frame_id >= inFlightFrameId)){
-      inFlightFrameId = null;
-    }
+    inFlightFrameId = null;
     // Realtime detection broadcast from StreamInferenceWorker or live_ws via WebSocket
     const wsNow = Date.now() / 1000.0;
     const frameAge = msg.capture_timestamp
@@ -2756,6 +2989,7 @@ function handleWsMessage(msg){
       detections: msg.detections || [],
       detection_time_sec: msg.latency_ms != null ? msg.latency_ms / 1000.0 : null,
       processing_ms: msg.processing_ms || msg.latency_ms,
+      perf_breakdown: msg.perf_breakdown || null,
       frame_id: msg.frame_id,
       capture_timestamp: msg.capture_timestamp,
       frame_age_ms: frameAge,
@@ -2769,6 +3003,11 @@ function handleWsMessage(msg){
     handleDetectionResult(detPayload, true);
   } else if (msg.type === "plate_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
+    // Guard terhadap frame yang terlampau usang (> 15 frame / ~1 detik di masa lalu) untuk track ini
+    if (msg.frame_id != null && latestRenderedFrameId > 0 && (latestRenderedFrameId - msg.frame_id) > 15){
+      console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} too far behind latestRendered=${latestRenderedFrameId}`);
+      return;
+    }
     if (msg.frame_id != null && lastDetectionData._last_plate_frame_id != null && msg.frame_id < lastDetectionData._last_plate_frame_id){
       console.warn(`[STALE_PLATE_UPDATE_DISCARDED] frame_id=${msg.frame_id} < last=${lastDetectionData._last_plate_frame_id}`);
       return;
@@ -2779,28 +3018,37 @@ function handleWsMessage(msg){
     if (msg.rel_plate_bbox) {
       lastDetectionData.rel_plate_bbox = msg.rel_plate_bbox;
     }
-    // Synchronize WebSocket updates: prioritize projecting against the current vehicle bbox
-    // so older frame plate detections never pull or jump the plate box backward.
     let resolvedPlateBox = null;
     if (lastDetectionData.bbox && lastDetectionData.rel_plate_bbox) {
       resolvedPlateBox = projectPlateBbox(lastDetectionData.bbox, lastDetectionData.rel_plate_bbox);
     }
     if (!resolvedPlateBox) {
-      if (msg.frame_id == null || latestRenderedFrameId <= 0 || msg.frame_id >= latestRenderedFrameId) {
-        resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
-      } else {
-        resolvedPlateBox = msg.projected_plate_bbox || null;
-      }
+      resolvedPlateBox = msg.plate_bbox || msg.projected_plate_bbox || null;
     }
     if (resolvedPlateBox) {
-      lastDetectionData.plate_bbox = resolvedPlateBox;
+      const rw = lastDetectionData.image_width || 1920;
+      const rh = lastDetectionData.image_height || 1080;
+      if (isPlateInsideRoi(resolvedPlateBox, rw, rh, currentRoi)) {
+        lastDetectionData.plate_bbox = resolvedPlateBox;
+      } else {
+        lastDetectionData.plate_bbox = null;
+      }
     }
     lastDetectionData.plate_confidence = msg.plate_confidence;
     lastDetectionData.plate_detected = true;
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
-    drawBoxes(lastDetectionData);
     updateResultCard(lastDetectionData);
+    const usingBackendAnnotated = isBackendAnnotatedVisible();
+    if (!usingBackendAnnotated) {
+      drawBoxes([lastDetectionData]);
+    } else if (lastDetectionData.plate_bbox) {
+      drawPlateBoxOnly(lastDetectionData);
+    }
+    const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
+    if (pLabel) {
+      pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
+    }
   } else if (msg.type === "ocr_update"){
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id) return;
 
@@ -2855,14 +3103,20 @@ function handleWsMessage(msg){
     }
 
     updateResultCard(lastDetectionData);
-    const pLabel = document.querySelector('#detBoxPlate .det-label');
-    if (pLabel && msg.license_plate) {
-      pLabel.textContent = msg.license_plate;
+    const ocrConfPct = msg.ocr_confidence != null ? `${(msg.ocr_confidence * 100).toFixed(1)}%` : '-';
+    console.log(`[ANPR_OCR_UPDATE] Track #${msg.track_id} | Plat: ${msg.license_plate} (${ocrConfPct}) | Matches: ${msg.candidate_matches || 1}/3 | Status: ${msg.status || msg.ocr_status}`);
+    const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
+    if (pLabel) {
+      pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
+    }
+    const vLabel = document.querySelector(`#detBoxVehicle_${msg.track_id} .det-label`) || document.querySelector('#detBoxVehicle .det-label');
+    if (vLabel) {
+      vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "body_update"){
     // Perbarui baris Entry History jika klasifikasi bodi selesai setelah record Entry History dibuat
     if (msg.body_style) {
-      updateEntryHistoryBodyStyle(msg.track_id, msg.body_style, msg.record_id, msg.body_style_confidence);
+      updateEntryHistoryBodyStyle(msg.track_id, msg.body_style, msg.record_id, msg.body_style_confidence, msg.vehicle_confidence);
     }
     // STALE ASYNC BODY RESULT PROTECTION (untuk kartu Latest Detection aktif):
     if (!lastDetectionData || lastActiveTrackId !== msg.track_id){
@@ -2873,18 +3127,9 @@ function handleWsMessage(msg){
     lastDetectionData.body_style_confidence = msg.body_style_confidence;
     lastDetectionData.body_pending = false;
     updateResultCard(lastDetectionData);
-    const vLabel = document.querySelector('#detBoxVehicle .det-label');
+    const vLabel = document.querySelector(`#detBoxVehicle_${msg.track_id} .det-label`) || document.querySelector('#detBoxVehicle .det-label');
     if (vLabel) {
-      const vName = typeLabel[lastDetectionData.vehicle_type] || lastDetectionData.vehicle_type || 'Vehicle';
-      const bStyle = lastDetectionData.body_style;
-      let baseLabel = vName;
-      if (bStyle && bStyle.toLowerCase() !== vName.toLowerCase()) {
-        baseLabel = `${vName} • ${bStyle}`;
-      } else if (bStyle) {
-        baseLabel = bStyle;
-      }
-      const vehConf = lastDetectionData.vehicle_confidence ? ` (${Math.round(lastDetectionData.vehicle_confidence * 100)}%)` : '';
-      vLabel.textContent = `${baseLabel}${vehConf}`;
+      vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
     }
   } else if (msg.type === "entry_confirmed"){
     // Guaranteed confirmed record for Entry History
@@ -2893,6 +3138,7 @@ function handleWsMessage(msg){
         lastDetectionData.status = 'CONFIRMED';
         lastDetectionData.confirmation_status = 'CONFIRMED';
         lastDetectionData.ocr_status = 'CONFIRMED';
+        lastDetectionData.record_id = msg.record.id;
         if (msg.record.license_plate) {
           lastDetectionData.license_plate = msg.record.license_plate;
           lastDetectionData.ocr_text = msg.record.license_plate;
@@ -2900,13 +3146,32 @@ function handleWsMessage(msg){
         if (msg.record.ocr_confidence) {
           lastDetectionData.ocr_confidence = msg.record.ocr_confidence;
         }
+        if (msg.record.vehicle_confidence != null) {
+          lastDetectionData.vehicle_confidence = msg.record.vehicle_confidence;
+          lastDetectionData.confirmed_vehicle_confidence = msg.record.vehicle_confidence;
+        }
         if (!msg.record.body_style && lastDetectionData.body_style) {
           msg.record.body_style = lastDetectionData.body_style;
           msg.record.body_pending = false;
         }
         updateResultCard(lastDetectionData);
+        const vBox = document.querySelector(`#detBoxVehicle_${lastDetectionData.track_id}`);
+        if (vBox) {
+          vBox.style.borderColor = '#10b981';
+          vBox.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.45)';
+          const vLabel = vBox.querySelector('.det-label');
+          if (vLabel) {
+            vLabel.style.background = '#10b981';
+            vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
+          }
+        }
+      } else {
+        // Fallback jika lastDetectionData sempat null karena jeda antar frame:
+        // Selalu tampilkan kendaraan yang baru terkonfirmasi di Kartu Hasil Deteksi (UI)!
+        selectHistoryRecord(msg.record);
       }
       addLogRow(msg.record);
+      console.log(`[ANPR_ENTRY_CONFIRMED] Track #${msg.record.track_id || '-'} | Plat: ${msg.record.license_plate} | Kendaraan: ${msg.record.vehicle_type} (${msg.record.body_style || '-'}) | Durasi: ${msg.record.processing_ms || 0}ms`);
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);
     }
   }

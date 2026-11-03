@@ -424,6 +424,7 @@ def test_ocr_fallback_preemption_and_pending_crop_guard():
     assert res.get("method") == "fast_preempted_by_better_crop", f"Expected fast_preempted_by_better_crop, got {res.get('method')}"
     print("[PASS] OCR fallback preemption and pending crop quality guard verified!")
 
+
 if __name__ == "__main__":
     import app
     orig_history = list(app.LATEST_RECORDS)
