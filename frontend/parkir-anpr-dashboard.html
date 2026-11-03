@@ -1491,7 +1491,7 @@ async function runContinuousDetectLoop(){
     if (!isScanning){
       await performDetectCycle(true);
     }
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => setTimeout(r, 85));
   }
 }
 
@@ -1507,9 +1507,9 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 2500ms, release it to prevent permanent deadlock
-    if (nowMs - inFlightFrameTime > 2500) {
-      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 2.5s, resetting backpressure.`);
+    // Watchdog: If frame in flight took > 1800ms, release it to prevent permanent deadlock
+    if (nowMs - inFlightFrameTime > 1800) {
+      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 1.8s, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
       return;
@@ -1525,8 +1525,8 @@ async function performDetectCycle(silent=true){
       const video = document.getElementById('liveVideo');
       const canvas = document.getElementById('captureCanvas') || document.createElement('canvas');
       if (video && video.videoWidth > 0 && !video.paused){
-        // Cap resolusi ke 960px untuk latensi encode ultra-cepat (~10ms) dan payload ringan tanpa kehilangan ketajaman plat
-        const maxDim = 960;
+        // Cap resolusi ke 640px untuk latensi encode ultra-cepat (~3ms) dan payload ringan tanpa lag
+        const maxDim = 640;
         let scale = 1.0;
         if (video.videoWidth > maxDim) {
           scale = maxDim / video.videoWidth;
@@ -1541,7 +1541,7 @@ async function performDetectCycle(silent=true){
           const clientCaptureTs = Date.now() / 1000.0;
           inFlightFrameId = clientFrameCounter;
           inFlightFrameTime = Date.now();
-          const b64 = canvas.toDataURL('image/jpeg', 0.70);
+          const b64 = canvas.toDataURL('image/jpeg', 0.65);
           liveWs.send(JSON.stringify({
             type: "detect_frame",
             frame_id: clientFrameCounter,
@@ -1560,30 +1560,64 @@ async function performDetectCycle(silent=true){
 }
 
 function handleDetectionResult(data, silent=false){
-  // Anti-Ghosting Guard: Reject stale detection results where capture is older than 1500ms
-  // Ini mencegah frame usang menimpa posisi video tanpa menghapus kotak aktif secara mendadak.
+  // Anti-Ghosting Guard: Lewati penggambaran kotak jika frame sudah lebih tua dari 800ms
+  // Jika frame tidak memiliki deteksi, bersihkan kotak segera untuk mencegah ghost box!
+  let skipOverlayDrawing = false;
   if (data.capture_timestamp != null && data.capture_timestamp > 0) {
     const ageMs = Date.now() - (data.capture_timestamp * 1000);
-    if (ageMs > 1500) {
-      console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing.`);
-      return;
+    if (ageMs > 800) {
+      skipOverlayDrawing = true;
+      if (!data.detections || data.detections.length === 0) {
+        console.warn(`[STALE_FRAME_DISCARDED] Frame ${data.frame_id} is ${Math.round(ageMs)}ms old, skipping drawing to prevent ghost box.`);
+        clearBoxes();
+        return;
+      }
     }
+  }
+
+  // Filter deteksi aktif yang berada di dalam area deteksi (ROI)
+  const activeDetections = (data.detections || []).filter(d => 
+    d && d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI'
+  );
+
+  // Bersihkan log: HANYA log ke console jika ada kendaraan di dalam area deteksi (ROI)
+  if (activeDetections.length > 0) {
+    const primaryDet = activeDetections.find(d => d.status === 'ANALYZING') || activeDetections[0];
+    const plateText = (primaryDet && primaryDet.license_plate) ? primaryDet.license_plate : '-';
+    const ocrConf = (primaryDet && primaryDet.ocr_confidence != null) ? `${(primaryDet.ocr_confidence * 100).toFixed(1)}%` : '-';
+    const vehType = (primaryDet && primaryDet.vehicle_type) ? primaryDet.vehicle_type : '-';
+    const vehConf = (primaryDet && primaryDet.vehicle_confidence != null) ? `${(primaryDet.vehicle_confidence * 100).toFixed(1)}%` : '-';
+    const yoloTime = (data.perf_breakdown && data.perf_breakdown.yolo_ms != null) ? `${data.perf_breakdown.yolo_ms}ms` : '-';
+    const ocrTime = (data.perf_breakdown && data.perf_breakdown.ocr_ms != null) ? `${data.perf_breakdown.ocr_ms}ms` : '-';
+    const backendProcMs = data.processing_ms != null ? `${data.processing_ms}ms` : (data.detection_time_sec != null ? `${Math.round(data.detection_time_sec * 1000)}ms` : '-');
+    const frameAgeStr = (data.capture_timestamp != null && data.capture_timestamp > 0)
+      ? `${Math.round(Date.now() - (data.capture_timestamp * 1000))}ms`
+      : (data.frame_age_ms != null ? `${data.frame_age_ms}ms` : '-');
+
+    console.log(`[ANPR_LIVE] Frame #${data.frame_id ?? '-'} | Plat: ${plateText} (${ocrConf}) | Kendaraan: ${vehType} (${vehConf}) | YOLO: ${yoloTime} | OCR: ${ocrTime} | Total BE: ${backendProcMs} | Age: ${frameAgeStr}`);
   }
 
   // Check frame freshness / monotonic frame ordering to discard stale out-of-order results
   if (data.frame_id != null && data.frame_id > 0) {
     if (data.frame_id < latestRenderedFrameId) {
-      // Discard stale result that arrived after a newer frame was already processed
-      console.warn(`[STALE_FRAME_DISCARDED] frame_id=${data.frame_id} latest=${latestRenderedFrameId}`);
-      return;
+      if (activeDetections.length === 0) {
+        console.warn(`[STALE_FRAME_DISCARDED] frame_id=${data.frame_id} latest=${latestRenderedFrameId}`);
+        return;
+      }
+      skipOverlayDrawing = true;
+    } else {
+      latestRenderedFrameId = data.frame_id;
     }
-    latestRenderedFrameId = data.frame_id;
   }
   if (data.capture_timestamp != null && data.capture_timestamp > 0) {
     if (data.capture_timestamp < latestRenderedCaptureTime) {
-      return;
+      if (activeDetections.length === 0) {
+        return;
+      }
+      skipOverlayDrawing = true;
+    } else {
+      latestRenderedCaptureTime = data.capture_timestamp;
     }
-    latestRenderedCaptureTime = data.capture_timestamp;
   }
 
   // Update Frame Age UI indicator if available
@@ -1614,10 +1648,6 @@ function handleDetectionResult(data, silent=false){
   }
 
   let activeDet = null;
-  const activeDetections = (data.detections || []).filter(d => 
-    d && d.inside_interest_area && !d.lost_interest && d.status !== 'OUTSIDE_ROI'
-  );
-
   if (activeDetections.length > 0){
     // Prioritaskan kendaraan yang sedang di-ANALYZING (mobil antre baru di ROI), baru mobil yang sudah CONFIRMED
     const unconfirmed = activeDetections.find(d => d.status === 'ANALYZING');
@@ -1710,13 +1740,21 @@ function handleDetectionResult(data, silent=false){
     }
     lastActiveTrackId = activeDet.track_id;
     lastDetectionData = activeDet;
-    if (usingBackendAnnotatedImage) {
-      clearBoxes();
-      if (!activeDet._hasBakedPlateBox && activeDet.plate_bbox) {
-        drawPlateBoxOnly(activeDet);
+    if (!skipOverlayDrawing) {
+      if (usingBackendAnnotatedImage) {
+        clearBoxes();
+        if (!activeDet._hasBakedPlateBox && activeDet.plate_bbox) {
+          drawPlateBoxOnly(activeDet);
+        }
+      } else {
+        drawBoxes(activeDetections);
       }
     } else {
-      drawBoxes(activeDetections);
+      // Frame kedaluwarsa/stale: bersihkan kotak agar tidak terjadi ghost box
+      clearBoxes();
+      if (!usingBackendAnnotatedImage) {
+        drawRoiBox(currentRoi);
+      }
     }
     updateResultCard(activeDet, detMs);
 
@@ -1745,9 +1783,11 @@ function handleDetectionResult(data, silent=false){
     if (!usingBackendAnnotatedImage) {
       drawRoiBox(currentRoi);
     }
-    lastDetectionData = null;
-    updateResultCard(null, 0);
-    updateTelemetry(null);
+    if (consecutiveEmptyCycles >= 2) {
+      lastDetectionData = null;
+      updateResultCard(null, 0);
+      updateTelemetry(null);
+    }
     if (!silent){
       const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
       showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
@@ -2621,13 +2661,12 @@ function addLogRow(det, isInit=false){
 
   const candidateRows = logList.querySelectorAll('.log-row');
   for (const targetRow of candidateRows) {
-    if (isInit) break;
     const rowTrack = targetRow.getAttribute('data-track-id');
     const rowPlate = targetRow.getAttribute('data-plate');
     const rowTime = parseInt(targetRow.getAttribute('data-created-epoch') || '0', 10);
 
-    const isSameRecentTrack = (det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 30));
-    const isSameRecentPlate = (targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean) && (nowEpoch - rowTime < 30));
+    const isSameRecentTrack = (!isInit && det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 45 && rowTime > 0));
+    const isSameRecentPlate = (targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean) && (!isInit ? (nowEpoch - rowTime < 45 && rowTime > 0) : cleanP(rowPlate) === targetClean));
 
     if (isSameRecentTrack || isSameRecentPlate) {
       // Perbarui baris yang sudah ada jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
@@ -2682,7 +2721,7 @@ function addLogRow(det, isInit=false){
   row.setAttribute('data-plate', plateText);
   row.setAttribute('data-body-style', bodyOrType);
   if (vehConf != null) row.setAttribute('data-veh-conf', vehConf);
-  row.setAttribute('data-created-epoch', Math.floor(Date.now() / 1000));
+  row.setAttribute('data-created-epoch', isInit ? 0 : Math.floor(Date.now() / 1000));
   
   row.style.cursor = 'pointer';
   row.title = `Klik untuk memilih / melihat riwayat (${plateText})`;
@@ -2886,6 +2925,28 @@ function handleWsMessage(msg){
   if (!msg || !msg.type) return;
 
   if (msg.type === "init"){
+    // Log inisialisasi backend ke DevTools Console
+    if (msg.startup_status){
+      const s = msg.startup_status;
+      if (s.ready) {
+        console.log(`[BACKEND_STARTUP] Backend mulai & siap menerima request (Port ${location.port || '5001'})`);
+      } else {
+        console.error(`[BACKEND_STARTUP] Inisialisasi Backend Gagal: ${s.error || 'Unknown error'}`);
+      }
+      if (s.models) {
+        const m = s.models;
+        console.log(`[BACKEND_STARTUP] Model YOLO: Vehicle=${m.vehicle?.name || '-'} (${m.vehicle?.classes || 0} kelas, ${m.vehicle?.loaded ? 'OK' : 'FAIL'}) | Plate=${m.plate?.name || '-'} (${m.plate?.classes || 0} kelas, ${m.plate?.loaded ? 'OK' : 'FAIL'}) | Body=${m.body_style?.name || '-'} (${m.body_style?.classes || 0} kelas) | Char=${m.character?.name || '-'} (${m.character?.classes || 0} kelas)`);
+      }
+      if (s.ocr) {
+        console.log(`[BACKEND_STARTUP] Model OCR: ${s.ocr.engine || 'PaddleOCR'} v${s.ocr.version || '-'} (API: ${s.ocr.api || '-'}, Init: ${s.ocr.init_ms || 0}ms, Status: ${s.ocr.loaded ? 'OK' : 'FAIL'})`);
+      }
+      if (s.warmup && s.warmup.warmup_ms) {
+        console.log(`[BACKEND_STARTUP] Graf AI Warmup: ${s.warmup.completed ? 'Selesai' : 'Gagal'} (${s.warmup.warmup_ms}ms)`);
+      }
+      if (s.error) {
+        console.error(`[BACKEND_STARTUP] Error: ${s.error}`);
+      }
+    }
     if (msg.interest_area){
       currentRoi = msg.interest_area;
       drawRoiBox(currentRoi);
@@ -2905,9 +2966,7 @@ function handleWsMessage(msg){
     }
   } else if (msg.type === "detection_update"){
     // Release in-flight backpressure
-    if (inFlightFrameId !== null && (msg.frame_id == null || msg.frame_id >= inFlightFrameId)){
-      inFlightFrameId = null;
-    }
+    inFlightFrameId = null;
     // Realtime detection broadcast from StreamInferenceWorker or live_ws via WebSocket
     const wsNow = Date.now() / 1000.0;
     const frameAge = msg.capture_timestamp
@@ -2930,6 +2989,7 @@ function handleWsMessage(msg){
       detections: msg.detections || [],
       detection_time_sec: msg.latency_ms != null ? msg.latency_ms / 1000.0 : null,
       processing_ms: msg.processing_ms || msg.latency_ms,
+      perf_breakdown: msg.perf_breakdown || null,
       frame_id: msg.frame_id,
       capture_timestamp: msg.capture_timestamp,
       frame_age_ms: frameAge,
@@ -2979,7 +3039,8 @@ function handleWsMessage(msg){
     if (msg.ocr_status) lastDetectionData.ocr_status = msg.ocr_status;
     if (msg.status) lastDetectionData.status = msg.status;
     updateResultCard(lastDetectionData);
-    if (!usingBackendAnnotatedImage) {
+    const usingBackendAnnotated = isBackendAnnotatedVisible();
+    if (!usingBackendAnnotated) {
       drawBoxes([lastDetectionData]);
     } else if (lastDetectionData.plate_bbox) {
       drawPlateBoxOnly(lastDetectionData);
@@ -3042,6 +3103,8 @@ function handleWsMessage(msg){
     }
 
     updateResultCard(lastDetectionData);
+    const ocrConfPct = msg.ocr_confidence != null ? `${(msg.ocr_confidence * 100).toFixed(1)}%` : '-';
+    console.log(`[ANPR_OCR_UPDATE] Track #${msg.track_id} | Plat: ${msg.license_plate} (${ocrConfPct}) | Matches: ${msg.candidate_matches || 1}/3 | Status: ${msg.status || msg.ocr_status}`);
     const pLabel = document.querySelector(`#detBoxPlate_${msg.track_id} .det-label`) || document.querySelector('#detBoxPlate .det-label');
     if (pLabel) {
       pLabel.textContent = formatPlateBoxLabel(lastDetectionData);
@@ -3102,8 +3165,13 @@ function handleWsMessage(msg){
             vLabel.textContent = formatVehicleBoxLabel(lastDetectionData);
           }
         }
+      } else {
+        // Fallback jika lastDetectionData sempat null karena jeda antar frame:
+        // Selalu tampilkan kendaraan yang baru terkonfirmasi di Kartu Hasil Deteksi (UI)!
+        selectHistoryRecord(msg.record);
       }
       addLogRow(msg.record);
+      console.log(`[ANPR_ENTRY_CONFIRMED] Track #${msg.record.track_id || '-'} | Plat: ${msg.record.license_plate} | Kendaraan: ${msg.record.vehicle_type} (${msg.record.body_style || '-'}) | Durasi: ${msg.record.processing_ms || 0}ms`);
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);
     }
   }

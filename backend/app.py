@@ -508,6 +508,9 @@ def _is_plate_similar(p1, p2):
     return (matches / float(max_l)) >= 0.70 or ((max_l - matches) <= 2 and abs(len(c1) - len(c2)) <= 1)
 
 
+history_save_lock = threading.RLock()
+
+
 def save_parking_record(det, source_img=None, source_img_path=None):
     """
     Menyimpan hasil deteksi yang TERKONFIRMASI langsung ke memory RAM (0ms).
@@ -515,7 +518,13 @@ def save_parking_record(det, source_img=None, source_img_path=None):
     - Plat harus valid (format nomor polisi Indonesia atau militer)
     - Confidence plat minimal 80% (>= 0.80)
     - Anti-Passback Gate Cooldown (30 detik) dan Fuzzy Deduplication untuk mencegah duplikasi catatan.
+    Thread-safe menggunakan mutex history_save_lock.
     """
+    with history_save_lock:
+        return _save_parking_record_internal(det, source_img=source_img, source_img_path=source_img_path)
+
+
+def _save_parking_record_internal(det, source_img=None, source_img_path=None):
     global LATEST_RECORDS, LAST_RECORDED_PLATES, LAST_RECORDED_TRACK_IDS
 
     plate_text = det.get("license_plate")
@@ -547,6 +556,8 @@ def save_parking_record(det, source_img=None, source_img_path=None):
             with confirmation_manager.lock:
                 trk = confirmation_manager.tracks.get(track_id)
                 if trk:
+                    trk.history_saved = True
+                    trk.status = "HISTORY_SAVED"
                     if not det.get("plate_bbox") and trk.last_plate_bbox:
                         det["plate_bbox"] = list(trk.last_plate_bbox)
                     if not det.get("body_style") and trk.cached_body_style:
@@ -1039,13 +1050,52 @@ def warmup_models():
             char_model.predict(dummy_crop, imgsz=160, verbose=False)
         if 'paddle_engine' in globals() and paddle_engine is not None:
             paddle_engine.run(dummy_crop)
-        print(f"[WARMUP] Inisialisasi & pemanasan seluruh graf AI selesai dalam {(time.time() - t_w0)*1000:.0f}ms!", flush=True)
+        w_ms = (time.time() - t_w0) * 1000.0
+        print(f"[WARMUP] Inisialisasi & pemanasan seluruh graf AI selesai dalam {w_ms:.0f}ms!", flush=True)
+        return {"completed": True, "warmup_ms": round(w_ms, 1), "error": None}
     except Exception as e:
         print(f"[WARN] Warmup error: {e}", flush=True)
+        return {"completed": False, "warmup_ms": 0.0, "error": str(e)}
 
-warmup_models()
+warmup_res = warmup_models()
 if not HAS_CUDA:
     torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 4)))
+
+STARTUP_STATUS = {
+    "ready": True,
+    "timestamp": round(time.time(), 3),
+    "models": {
+        "vehicle": {
+            "name": os.path.basename(indo_vmodel_path if os.path.exists(indo_vmodel_path) else fallback_vmodel),
+            "loaded": ('vehicle_model' in globals() and vehicle_model is not None),
+            "classes": len(vehicle_model.names) if ('vehicle_model' in globals() and vehicle_model) else 0
+        },
+        "plate": {
+            "name": os.path.basename(best_plate_path if os.path.exists(best_plate_path) else config.PLATE_LEGACY_MODEL_PATH),
+            "loaded": ('plate_detector' in globals() and plate_detector is not None),
+            "classes": len(plate_detector.names) if ('plate_detector' in globals() and plate_detector) else 0
+        },
+        "body_style": {
+            "name": os.path.basename(config.BODY_TYPE_MODEL_PATH),
+            "loaded": ('body_style_model' in globals() and body_style_model is not None),
+            "classes": len(body_style_model.names) if ('body_style_model' in globals() and body_style_model) else 0
+        },
+        "character": {
+            "name": os.path.basename(config.CHARACTER_MODEL_PATH),
+            "loaded": ('char_model' in globals() and char_model is not None),
+            "classes": len(char_model.names) if ('char_model' in globals() and char_model) else 0
+        }
+    },
+    "ocr": {
+        "engine": "PaddleOCR",
+        "version": getattr(paddle_engine, "version", "unknown") if ('paddle_engine' in globals() and paddle_engine) else "unknown",
+        "api": getattr(paddle_engine, "api", "v3") if ('paddle_engine' in globals() and paddle_engine) else "unknown",
+        "init_ms": round(getattr(paddle_engine, "init_ms", 0.0), 1) if ('paddle_engine' in globals() and paddle_engine) else 0.0,
+        "loaded": ('paddle_engine' in globals() and paddle_engine is not None)
+    },
+    "warmup": warmup_res,
+    "error": None
+}
 
 print("[INFO] Semua model AI, PaddleOCR & Thread Pools siap digunakan!")
 
@@ -2725,6 +2775,22 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         self.is_locked = True
         print(f"[PERF_TOTAL] track_id={self.track_id} total_ms={total_proc_ms:.1f} (vehicle={v_ms:.1f}ms plate={p_ms:.1f}ms ocr={o_ms:.1f}ms)", flush=True)
         print(f"[ENTRY_HISTORY] track_id={self.track_id} plate=\"{stable_plate}\" processing_ms={int(round(total_proc_ms))}", flush=True)
+        print(f"""
+============================================================
+[RESULT PROCESS] UNIT KENDARAAN TERKONFIRMASI
+------------------------------------------------------------
+  Track ID         : #{self.track_id}
+  Plat Nomor       : {stable_plate} (Akurasi: {conf_rounded*100:.1f}%)
+  Tipe Bodi        : {best_style}
+  Jenis Kendaraan  : {best_type}
+  Alasan Validasi  : {reason}
+  Total Durasi     : {int(round(total_proc_ms))} ms
+    - Deteksi Mobil: {v_ms:.1f} ms
+    - Deteksi Plat : {p_ms:.1f} ms
+    - OCR Teks Plat: {o_ms:.1f} ms
+  Status           : TERSIMPAN KE RIWAYAT MASUK
+============================================================
+""", flush=True)
 
     def get_current_stability_count(self):
         """Mengembalikan jumlah observasi plat yang cocok saat ini (untuk progress UI 1/3, 2/3, dst)."""
@@ -3904,7 +3970,7 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None,
 
 def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
     t_start = time.time()
-    if frame_id is not None:
+    if frame_id is not None and SAVE_DEBUG_CROPS:
         print(f"[FRAME_RECEIVED]\nframe_id={frame_id}", flush=True)
     v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
     m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
@@ -3923,7 +3989,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
     # 1. YOLO VEHICLE INFERENCE (plate detection is gated by interest area)
     t_yolo_0 = time.time()
-    print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
+    if SAVE_DEBUG_CROPS:
+        print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
     infer_conf = min(v_conf_thresh, m_conf_thresh, VEHICLE_TRACK_CONTINUE_CONF)
     t_lock_start = time.time()
     with vehicle_infer_lock:
@@ -3937,7 +4004,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo_end = time.time()
     t_yolo = t_yolo_end - t_yolo_0
     t_yolo_duration_ms = t_yolo * 1000.0
-    print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
+    if SAVE_DEBUG_CROPS:
+        print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
     # 2. EKSTRAKSI KANDIDAT KENDARAAN (Two-Tier Confidence: 0.25 for new tracks, 0.18 for active tracks)
     candidates = []
@@ -4069,8 +4137,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 })
                 break
 
-    v_conf_log = f" veh_conf={candidates[0]['v_conf']:.3f} ({candidates[0]['v_conf']*100:.1f}%)" if candidates else ""
-    print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id'] if candidates else None}{v_conf_log}", flush=True)
+    if candidates:
+        v_conf_log = f" veh_conf={candidates[0]['v_conf']:.3f} ({candidates[0]['v_conf']*100:.1f}%)"
+        print(f"[VEHICLE_RESULT] frame_id={frame_id} count={len(candidates)} active_track_id={candidates[0]['track_id']}{v_conf_log}", flush=True)
     any_inside_roi = bool(candidates)
 
     # Single Photo Mode: Jangan jalankan deteksi plat global di seluruh gambar terlebih dahulu.
@@ -4371,8 +4440,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     else:
         data_uri, raw_b64, mime_type = None, None, "image/jpeg"
 
-    # 5. PERFORMANCE TELEMETRY LOGGING
-    print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+    # 5. PERFORMANCE TELEMETRY LOGGING (Hanya log saat ada kendaraan di area deteksi)
+    if candidates or results_out:
+        print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
 
     return {
         "detections": results_out,
@@ -4505,6 +4575,7 @@ class StreamInferenceWorker:
                     "frame_age_ms": frame_age_ms,
                     "latency_ms": det_time_ms,
                     "processing_ms": det_time_ms,
+                    "perf_breakdown": result.get("perf_breakdown"),
                     "detections": detections,
                     "image_mime_type": result.get("image_mime_type", "image/jpeg"),
                     "result_image": result.get("result_image"),
@@ -4516,8 +4587,9 @@ class StreamInferenceWorker:
                 ws_broadcaster.broadcast(payload)
                 if result.get("result_image"):
                     print(f"[RESULT_IMAGE_SENT]\nframe_id={frame_id}\nrecipient=ws_all", flush=True)
-                print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
-                print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
+                if det_ids:
+                    print(f"[DETECTION_SENT]\nframe_id={frame_id}\nactive_tracks={det_ids}", flush=True)
+                    print(f"[PERF_TOTAL]\nframe_id={frame_id}\nduration_ms={det_time_ms}", flush=True)
                 time.sleep(0.05 if has_pending_ocr else 0.01)
             except Exception as e:
                 print(f"[STREAM INFERENCE ERROR]: {e}")
@@ -4538,7 +4610,8 @@ def live_ws(ws):
             "type": "init",
             "interest_area": INTEREST_AREA,
             "status": camera_stream_manager.get_status(),
-            "history": list(LATEST_RECORDS)[:30]
+            "history": list(LATEST_RECORDS)[:30],
+            "startup_status": STARTUP_STATUS
         }
         ws_broadcaster.send(ws, init_payload)
 
@@ -4574,10 +4647,10 @@ def live_ws(ws):
                         client_frame_id = msg.get("frame_id")
                         client_capture_ts = msg.get("capture_timestamp")
                         
-                        # Anti-Lag Guard: Jika frame sudah tertahan di antrean socket > 500ms, buang agar latency tidak membengkak
+                        # Anti-Lag Guard: Jika frame sudah tertahan di antrean socket > 0.8s, buang agar latency tidak membengkak
                         now_recv = time.time()
                         frame_wait_sec = (now_recv - client_capture_ts) if (client_capture_ts and client_capture_ts > 0) else 0.0
-                        if frame_wait_sec > 0.50:
+                        if frame_wait_sec > 0.80:
                             ws_broadcaster.send(ws, {
                                 "type": "detection_update",
                                 "frame_id": client_frame_id,
@@ -4636,6 +4709,7 @@ def live_ws(ws):
                                     "timestamp": t0,
                                     "latency_ms": det_ms,
                                     "processing_ms": det_ms,
+                                    "perf_breakdown": res.get("perf_breakdown"),
                                     "detections": detections,
                                     "image_mime_type": res.get("image_mime_type", "image/jpeg"),
                                     "result_image": res.get("result_image"),
@@ -4646,8 +4720,9 @@ def live_ws(ws):
                                 ws_broadcaster.send(ws, payload)
                                 if res.get("result_image"):
                                     print(f"[RESULT_IMAGE_SENT]\nframe_id={client_frame_id}\nrecipient=ws_client", flush=True)
-                                print(f"[DETECTION_SENT]\nframe_id={client_frame_id}\nactive_tracks={det_ids}", flush=True)
-                                print(f"[PERF_TOTAL]\nframe_id={client_frame_id}\nduration_ms={det_ms}", flush=True)
+                                if det_ids:
+                                    print(f"[DETECTION_SENT]\nframe_id={client_frame_id}\nactive_tracks={det_ids}", flush=True)
+                                    print(f"[PERF_TOTAL]\nframe_id={client_frame_id}\nduration_ms={det_ms}", flush=True)
                 except Exception as ex:
                     print(f"[WS MSG ERROR]: {ex}")
     except Exception:
@@ -4740,7 +4815,8 @@ def health():
         "message": "Server ANPR aktif",
         "memory_records_count": len(LATEST_RECORDS),
         "stream_status": camera_stream_manager.get_status(),
-        "interest_area": INTEREST_AREA
+        "interest_area": INTEREST_AREA,
+        "startup_status": STARTUP_STATUS
     })
 
 
