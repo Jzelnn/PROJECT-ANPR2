@@ -1446,9 +1446,10 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     # NMS Berdasarkan IoU & Horizontal Overlap (threshold 0.48 agar karakter berdekatan seperti '11' tidak terbuang)
     raw_dets.sort(key=lambda d: -d["conf"])
     kept = []
+    min_edge_w = max(3.5, w * 0.035)
     for det in raw_dets:
-        # Filter artefak batas pemotongan (garis tepi tipis palsu)
-        if (det["box"][0] <= 2.0 and det["w"] < 8.0) or (det["box"][2] >= (w - 2.0) and det["w"] < 8.0):
+        # Filter artefak batas pemotongan (garis tepi tipis palsu) secara proporsional terhadap lebar crop
+        if (det["box"][0] <= 2.0 and det["w"] < min_edge_w) or (det["box"][2] >= (w - 2.0) and det["w"] < min_edge_w):
             continue
 
         dup = False
@@ -1466,17 +1467,24 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     if not kept:
         return "", 0.0, []
 
-    # Pemisahan 2 Baris Plat (Baris 1 = Nomor Polisi, Baris 2 = Bulan & Tahun Pajak)
+    # Pemisahan 2 Baris Plat Secara Scale-Invariant (Baris 1 = Nomor Polisi, Baris 2 = Bulan & Tahun Pajak)
+    median_h = float(np.median([k["h"] for k in kept])) if kept else float(h * 0.5)
+    median_w = float(np.median([k["w"] for k in kept])) if kept else float(w * 0.1)
+    stack_dx_thresh = max(w * 0.075, median_w * 0.85)
+    stack_dy_thresh = max(h * 0.20, median_h * 0.55)
+
     if len(kept) <= 8:
         has_vertical_stack = False
         for i in range(len(kept)):
             for j in range(i + 1, len(kept)):
-                if abs(kept[i]["cx"] - kept[j]["cx"]) < 12 and abs(kept[i]["cy"] - kept[j]["cy"]) > 15:
+                if abs(kept[i]["cx"] - kept[j]["cx"]) < stack_dx_thresh and abs(kept[i]["cy"] - kept[j]["cy"]) > stack_dy_thresh:
                     has_vertical_stack = True
                     break
             if has_vertical_stack:
                 break
-        if not has_vertical_stack:
+        # Cek juga apakah ada karakter kecil di baris bawah pajak (cy > 65% tinggi plat & tinggi karakter < 75% median)
+        has_small_bottom_tax = any(k["cy"] > (h * 0.65) and k["h"] < (median_h * 0.75) for k in kept)
+        if not has_vertical_stack and not has_small_bottom_tax:
             line1_chars = kept
         else:
             line1_chars = []
@@ -1485,14 +1493,17 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
 
     if not line1_chars:
         row1 = []
+        median_y = float(np.median([k["cy"] for k in kept]))
         for d in kept:
-            is_bottom = any(other["cy"] < d["cy"] - 12 and abs(other["cx"] - d["cx"]) < 15 for other in kept)
-            if not is_bottom and d["cy"] < (h * 0.72):
+            is_bottom_stacked = any(
+                other["cy"] < (d["cy"] - stack_dy_thresh) and abs(other["cx"] - d["cx"]) < (stack_dx_thresh * 1.15)
+                for other in kept
+            )
+            is_small_tax_char = (d["cy"] > (h * 0.64) and d["h"] < (median_h * 0.76))
+            if is_bottom_stacked or is_small_tax_char:
+                continue
+            if d["cy"] < (h * 0.72) or d["cy"] <= (median_y + h * 0.18):
                 row1.append(d)
-            elif not is_bottom:
-                median_y = np.median([k["cy"] for k in kept])
-                if d["cy"] <= median_y + 15:
-                    row1.append(d)
         line1_chars = row1 if len(row1) >= 3 else kept
 
     line1_chars.sort(key=lambda d: d["cx"])
@@ -1504,27 +1515,44 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
 def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fallbacks=None):
     """
     Membaca teks plat nomor menggunakan PaddleOCR dengan:
-    1. Normalisasi ukuran cerdas (height ~64px optimal untuk model recognition).
-    2. Multi-pass adaptive visual enhancement (inverse untuk plat hitam dan CLAHE untuk kontras bayangan).
+    1. Normalisasi ukuran cerdas (height ~64px + border replikasi agar huruf tepi 'B'/seri akhir tidak terpotong DBNet).
+    2. Pre-normalisasi kontras cepat & multi-pass adaptif (inverse untuk plat hitam dan CLAHE untuk kontras bayangan).
     3. Eliminasi tanggal pajak dan penyusunan multi-token.
     """
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
         return "", 0.0, []
 
-    # Clean inner margin trim: memotong 7% margin atas/bawah dan 4% margin kiri/kanan
-    # untuk menghilangkan bezel hitam bumper dan baut plat yang merusak pembacaan karakter (misal BAJ terbaca BAE/8A3)
-    if h >= 26 and w >= 45:
-        clean_crop = plate_crop[int(h * 0.07):int(h * 0.93), int(w * 0.04):int(w * 0.96)]
+    # Gentle inner margin trim: hanya pangkas tipis 2% jika crop cukup besar agar huruf tepi kiri ('B') dan kanan ('M'/'H') TIDAK terpotong!
+    if h >= 36 and w >= 80:
+        clean_crop = plate_crop[int(h * 0.03):int(h * 0.97), int(w * 0.02):int(w * 0.98)]
     else:
         clean_crop = plate_crop
 
-    target_h = 48
+    target_h = 64
     ch, cw = clean_crop.shape[:2]
-    scale = target_h / float(ch)
-    proc_crop = cv2.resize(clean_crop, (int(cw * scale), target_h), interpolation=cv2.INTER_CUBIC if ch < target_h else cv2.INTER_AREA)
+    scale = target_h / float(max(1, ch))
+    resized_crop = cv2.resize(clean_crop, (max(16, int(cw * scale)), target_h), interpolation=cv2.INTER_CUBIC if ch < target_h else cv2.INTER_AREA)
+    # Tambahkan border 6px atas/bawah & 8px kiri/kanan agar PP-OCRv6_medium_det tidak memotong karakter di ujung plat
+    proc_crop = cv2.copyMakeBorder(resized_crop, 6, 6, 8, 8, cv2.BORDER_REPLICATE)
 
-    items = paddle_engine.run(proc_crop)
+    gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
+    mean_brightness = float(gray.mean())
+    p50_brightness = float(np.median(gray))
+    contrast_std = float(gray.std())
+    is_dark_or_black_plate = (p50_brightness < 82.0 and mean_brightness < 100.0)
+
+    # Pre-normalisasi cepat (< 0.8ms) sebelum Pass 1:
+    # - Jika plat hitam pekat (huruf putih di latar hitam), langsung gunakan hasil invert + CLAHE sebagai Pass 1 utama
+    # - Jika plat putih namun kontras pudar/blur (std < 42), tajamkan dengan CLAHE + Unsharp Mask ringan
+    if is_dark_or_black_plate:
+        pass1_crop = invert_and_enhance_dark_plate(proc_crop, gray=gray)
+    elif contrast_std < 42.0:
+        pass1_crop = enhance_moving_plate_crop(proc_crop)
+    else:
+        pass1_crop = proc_crop
+
+    items = paddle_engine.run(pass1_crop)
 
     def _has_valid_complete_plate(item_list):
         if not item_list:
@@ -1559,44 +1587,37 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fall
         float(it.get("conf", 0.0) or 0.0) >= 0.70
         for it in items
     )
-    has_meaningful_pass1 = any(
-        len(re.sub(r'[^A-Z0-9]', '', str(it.get("text", "")).upper())) >= 4 and not is_tax_date(str(it.get("text", "")))
-        for it in items
-    )
 
-    # Hindari multi-pass berulang jika Pass 1 sudah menangkap plat nomor (valid penuh atau partial berkeyakinan tinggi)
     is_realtime_stream = should_skip_fallbacks is not None
-    should_try_multipass = allow_multipass and not has_valid_init and not has_strong_partial and not (should_skip_fallbacks and should_skip_fallbacks())
+    # Jika di mode stream Pass 1 sama sekali belum mendapatkan struktur valid dan tidak di-preempt:
+    # izinkan 1 fallback cepat pada crop asli/enhanced jika Pass 1 tadi menggunakan invert (atau sebaliknya pada plat gelap)
     if is_realtime_stream:
-        # Nonaktifkan multi-pass di real-time stream agar OCR responsif (< 800ms)
-        should_try_multipass = False
+        if not has_valid_init and not has_strong_partial and not (should_skip_fallbacks and should_skip_fallbacks()):
+            if is_dark_or_black_plate:
+                alt_items = paddle_engine.run(proc_crop)
+                if alt_items:
+                    items.extend(alt_items)
+            elif mean_brightness < 95.0:
+                inv_items = paddle_engine.run(invert_and_enhance_dark_plate(proc_crop, gray=gray))
+                if inv_items:
+                    items.extend(inv_items)
     else:
-        should_try_multipass = should_try_multipass and h >= 22
+        should_try_multipass = allow_multipass and not has_valid_init and not has_strong_partial and h >= 22 and not (should_skip_fallbacks and should_skip_fallbacks())
+        if should_try_multipass:
+            if is_dark_or_black_plate:
+                orig_items = paddle_engine.run(proc_crop)
+                if orig_items:
+                    items.extend(orig_items)
+            elif mean_brightness < 98.0:
+                inv_items = paddle_engine.run(invert_and_enhance_dark_plate(proc_crop, gray=gray))
+                if inv_items:
+                    items.extend(inv_items)
 
-    if should_try_multipass:
-        gray = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2GRAY)
-        mean_brightness = float(gray.mean())
-        p50_brightness = float(np.median(gray))
-        is_dark_or_black_plate = (p50_brightness < 85.0 and mean_brightness < 105.0)
-
-        # Pass 2: Inverted image (untuk plat sangat gelap di mode stream, atau plat hitam < 95 di mode foto statis)
-        inv_thresh = 75.0 if is_realtime_stream else 95.0
-        if mean_brightness < inv_thresh:
-            inv = cv2.bitwise_not(proc_crop)
-            inv_items = paddle_engine.run(inv)
-            if inv_items:
-                items.extend(inv_items)
-
-        # Pass 3: CLAHE contrast enhancement hanya untuk foto statis (bukan stream real-time)
-        if not is_realtime_stream and h >= 22 and not _has_valid_complete_plate(items):
-            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-            lab = cv2.cvtColor(proc_crop, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            l2 = clahe.apply(l)
-            enhanced = cv2.cvtColor(cv2.merge((l2, a, b)), cv2.COLOR_LAB2BGR)
-            clahe_items = paddle_engine.run(enhanced)
-            if clahe_items:
-                items.extend(clahe_items)
+            if not _has_valid_complete_plate(items) and contrast_std >= 42.0:
+                enhanced = enhance_moving_plate_crop(proc_crop)
+                clahe_items = paddle_engine.run(enhanced)
+                if clahe_items:
+                    items.extend(clahe_items)
 
     non_date_items = []
     seen_texts = set()
@@ -1758,31 +1779,38 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
         if j_nospace and j_nospace not in candidates_to_try:
             candidates_to_try.append(j_nospace)
 
-    # Jika PaddleOCR membaca angka + seri akhir secara jelas (misal "2866 PBM" atau "902 JRN") namun huruf prefix terpotong di tepi,
+    # Jika PaddleOCR membaca angka + seri akhir secara jelas (misal "2866 PBM", "902 JRN", atau tanpa spasi "1363BJB") namun huruf prefix terpotong di tepi,
     # gabungkan huruf prefix dari char_raw (misal "B...") sebelum jatuh ke char_raw utuh.
-    if c_raw and p_raw:
-        c_clean_pref = re.sub(r'[^A-Z0-9]', '', c_raw)
-        p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t]
-        if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
-            for pref_len in (2, 1):
-                if len(c_clean_pref) >= pref_len + 2:
-                    cand_pref = pref_map.get(c_clean_pref[:pref_len], c_clean_pref[:pref_len])
-                    if cand_pref in SAMSAT_PREFIXES:
-                        fused = f"{cand_pref} {p_tokens[0]} {p_tokens[1]}"
-                        if fused not in candidates_to_try:
-                            candidates_to_try.insert(0, fused)
-                        break
+    p_clean_nospace = re.sub(r'[^A-Z0-9]', '', p_raw) if p_raw else ""
+    m_no_pref = re.match(r'^([1-9]\d{0,3})([A-Z0-9]{1,3})$', p_clean_nospace) if p_clean_nospace else None
+    p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t] if p_raw else []
+    missing_pref_parts = None
+    if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
+        missing_pref_parts = (p_tokens[0], p_tokens[1])
+    elif m_no_pref and any(ch.isalpha() for ch in m_no_pref.group(2)):
+        missing_pref_parts = (m_no_pref.group(1), m_no_pref.group(2))
 
-    # Jika char_raw tidak ada atau tidak membaca prefix tapi token Paddle berupa 2 token valid (misal "902 JRN") dengan suffix Jabodetabek,
+    if c_raw and missing_pref_parts:
+        c_clean_pref = re.sub(r'[^A-Z0-9]', '', c_raw)
+        d_part, s_part = missing_pref_parts
+        for pref_len in (2, 1):
+            if len(c_clean_pref) >= pref_len + 2:
+                cand_pref = pref_map.get(c_clean_pref[:pref_len], c_clean_pref[:pref_len])
+                if cand_pref in SAMSAT_PREFIXES:
+                    fused = f"{cand_pref} {d_part} {s_part}"
+                    if fused not in candidates_to_try:
+                        candidates_to_try.insert(0, fused)
+                    break
+
+    # Jika char_raw tidak ada atau tidak membaca prefix tapi Paddle membaca angka + suffix valid (misal "902 JRN" atau "1363BJB") dengan suffix Jabodetabek,
     # tawarkan kandidat prefix 'B' sebagai kandidat
-    if p_raw:
-        p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', p_raw).split() if t]
-        if len(p_tokens) == 2 and p_tokens[0].isdigit() and (1 <= len(p_tokens[0]) <= 4) and not p_tokens[0].startswith('0') and any(ch.isalpha() for ch in p_tokens[1]):
-            s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in p_tokens[1]])
-            if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')):
-                fused_b = f"B {p_tokens[0]} {s_cand}"
-                if fused_b not in candidates_to_try:
-                    candidates_to_try.append(fused_b)
+    if missing_pref_parts:
+        d_part, s_part = missing_pref_parts
+        s_cand = ''.join([suff_map.get(ch, ch) if ch.isdigit() else ch for ch in s_part])
+        if s_cand.startswith(('B', 'P', 'S', 'T', 'U', 'E', 'Z', 'F', 'K', 'W', 'C', 'N', 'V', 'R', 'H', 'J')):
+            fused_b = f"B {d_part} {s_cand}"
+            if fused_b not in candidates_to_try:
+                candidates_to_try.append(fused_b)
 
     if c_raw and c_raw not in candidates_to_try and not is_tax_date(c_raw):
         candidates_to_try.append(c_raw)
@@ -1801,10 +1829,12 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
                     parsed = f"B {p_parts[1]} {p_parts[2]}"
                     p_parts = parsed.split()
 
-                # Jika PaddleOCR dan Character Model memiliki angka tengah yang identik namun huruf terakhir PaddleOCR adalah N/W/H
-                # sedangkan Character Model membaca huruf terakhir sebagai M (misal PBN/PBW/PEH vs PBM), gunakan seri akhir Character Model!
-                if len(p_parts) == 3 and len(c_parts) == 3:
-                    if p_parts[0] == c_parts[0] and p_parts[1] == c_parts[1] and len(p_parts[2]) == len(c_parts[2]) >= 2:
+                if len(p_parts) == 3 and len(c_parts) == 3 and p_parts[0] == c_parts[0] and p_parts[1] == c_parts[1]:
+                    # 1. Jika seri akhir PaddleOCR terpotong 1 huruf di tepi kanan (misal 'BJ' vs 'BJB'), lengkapi dari Character Model!
+                    if len(c_parts[2]) > len(p_parts[2]) and c_parts[2].startswith(p_parts[2]):
+                        return f"{p_parts[0]} {p_parts[1]} {c_parts[2]}"
+                    # 2. Jika huruf terakhir PaddleOCR adalah N/W/H sedangkan Character Model membaca M (misal PBN/PBW/PEH vs PBM), gunakan seri akhir Character Model!
+                    if len(p_parts[2]) == len(c_parts[2]) >= 2:
                         if p_parts[2][-1] in ('N', 'W', 'H') and c_parts[2][-1] == 'M' and p_parts[2][0] == c_parts[2][0]:
                             return f"{p_parts[0]} {p_parts[1]} {c_parts[2]}"
                 return parsed
@@ -1830,14 +1860,15 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     allow_multi = bool(h >= 38 if is_realtime_stream else h >= 20)
 
     # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~45ms)
-    # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.52),
-    # langsung selesaikan tanpa memanggil PaddleOCR yang berat (menghemat ~1500ms CPU!)
+    # Hanya langsung return tanpa PaddleOCR jika confidence rata-rata sangat tinggi (>= 0.76) dan setiap karakter jelas (>= 0.58).
+    # Jika di bawah itu, simpan di cache untuk digabungkan (ensemble fusion) dengan hasil PaddleOCR!
     cached_char_res = None
     if h >= 22:
         c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
         c_raw_fast = c_raw_fast.upper()
         cached_char_res = (c_raw_fast, c_conf_fast, line1_fast)
-        if len(line1_fast) >= 5 and c_conf_fast >= 0.52:
+        min_char_conf = min((d["conf"] for d in line1_fast), default=0.0)
+        if len(line1_fast) >= 5 and c_conf_fast >= 0.76 and min_char_conf >= 0.58:
             c_fused_fast = refine_indonesian_plate(c_raw_fast)
             is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
             if is_c_valid:
@@ -1858,20 +1889,22 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
         plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
     )
     paddle_raw = paddle_raw.upper()
-    p_refined = refine_indonesian_plate("", paddle_raw, all_paddle)
+    c_cached_str = cached_char_res[0] if cached_char_res else ""
+    c_cached_conf = cached_char_res[1] if cached_char_res else 0.0
+    p_refined = refine_indonesian_plate(c_cached_str, paddle_raw, all_paddle) or refine_indonesian_plate("", paddle_raw, all_paddle)
     is_p_valid, _ = is_valid_indonesian_plate_structure(p_refined or paddle_raw)
 
     # Fast Path A: Jika crop asli menghasilkan plat nomor berstruktur valid dengan confidence >= 0.45, langsung selesaikan!
     if is_p_valid and (paddle_conf >= 0.45 or (p_refined and len(p_refined.split()) == 3)):
-        final_formatted = p_refined or refine_indonesian_plate("", paddle_raw, all_paddle)
+        final_formatted = p_refined or refine_indonesian_plate(c_cached_str, paddle_raw, all_paddle)
         if final_formatted:
             return {
                 "final": final_formatted,
-                "char_raw": cached_char_res[0] if cached_char_res else "",
-                "char_conf": cached_char_res[1] if cached_char_res else 0.0,
+                "char_raw": c_cached_str,
+                "char_conf": c_cached_conf,
                 "paddle_raw": paddle_raw,
                 "paddle_conf": paddle_conf,
-                "confidence": paddle_conf,
+                "confidence": max(paddle_conf, c_cached_conf * 0.95) if paddle_conf >= 0.45 else max(paddle_conf, c_cached_conf),
                 "method": "fast_paddle_direct"
             }
 
