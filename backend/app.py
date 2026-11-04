@@ -1820,6 +1820,8 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
+    raw_plate_crop = plate_crop
+
     # Adaptive OCR multi-pass gating:
     # Untuk crop kecil (h < 38px), gunakan single-pass cepat agar tidak membuang waktu CPU di frame jauh,
     # dan biarkan frame berikutnya yang lebih dekat & besar diproses secara multi-pass.
@@ -1830,9 +1832,11 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~45ms)
     # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.52),
     # langsung selesaikan tanpa memanggil PaddleOCR yang berat (menghemat ~1500ms CPU!)
+    cached_char_res = None
     if h >= 22:
         c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
         c_raw_fast = c_raw_fast.upper()
+        cached_char_res = (c_raw_fast, c_conf_fast, line1_fast)
         if len(line1_fast) >= 5 and c_conf_fast >= 0.52:
             c_fused_fast = refine_indonesian_plate(c_raw_fast)
             is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
@@ -1863,8 +1867,8 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
         if final_formatted:
             return {
                 "final": final_formatted,
-                "char_raw": "",
-                "char_conf": 0.0,
+                "char_raw": cached_char_res[0] if cached_char_res else "",
+                "char_conf": cached_char_res[1] if cached_char_res else 0.0,
                 "paddle_raw": paddle_raw,
                 "paddle_conf": paddle_conf,
                 "confidence": paddle_conf,
@@ -1872,11 +1876,15 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
             }
 
     # Fast Path B: Jika PaddleOCR membaca angka + seri akhir (misal '2157 PZU') namun kehilangan prefix di tepi,
-    # panggil char_model cepat (~50ms) untuk melengkapi huruf depan ('B') sebelum jatuh ke enhancement/CLAHE berat (~5000ms)!
+    # gunakan hasil char_model yang sudah di-cache (atau panggil char_model jika belum) untuk melengkapi huruf depan ('B')!
     p_tokens = [t for t in re.sub(r'[^A-Z0-9]', ' ', paddle_raw).split() if t]
     if len(p_tokens) >= 2 and any(ch.isalpha() for ch in p_tokens[-1]):
-        c_raw, c_conf, _ = read_plate_with_char_model(plate_crop, conf=0.18)
-        c_raw = c_raw.upper()
+        if cached_char_res is not None:
+            c_raw, c_conf, _ = cached_char_res
+        else:
+            c_raw, c_conf, line1_c = read_plate_with_char_model(plate_crop, conf=0.18)
+            c_raw = c_raw.upper()
+            cached_char_res = (c_raw, c_conf, line1_c)
         fused = refine_indonesian_plate(c_raw, paddle_raw, all_paddle)
         if fused and is_valid_indonesian_plate_structure(fused)[0]:
             return {
@@ -1951,20 +1959,25 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None):
     # langsung kembalikan tanpa char_model. Namun jika sudah ada >= 3 digit atau plat hitam/gelap, jalankan char_model untuk melengkapi!
     p_digits_count = sum(c.isdigit() for c in paddle_raw)
     if is_realtime_stream and (plate_crop.shape[0] < 38 or p_digits_count < 3):
-        final_formatted = refine_indonesian_plate("", paddle_raw, all_paddle)
+        c_cached_str = cached_char_res[0] if cached_char_res else ""
+        c_cached_conf = cached_char_res[1] if cached_char_res else 0.0
+        final_formatted = refine_indonesian_plate(c_cached_str, paddle_raw, all_paddle)
         return {
             "final": final_formatted,
-            "char_raw": "",
-            "char_conf": 0.0,
+            "char_raw": c_cached_str,
+            "char_conf": c_cached_conf,
             "paddle_raw": paddle_raw,
             "paddle_conf": paddle_conf,
-            "confidence": paddle_conf if final_formatted else 0.0,
+            "confidence": max(paddle_conf, c_cached_conf) if final_formatted else 0.0,
             "method": "fast_small_crop_skip"
         }
 
-    # 2. Pembacaan via Character Model (Corroborating Fast YOLO pada crop asli tanpa artefak sharpening)
-    char_raw, char_conf, line1_chars = read_plate_with_char_model(raw_plate_crop, conf=0.16 if is_dark_plate else 0.18)
-    char_raw = char_raw.upper()
+    # 2. Pembacaan via Character Model (Gunakan hasil cache jika sudah dievaluasi pada crop yang sama)
+    if cached_char_res is not None and not is_dark_plate:
+        char_raw, char_conf, line1_chars = cached_char_res
+    else:
+        char_raw, char_conf, line1_chars = read_plate_with_char_model(raw_plate_crop, conf=0.16 if is_dark_plate else 0.18)
+        char_raw = char_raw.upper()
     c_clean = re.sub(r'[^A-Z0-9]', '', char_raw)
 
     # 2b. Fallback Deskew hanya untuk mode foto statis (should_skip_fallbacks is None)
@@ -3607,7 +3620,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and not alignment_only:
+            if not valid_crops and not alignment_only and (attempt_count % 3 == 0):
                 with plate_infer_lock:
                     pdet_legacy = plate_model_legacy.predict(padded_crop, conf=min(PLATE_INFER_CONF, 0.12), imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
@@ -3628,8 +3641,8 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         score = p_conf * y_factor
                         valid_crops.append((abs_box, p_conf, score))
 
-            # Fallback B: Contrast Enhancement (CLAHE) for dark/shadowed vehicles
-            if not valid_crops and not alignment_only and padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+            # Fallback B: Contrast Enhancement (CLAHE) for dark/shadowed vehicles (throttled in stream mode)
+            if not valid_crops and not alignment_only and (attempt_count % 3 == 0) and padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
                 try:
                     lab = cv2.cvtColor(padded_crop, cv2.COLOR_BGR2LAB)
                     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -3906,8 +3919,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
                 t_conf = time.time()
                 print(f"[PERF_LATENCY] [CONFIRMATION: track_id={track_id} plate='{confirmed_data.get('license_plate')}' time={t_conf:.3f} reason='{track.confirmation_reason}']", flush=True)
 
-        # Siarkan pembaruan OCR langsung ke WebSocket tanpa menunggu konfirmasi
-        if update_info:
+        # Siarkan pembaruan OCR langsung ke WebSocket hanya jika ada kandidat plat yang terbaca (cegah broadcast kosong 'Plat: (-)')
+        if update_info and update_info.get("ocr_candidate"):
             cand_count = update_info.get("candidate_matches", 0)
             ocr_stat = "CONFIRMED" if update_info["is_confirmed"] else ("GOOD_CANDIDATE" if cand_count >= 2 else "ANALYZING")
             ws_broadcaster.broadcast({
@@ -4725,6 +4738,7 @@ def live_ws(ws):
                                 "frame_age_ms": int(frame_wait_sec * 1000),
                                 "latency_ms": 0,
                                 "processing_ms": 0,
+                                "stale_dropped": True,
                                 "detections": [],
                                 "interest_area": INTEREST_AREA
                             })

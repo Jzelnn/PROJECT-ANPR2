@@ -1507,9 +1507,9 @@ async function performDetectCycle(silent=true){
   // 1-in-flight backpressure protection: Do not send a new frame if previous is still processing
   const nowMs = Date.now();
   if (inFlightFrameId !== null) {
-    // Watchdog: If frame in flight took > 1800ms, release it to prevent permanent deadlock
-    if (nowMs - inFlightFrameTime > 1800) {
-      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 1.8s, resetting backpressure.`);
+    // Watchdog: If frame in flight took > 3500ms, release it to prevent permanent deadlock
+    if (nowMs - inFlightFrameTime > 3500) {
+      console.warn(`[IN_FLIGHT_TIMEOUT] Frame ${inFlightFrameId} timed out after 3.5s, resetting backpressure.`);
       inFlightFrameId = null;
     } else {
       return;
@@ -2965,8 +2965,13 @@ function handleWsMessage(msg){
       drawRoiBox(currentRoi);
     }
   } else if (msg.type === "detection_update"){
-    // Release in-flight backpressure
-    inFlightFrameId = null;
+    // Release in-flight backpressure only if this response matches or is newer than the current in-flight frame
+    if (msg.frame_id == null || inFlightFrameId == null || msg.frame_id >= inFlightFrameId) {
+      inFlightFrameId = null;
+    }
+    if (msg.stale_dropped) {
+      return;
+    }
     // Realtime detection broadcast from StreamInferenceWorker or live_ws via WebSocket
     const wsNow = Date.now() / 1000.0;
     const frameAge = msg.capture_timestamp
