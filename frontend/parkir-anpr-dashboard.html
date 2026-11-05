@@ -944,6 +944,11 @@ async function triggerRpiKitCapture(){
 
     if (data.detections && data.detections.length > 0){
       const det = data.detections[0];
+      const detMs = det.processing_ms || det.latency_ms || (data.detection_time_sec ? Math.round(data.detection_time_sec * 1000) : 0);
+      det.latency_ms = detMs;
+      det.processing_ms = detMs;
+      if (detMs > 0) updateLatencyIndicator(detMs);
+      lastActiveTrackId = det.track_id;
       lastDetectionData = det;
       drawBoxes(det);
       if (det.is_newly_confirmed) {
@@ -1477,7 +1482,7 @@ async function runContinuousDetectLoop(){
   if (!isCameraConnected || !isContinuousDetectActive) return;
 
   const src = document.getElementById('camSourceSelect').value;
-  const isServerStream = (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream');
+  const isServerStream = (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream' || src === 'video_file');
 
   // For server streams: StreamInferenceWorker pushes detection_update via WebSocket in real-time.
   // No HTTP polling needed — simply exit and let WS onmessage drive all UI updates.
@@ -1500,7 +1505,7 @@ async function performDetectCycle(silent=true){
 
   const src = document.getElementById('camSourceSelect').value;
   // Mode Stream: Server streams run automatically via StreamInferenceWorker over WebSocket
-  if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream'){
+  if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream' || src === 'video_file'){
     return;
   }
 
@@ -1854,6 +1859,7 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     det.latency_ms = detMs;
     det.processing_ms = detMs;
     if (detMs > 0) updateLatencyIndicator(detMs);
+    lastActiveTrackId = det.track_id;
     lastDetectionData = det;
     const feedImg = document.getElementById('feedImg');
     if (data.result_image || data.annotated_image) {
@@ -1923,8 +1929,20 @@ document.getElementById('videoFileInput').addEventListener('change', async (e) =
   document.getElementById('autoScanWrap').style.display = "inline-flex";
   document.getElementById('chkAutoScan').checked = true;
 
-  updateLiveIndicator(true, "VIDEO LIVE");
+  updateLiveIndicator(true, "VIDEO LIVE (STREAM)");
   showToast(`Video "${file.name}" dimuat - Real-time ANPR aktif!`);
+
+  // Kirim video ke backend untuk disiarkan sebagai stream CCTV asinkron via StreamInferenceWorker
+  const formData = new FormData();
+  formData.append("video", file);
+  fetch(`http://${HOST}:5001/api/upload_video`, { method: "POST", body: formData })
+    .then(r => r.json())
+    .then(res => {
+      console.log("[VIDEO_UPLOAD_BACKEND] Video streaming asynchronously on server:", res);
+    })
+    .catch(err => {
+      console.warn("[VIDEO_UPLOAD_WARN] Could not post video to server:", err);
+    });
 
   // Mulai loop deteksi otomatis secara hands-free pada video yang sedang berputar
   startContinuousAutoDetect();
@@ -2326,6 +2344,11 @@ function updateResultCard(det, detMs){
   if (bStyle && bStyle.toLowerCase() !== vType.toLowerCase()){
     tagBody.style.display = 'inline-block';
     tagBody.textContent = bStyle;
+    tagBody.style.opacity = '1';
+  } else if (det.body_pending) {
+    tagBody.style.display = 'inline-block';
+    tagBody.textContent = 'Bodi: memproses...';
+    tagBody.style.opacity = '0.7';
   } else {
     tagBody.style.display = 'none';
   }
@@ -2517,14 +2540,13 @@ function formatEntryHistoryBodyStyle(det){
     return bs;
   }
   if (det && det.body_pending) {
-    return 'Classifying...';
+    return 'Bodi: memproses...';
   }
-  return 'Unknown';
+  return typeLabel[det?.vehicle_type] || det?.vehicle_type || 'Mobil';
 }
 
 function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null, vehConf=null){
   const cleanBody = bodyStyle != null ? String(bodyStyle).trim() : '';
-  if (!cleanBody || cleanBody === '-' || cleanBody.toUpperCase() === 'UNKNOWN') return;
   const logList = document.getElementById('logList');
   if (!logList) return;
 
@@ -2538,29 +2560,35 @@ function updateEntryHistoryBodyStyle(trackId, bodyStyle, recordId, bodyConf=null
     for (const r of rows) {
       const createdEpoch = parseInt(r.getAttribute('data-created-epoch') || '0', 10);
       const existingBs = r.getAttribute('data-body-style') || '';
-      if ((!existingBs || existingBs === 'Classifying...' || existingBs === 'Unknown') && (createdEpoch === 0 || (nowEpoch - createdEpoch) < 60)) {
+      if ((!existingBs || existingBs.includes('memproses') || existingBs === 'Classifying...' || existingBs === 'Unknown') && (createdEpoch === 0 || (nowEpoch - createdEpoch) < 60)) {
         targetRow = r;
         break;
       }
     }
   }
   if (targetRow) {
-    targetRow.setAttribute('data-body-style', cleanBody);
-    const bodyLbl = targetRow.querySelector('.log-body-label');
-    if (bodyLbl) {
-      bodyLbl.textContent = cleanBody;
-    }
-    const bConfVal = (bodyConf != null && bodyConf > 0) ? bodyConf : null;
-    let bConfEl = targetRow.querySelector('.log-body-conf');
-    if (bConfVal != null) {
-      const bConfScore = `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bConfVal * 100)}%">${Math.round(bConfVal * 100)}%</span>`;
-      if (bConfEl) {
-        bConfEl.outerHTML = bConfScore;
-      } else if (bodyLbl && bodyLbl.parentElement) {
-        bodyLbl.insertAdjacentHTML('afterend', bConfScore);
+    if (cleanBody && cleanBody !== '-' && cleanBody.toUpperCase() !== 'UNKNOWN') {
+      targetRow.setAttribute('data-body-style', cleanBody);
+      const bodyLbl = targetRow.querySelector('.log-body-label');
+      if (bodyLbl) {
+        bodyLbl.textContent = cleanBody;
       }
-    } else if (bConfEl) {
-      bConfEl.remove();
+      const bConfVal = (bodyConf != null && bodyConf > 0) ? bodyConf : null;
+      let bConfEl = targetRow.querySelector('.log-body-conf');
+      if (bConfVal != null) {
+        const bConfScore = `<span class="log-body-conf" style="font-size:10.5px; background:#f3f4f6; color:#4b5563; padding:1px 5px; border-radius:4px; margin-left:3px; font-weight:600; font-family:'IBM Plex Mono',monospace;" title="Confidence Tipe Bodi: ${Math.round(bConfVal * 100)}%">${Math.round(bConfVal * 100)}%</span>`;
+        if (bConfEl) {
+          bConfEl.outerHTML = bConfScore;
+        } else if (bodyLbl && bodyLbl.parentElement) {
+          bodyLbl.insertAdjacentHTML('afterend', bConfScore);
+        }
+      }
+    } else {
+      // Body style failed or timed out: remove "Bodi: memproses..."
+      const bodyLbl = targetRow.querySelector('.log-body-label');
+      if (bodyLbl && bodyLbl.textContent.includes('memproses')) {
+        bodyLbl.textContent = targetRow.getAttribute('data-vtype') || 'Mobil';
+      }
     }
 
     const vConfVal = (vehConf != null && !isNaN(vehConf) && vehConf > 0) ? vehConf : null;

@@ -2043,16 +2043,38 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
 
 def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None, is_stream=False):
     """
-    Pembacaan plat nomor murni Single-Pass via PaddleOCR (hanya 1x pass inferensi):
-    Langsung memproses crop plat nomor dengan 1 pass PaddleOCR tanpa ekstra fallback
-    atau multipass, sehingga latensi pemrosesan gambar konsisten ~400-500ms dan
-    total response time selalu di bawah 1 detik (< 1000ms).
+    Pembacaan plat nomor Single-Pass via PaddleOCR + verifikasi sel piksel (~6ms)
+    dengan Fast-Path Char Model (~35ms) agar latensi foto selalu di bawah 1 detik.
     """
     t_ens_start = time.time()
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
     raw_plate_crop = plate_crop
+    h = plate_crop.shape[0]
+
+    # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~35ms)
+    # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.55),
+    # langsung selesaikan tanpa memanggil PaddleOCR yang lebih berat (menghemat ~450ms CPU!)
+    if h >= 22:
+        c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
+        c_raw_fast = c_raw_fast.upper()
+        if len(line1_fast) >= 5 and c_conf_fast >= 0.55:
+            c_fused_fast = refine_indonesian_plate(c_raw_fast)
+            is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
+            if is_c_valid:
+                c_parts = c_fused_fast.split()
+                if len(c_parts) == 3 and (1 <= len(c_parts[1]) <= 4) and len(c_parts[2]) >= 2:
+                    c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused_fast, vehicle_type=vehicle_type)
+                    return {
+                        "final": c_fixed or c_fused_fast,
+                        "char_raw": c_raw_fast,
+                        "char_conf": c_conf_fast,
+                        "paddle_raw": "",
+                        "paddle_conf": 0.0,
+                        "confidence": c_conf_fast,
+                        "method": "fast_char_yolo_direct"
+                    }
 
     # 1. Pembacaan Murni Single-Pass via PaddleOCR (tepat 1x pass)
     paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
@@ -2362,6 +2384,7 @@ class VehicleTrack:
         self.last_plate_attempt_time = 0.0
         self.last_plate_update_time = 0.0
         self.plate_attempt_count = 0
+        self.ocr_attempt_count = 0
         self.frames_since_plate_det = 0
         self.velocity = [0.0, 0.0]
         self.track_confidence = 0.0
@@ -3144,18 +3167,22 @@ class VehicleConfirmationManager:
             self.next_fallback_id = 1
             self.primary_track_id = None
 
-    def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080, frame_id=None):
+    def get_or_create_track(self, raw_tid, bbox, img_w=1920, img_h=1080, frame_id=None, is_stream=True):
         """Ambil atau buat track sebelum plate/OCR agar job asinkron tidak kehilangan target."""
         with self.lock:
             if raw_tid is not None:
                 tid = raw_tid
-            else:
+            elif is_stream:
                 matched_id = self._match_track(bbox, img_w=img_w, img_h=img_h, iou_thresh=0.20)
                 if matched_id is not None:
                     tid = matched_id
                 else:
                     tid = self.next_fallback_id
                     self.next_fallback_id += 1
+            else:
+                # Mode Foto Manual: Setiap foto adalah kendaraan independen dengan Track ID unik!
+                tid = self.next_fallback_id
+                self.next_fallback_id += 1
             if tid not in self.tracks:
                 self.tracks[tid] = VehicleTrack(tid, None)
                 if bbox:
@@ -3284,6 +3311,11 @@ class VehicleConfirmationManager:
                         self.next_fallback_id += 1
                     tid = det["track_id"]
 
+                    trk = self.tracks.get(tid)
+                    if trk:
+                        trk.last_seen = now
+                        trk.plate_detected = bool(det.get("plate_bbox") or det.get("plate_detected"))
+
                     det["inside_interest_area"] = True
                     det["lost_interest"] = False
                     det["last_seen"] = now
@@ -3302,9 +3334,15 @@ class VehicleConfirmationManager:
                         det["consistency"] = 1.0
                         det["is_newly_confirmed"] = True
                         det["confirmation_time"] = now_ts
+                        if trk:
+                            trk.status = "CONFIRMED"
+                            trk.is_locked = True
+                            trk.confirmed_data = det.copy()
+                            if det.get("plate_bbox"):
+                                trk.last_plate_bbox = det.get("plate_bbox")
                         print(f"""[CONFIRMATION]
 track={tid}
-plate=\"{p_clean}\"
+plate="{p_clean}"
 reason=SINGLE_PHOTO_FAST_PATH (conf={p_conf:.2f})
 time_from_good_ocr_to_confirmation_ms=0.0""")
                     else:
@@ -3314,6 +3352,8 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                         det["is_newly_confirmed"] = False
                         det["analyzing_frame_count"] = 1
                         det["analyzing_max_frames"] = 3
+                        if trk:
+                            trk.status = "ANALYZING"
                     det.pop("plate_crop", None)
                 return detections
 
@@ -3626,6 +3666,17 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
             track = confirmation_manager.tracks.get(track_id)
             if track:
                 track.body_pending = False
+            for r in LATEST_RECORDS:
+                if r.get("track_id") == track_id and r.get("body_pending"):
+                    r["body_pending"] = False
+                    break
+        ws_broadcaster.broadcast({
+            "type": "body_update",
+            "track_id": track_id,
+            "body_style": None,
+            "body_pending": False,
+            "error": str(e)
+        })
 
 
 def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_time, initial_vtype="car", frame_id=None, capture_timestamp=None, alignment_only=False):
@@ -3818,20 +3869,25 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         crop_h, crop_w = plate_crop.shape[:2] if (plate_crop is not None and plate_crop.size > 0) else (0, 0)
                         min_crop_w = 64 if full_img.shape[1] >= 800 else 40
                         min_crop_h = 24 if full_img.shape[1] >= 800 else 16
-                        # Mulai membaca OCR sejak Frame 1 saat bumper/plat baru masuk area ROI
-                        # agar ketika mobil sudah masuk penuh dan berhenti sejenak, hasil sudah siap
+                        # Sweet Spot Trigger Filter:
+                        # Picu OCR hanya jika ukuran plat cukup (tinggi >= 24px) dan ketajaman (Laplacian var >= 25.0),
+                        # serta batasi maksimal 5 pembacaan OCR per kendaraan agar CPU tidak terbebani terus-menerus.
                         if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
-                            crop_q = compute_crop_quality(plate_crop, plate_conf_val)
-                            if not track.ocr_pending:
-                                job_id = get_next_ocr_job_id()
-                                track.ocr_pending = True
-                                track.last_ocr_job_id = job_id
-                                ocr_to_submit = (job_id, track_id, plate_crop, crop_q, full_img, time.time(), frame_id, capture_timestamp)
-                            else:
-                                # Replace pending OCR crop only if none is queued or new crop is not degraded
-                                if track.pending_ocr_job is None or crop_q >= (track.pending_ocr_job[3] or 0.0) * 0.90:
+                            gray_crop = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                            sharpness = float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
+                            if sharpness >= 25.0 and getattr(track, 'ocr_attempt_count', 0) < 5:
+                                crop_q = compute_crop_quality(plate_crop, plate_conf_val)
+                                if not track.ocr_pending:
+                                    track.ocr_attempt_count = getattr(track, 'ocr_attempt_count', 0) + 1
                                     job_id = get_next_ocr_job_id()
-                                    track.pending_ocr_job = (job_id, track_id, plate_crop, crop_q, full_img, time.time(), frame_id, capture_timestamp)
+                                    track.ocr_pending = True
+                                    track.last_ocr_job_id = job_id
+                                    ocr_to_submit = (job_id, track_id, plate_crop, crop_q, full_img, time.time(), frame_id, capture_timestamp)
+                                else:
+                                    # Replace pending OCR crop only if none is queued or new crop is not degraded
+                                    if track.pending_ocr_job is None or crop_q >= (track.pending_ocr_job[3] or 0.0) * 0.90:
+                                        job_id = get_next_ocr_job_id()
+                                        track.pending_ocr_job = (job_id, track_id, plate_crop, crop_q, full_img, time.time(), frame_id, capture_timestamp)
 
         if abs_plate_bbox is not None and updated_ok:
             t_plate_sent = time.time()
@@ -4321,7 +4377,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             vehicle_crop = img[y1:y2, x1:x2]
 
             tid, existing_trk = confirmation_manager.get_or_create_track(
-                cand_track_id, [x1, y1, x2, y2], img_w=iw, img_h=ih, frame_id=frame_id
+                cand_track_id, [x1, y1, x2, y2], img_w=iw, img_h=ih, frame_id=frame_id, is_stream=is_stream
             )
             cand_track_id = tid
             existing_trk.vehicle_infer_ms = pure_infer_ms
@@ -4463,13 +4519,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 })
 
             else:
-                # Single Photo Mode: Concurrent body style + plate OCR
-                t_b0 = time.time()
-                body_future = body_executor.submit(
-                    classify_vehicle_indonesian,
-                    img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
-                )
-
+                # Single Photo Mode: Plat Keluar Dulu, Bodi Menyusul Asinkron
                 plate_conf_val = None
                 abs_plate_bbox = None
                 plate_crop = np.array([])
@@ -4548,10 +4598,6 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                 if plate_crop.size > 0:
                     t_o0 = time.time()
-                    # Hard Latency Budget: Jika total waktu upload mendekati 1.75 detik, lewati fallback berat
-                    # agar total latency selalu berada di kisaran target < 2000ms!
-                    def _upload_budget_guard():
-                        return (time.time() - t_start) >= 1.75
                     ensemble_res = ensemble_plate_reading(
                         plate_crop,
                         should_skip_fallbacks=None,
@@ -4563,22 +4609,41 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
                     t_ocr_total += (time.time() - t_o0)
 
-                try:
-                    vehicle_type, body_style, body_style_conf = body_future.result(timeout=1.0)
-                except Exception:
-                    vehicle_type, body_style, body_style_conf = initial_vtype, None, None
-                t_body_total += (time.time() - t_b0)
+                # Tahap Bodi Asinkron: Plat keluar dulu, bodi menyusul di background
+                vehicle_type = initial_vtype
+                body_style = None
+                body_style_conf = None
+                body_pending = (initial_vtype != "motorcycle")
+                t_body_total = 0.0
 
                 effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
                 if abs_plate_bbox is not None:
                     existing_trk.update_plate_bbox(abs_plate_bbox, [x1, y1, x2, y2], frame_id=frame_id)
+
+                # Picu klasifikasi bodi asinkron SETELAH OCR selesai agar tidak bersaing CPU
+                if body_pending:
+                    existing_trk.body_pending = True
+                    body_executor.submit(
+                        _async_body_task,
+                        cand_track_id,
+                        img.copy(),
+                        [x1, y1, x2, y2],
+                        initial_vtype,
+                        v_conf,
+                        has_bus_det,
+                        body_hints,
+                        frame_id,
+                        capture_timestamp,
+                        time.time()
+                    )
 
                 results_out.append({
                     "track_id": cand_track_id,
                     "frame_id": frame_id,
                     "vehicle_type": vehicle_type,
                     "body_style": body_style,
-                    "body_style_confidence": round(body_style_conf, 3) if body_style_conf else None,
+                    "body_style_confidence": None,
+                    "body_pending": body_pending,
                     "license_plate": plate_text,
                     "ocr_method": ocr_method,
                     "vehicle_confidence": round(v_conf, 3),
