@@ -93,8 +93,8 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 384))           # 384 for fast CPU detection (< 150ms)
 VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 384))  # 384 for fast real-time stream vehicle detection (~160ms on CPU)
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.25))
-VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.18))
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.35))
+VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.28))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.25))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.15))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
@@ -3247,6 +3247,14 @@ class VehicleConfirmationManager:
             if is_stale_time or trk.lifecycle_state in ("EXPIRED", "DISCARDED"):
                 continue
 
+            # Anti Ghost-Box: Jangan mencocokkan deteksi baru ke track yang sudah CONFIRMED/HISTORY_SAVED dan sudah mulai keluar
+            is_confirmed_and_exited = (
+                (trk.is_locked or trk.status in ("CONFIRMED", "HISTORY_SAVED")) and
+                (trk.lost_interest or trk.lifecycle_state in ("EXITING", "LOST") or getattr(trk, "frames_outside_after_inside", 0) > 0)
+            )
+            if is_confirmed_and_exited:
+                continue
+
             if trk.last_bbox:
                 iou = compute_iou(bbox, trk.last_bbox)
                 tx1, ty1, tx2, ty2 = trk.last_bbox
@@ -4233,9 +4241,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             continue
 
         if v_conf < threshold:
-            # Toleransi adaptif untuk mobil hitam / kondisi malam (0.22 <= v_conf < threshold):
+            # Toleransi adaptif untuk mobil hitam / kondisi malam (0.30 <= v_conf < threshold):
             # Diizinkan jika kondisi ROI gelap ATAU bodi kendaraan berwarna gelap/hitam (box_brightness < 82) dengan proporsi fisik mobil normal.
-            if v_conf >= 0.22 and y1 > int(ih * 0.04) and (0.40 <= (bw / float(max(1, bh))) <= 1.65):
+            if v_conf >= 0.30 and y1 > int(ih * 0.04) and (0.40 <= (bw / float(max(1, bh))) <= 1.65):
                 box_sample = img[max(0, y1):min(ih, y2):6, max(0, x1):min(iw, x2):6]
                 box_brightness = float(box_sample.mean()) if box_sample.size > 0 else 128.0
                 if not (is_low_light or box_brightness < 82.0):

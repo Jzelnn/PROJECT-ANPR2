@@ -1482,7 +1482,7 @@ async function runContinuousDetectLoop(){
   if (!isCameraConnected || !isContinuousDetectActive) return;
 
   const src = document.getElementById('camSourceSelect').value;
-  const isServerStream = (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream' || src === 'video_file');
+  const isServerStream = (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream');
 
   // For server streams: StreamInferenceWorker pushes detection_update via WebSocket in real-time.
   // No HTTP polling needed — simply exit and let WS onmessage drive all UI updates.
@@ -1491,7 +1491,7 @@ async function runContinuousDetectLoop(){
     return;
   }
 
-  // Webcam / video_file sources: WebSocket stream is not active, use fast loop
+  // Webcam / video_file sources: WebSocket stream is driven by frame capture loop
   while (isCameraConnected && isContinuousDetectActive){
     if (!isScanning){
       await performDetectCycle(true);
@@ -1505,7 +1505,7 @@ async function performDetectCycle(silent=true){
 
   const src = document.getElementById('camSourceSelect').value;
   // Mode Stream: Server streams run automatically via StreamInferenceWorker over WebSocket
-  if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream' || src === 'video_file'){
+  if (src === 'hikvision_isapi' || src === 'cctv_rtsp' || src === 'droidcam_stream' || src === 'rpi_stream' || src === 'zerotier_stream'){
     return;
   }
 
@@ -1784,15 +1784,13 @@ function handleDetectionResult(data, silent=false){
       console.log(`[TRACK_EXITED_ROI] track_id=${lastActiveTrackId}`);
     }
     lastActiveTrackId = null;
+    lastDetectionData = null;
     clearBoxes();
     if (!usingBackendAnnotatedImage) {
       drawRoiBox(currentRoi);
     }
-    if (consecutiveEmptyCycles >= 2) {
-      lastDetectionData = null;
-      updateResultCard(null, 0);
-      updateTelemetry(null);
-    }
+    updateResultCard(null, 0);
+    updateTelemetry(null);
     if (!silent){
       const timeMs = detMs > 0 ? ` (${detMs} ms)` : '';
       showToast(`Frame terpindai, tidak ada kendaraan di area deteksi${timeMs}.`);
@@ -1929,20 +1927,8 @@ document.getElementById('videoFileInput').addEventListener('change', async (e) =
   document.getElementById('autoScanWrap').style.display = "inline-flex";
   document.getElementById('chkAutoScan').checked = true;
 
-  updateLiveIndicator(true, "VIDEO LIVE (STREAM)");
+  updateLiveIndicator(true, "VIDEO LIVE");
   showToast(`Video "${file.name}" dimuat - Real-time ANPR aktif!`);
-
-  // Kirim video ke backend untuk disiarkan sebagai stream CCTV asinkron via StreamInferenceWorker
-  const formData = new FormData();
-  formData.append("video", file);
-  fetch(`http://${HOST}:5001/api/upload_video`, { method: "POST", body: formData })
-    .then(r => r.json())
-    .then(res => {
-      console.log("[VIDEO_UPLOAD_BACKEND] Video streaming asynchronously on server:", res);
-    })
-    .catch(err => {
-      console.warn("[VIDEO_UPLOAD_WARN] Could not post video to server:", err);
-    });
 
   // Mulai loop deteksi otomatis secara hands-free pada video yang sedang berputar
   startContinuousAutoDetect();
