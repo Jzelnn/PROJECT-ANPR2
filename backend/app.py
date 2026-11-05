@@ -3279,7 +3279,11 @@ class VehicleConfirmationManager:
                     is_valid_struct, p_type = is_valid_indonesian_plate_structure(p_text)
                     p_clean = re.sub(r'[^A-Z0-9]', '', p_text.upper()) if p_text else ""
 
-                    det["track_id"] = 1
+                    if det.get("track_id") is None:
+                        det["track_id"] = self.next_fallback_id
+                        self.next_fallback_id += 1
+                    tid = det["track_id"]
+
                     det["inside_interest_area"] = True
                     det["lost_interest"] = False
                     det["last_seen"] = now
@@ -3299,7 +3303,7 @@ class VehicleConfirmationManager:
                         det["is_newly_confirmed"] = True
                         det["confirmation_time"] = now_ts
                         print(f"""[CONFIRMATION]
-track=1
+track={tid}
 plate=\"{p_clean}\"
 reason=SINGLE_PHOTO_FAST_PATH (conf={p_conf:.2f})
 time_from_good_ocr_to_confirmation_ms=0.0""")
@@ -5154,6 +5158,7 @@ def detect():
         if result.get("detections"):
             primary_det = result["detections"][0]
             primary_det["latency_ms"] = ai_total_ms
+            primary_det["processing_ms"] = ai_total_ms
             if primary_det.get("is_newly_confirmed"):
                 rec = save_parking_record(primary_det, source_img=img)
                 primary_det["record"] = rec

@@ -1850,8 +1850,9 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
     }
 
     const det = data.detections[0];
-    const detMs = data.detection_time_sec ? Math.round(data.detection_time_sec * 1000) : 0;
+    const detMs = det.processing_ms || det.latency_ms || (data.detection_time_sec ? Math.round(data.detection_time_sec * 1000) : 0);
     det.latency_ms = detMs;
+    det.processing_ms = detMs;
     if (detMs > 0) updateLatencyIndicator(detMs);
     lastDetectionData = det;
     const feedImg = document.getElementById('feedImg');
@@ -1868,10 +1869,18 @@ document.getElementById('fileInput').addEventListener('change', async (e) => {
       drawBoxes(det);
     }
     updateResultCard(det, detMs);
-    if (det.is_newly_confirmed) {
+    if (det.is_newly_confirmed || det.status === 'CONFIRMED') {
       addLogRow(det);
+      const recKey = `${det.license_plate}_${det.id || det.track_id}`;
+      if (!window._lastLoggedRecordKeys) window._lastLoggedRecordKeys = new Set();
+      if (!window._lastLoggedRecordKeys.has(recKey)) {
+        window._lastLoggedRecordKeys.add(recKey);
+        setTimeout(() => window._lastLoggedRecordKeys && window._lastLoggedRecordKeys.delete(recKey), 3000);
+        console.log(`[ANPR_ENTRY_CONFIRMED] Track #${det.track_id || '-'} | Plat: ${det.license_plate} | Kendaraan: ${det.vehicle_type} (${det.body_style || '-'}) | Durasi: ${detMs}ms`);
+      }
       showToast("Photo processed & recorded to Entry History!");
     } else {
+      console.log(`[ANPR_PHOTO_PROCESSED] Track #${det.track_id || '-'} | Plat: ${det.license_plate || '-'} | Status: ${det.status} | Durasi: ${detMs}ms`);
       showToast("Photo processed: plate confidence too low (<80%) to record in Entry History.");
     }
 
@@ -2665,8 +2674,9 @@ function addLogRow(det, isInit=false){
     const rowPlate = targetRow.getAttribute('data-plate');
     const rowTime = parseInt(targetRow.getAttribute('data-created-epoch') || '0', 10);
 
-    const isSameRecentTrack = (!isInit && det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 45 && rowTime > 0));
-    const isSameRecentPlate = (targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean) && (!isInit ? (nowEpoch - rowTime < 45 && rowTime > 0) : cleanP(rowPlate) === targetClean));
+    const isSimilarOrSamePlate = targetClean && rowPlate && isSimilarPlate(cleanP(rowPlate), targetClean);
+    const isSameRecentTrack = (!isInit && det.track_id && rowTrack && String(rowTrack) === String(det.track_id) && (nowEpoch - rowTime < 45 && rowTime > 0) && isSimilarOrSamePlate);
+    const isSameRecentPlate = (isSimilarOrSamePlate && (!isInit ? (nowEpoch - rowTime < 45 && rowTime > 0) : cleanP(rowPlate) === targetClean));
 
     if (isSameRecentTrack || isSameRecentPlate) {
       // Perbarui baris yang sudah ada jika nomor plat, body style, confidence, atau processing_ms lebih lengkap
@@ -3176,7 +3186,13 @@ function handleWsMessage(msg){
         selectHistoryRecord(msg.record);
       }
       addLogRow(msg.record);
-      console.log(`[ANPR_ENTRY_CONFIRMED] Track #${msg.record.track_id || '-'} | Plat: ${msg.record.license_plate} | Kendaraan: ${msg.record.vehicle_type} (${msg.record.body_style || '-'}) | Durasi: ${msg.record.processing_ms || 0}ms`);
+      const recKey = `${msg.record.license_plate}_${msg.record.id || msg.record.track_id}`;
+      if (!window._lastLoggedRecordKeys) window._lastLoggedRecordKeys = new Set();
+      if (!window._lastLoggedRecordKeys.has(recKey)) {
+        window._lastLoggedRecordKeys.add(recKey);
+        setTimeout(() => window._lastLoggedRecordKeys && window._lastLoggedRecordKeys.delete(recKey), 3000);
+        console.log(`[ANPR_ENTRY_CONFIRMED] Track #${msg.record.track_id || '-'} | Plat: ${msg.record.license_plate} | Kendaraan: ${msg.record.vehicle_type} (${msg.record.body_style || '-'}) | Durasi: ${msg.record.processing_ms || 0}ms`);
+      }
       showToast(`Entry Confirmed: #${msg.record.track_id || ''} ${msg.record.license_plate}`);
     }
   }
