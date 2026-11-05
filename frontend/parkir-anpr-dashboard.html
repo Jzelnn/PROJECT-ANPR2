@@ -678,18 +678,19 @@ setInterval(updateClock, 1000);
 // GLOBAL STATE & VARIABLES
 // ============================================================
 const HOST = (window.location.hostname && window.location.hostname !== 'localhost') ? window.location.hostname : '127.0.0.1';
-const API_URL = `http://${HOST}:5001/api/detect`;
-const RPI_CAPTURE_URL = `http://${HOST}:5001/api/rpi/capture`;
-const STREAM_CAPTURE_URL = `http://${HOST}:5001/api/stream/capture`;
-const RPI_PING_URL = `http://${HOST}:5001/api/rpi/ping`;
-const HISTORY_URL = `http://${HOST}:5001/api/history`;
-const EXPORT_URL = `http://${HOST}:5001/api/export`;
-const LIVE_STREAM_URL = `http://${HOST}:5001/api/live_stream`;
-const STREAM_START_URL = `http://${HOST}:5001/api/stream/start`;
-const STREAM_STOP_URL = `http://${HOST}:5001/api/stream/stop`;
-const STREAM_STATUS_URL = `http://${HOST}:5001/api/stream/status`;
-const DETECT_CURRENT_URL = `http://${HOST}:5001/api/detect_current`;
-const WS_URL = `${(location.protocol === 'https:' ? 'wss://' : 'ws://')}${HOST}:5001/ws/live`;
+const PORT = (window.location.port && window.location.port !== '') ? window.location.port : (window.ANPR_PORT || '5050');
+const API_URL = `http://${HOST}:${PORT}/api/detect`;
+const RPI_CAPTURE_URL = `http://${HOST}:${PORT}/api/rpi/capture`;
+const STREAM_CAPTURE_URL = `http://${HOST}:${PORT}/api/stream/capture`;
+const RPI_PING_URL = `http://${HOST}:${PORT}/api/rpi/ping`;
+const HISTORY_URL = `http://${HOST}:${PORT}/api/history`;
+const EXPORT_URL = `http://${HOST}:${PORT}/api/export`;
+const LIVE_STREAM_URL = `http://${HOST}:${PORT}/api/live_stream`;
+const STREAM_START_URL = `http://${HOST}:${PORT}/api/stream/start`;
+const STREAM_STOP_URL = `http://${HOST}:${PORT}/api/stream/stop`;
+const STREAM_STATUS_URL = `http://${HOST}:${PORT}/api/stream/status`;
+const DETECT_CURRENT_URL = `http://${HOST}:${PORT}/api/detect_current`;
+const WS_URL = `${(location.protocol === 'https:' ? 'wss://' : 'ws://')}${HOST}:${PORT}/ws/live`;
 const typeLabel = {car: "Mobil", motorcycle: "Motor", bus: "Bus", truck: "Truk"};
 
 let isCameraConnected = false;
@@ -939,7 +940,7 @@ async function triggerRpiKitCapture(){
 
     // Display the newly captured frame in feed body
     const feedBody = document.getElementById('feedBody');
-    const imgUrl = data.image_url ? `http://localhost:5001${data.image_url}` : "http://localhost:5001/captures/temp_upload.jpg?" + new Date().getTime();
+    const imgUrl = data.image_url ? `http://${HOST}:${PORT}${data.image_url}` : `http://${HOST}:${PORT}/captures/temp_upload.jpg?` + new Date().getTime();
     feedBody.innerHTML = `<div class="feed-wrap"><img id="feedImg" src="${imgUrl}"></div><canvas id="captureCanvas" style="display:none;"></canvas>`;
 
     if (data.detections && data.detections.length > 0){
@@ -2730,7 +2731,7 @@ function addLogRow(det, isInit=false){
       };
       if (det.snapshot_url) {
         targetRow.setAttribute('data-snapshot', det.snapshot_url);
-        targetRow.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+        targetRow.ondblclick = () => window.open(`http://${HOST}:${PORT}${det.snapshot_url}`, '_blank');
       }
       return;
     }
@@ -2757,7 +2758,7 @@ function addLogRow(det, isInit=false){
   };
   if (det.snapshot_url) {
     row.setAttribute('data-snapshot', det.snapshot_url);
-    row.ondblclick = () => window.open(`http://${HOST}:5001${det.snapshot_url}`, '_blank');
+    row.ondblclick = () => window.open(`http://${HOST}:${PORT}${det.snapshot_url}`, '_blank');
   }
   
   row.innerHTML = `

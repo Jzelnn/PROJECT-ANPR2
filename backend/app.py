@@ -5617,19 +5617,58 @@ def rpi_capture():
 
 if __name__ == "__main__":
     import subprocess
+    import sys
+    import socket
+
+    # Dukungan port fleksibel: argumen baris perintah (--port X atau X), environment variable, atau default
+    chosen_port = None
+    for idx_arg, arg_val in enumerate(sys.argv[1:]):
+        if arg_val.isdigit():
+            chosen_port = int(arg_val)
+            break
+        elif arg_val in ("--port", "-p") and idx_arg + 1 < len(sys.argv[1:]):
+            nxt = sys.argv[1:][idx_arg + 1]
+            if nxt.isdigit():
+                chosen_port = int(nxt)
+                break
+
+    if chosen_port is None:
+        env_port = os.environ.get("ANPR_PORT") or os.environ.get("PORT")
+        if env_port and env_port.isdigit():
+            chosen_port = int(env_port)
+
+    # Daftar kandidat port jika port default sedang bentrok/dipakai proses lain
+    candidate_ports = [chosen_port] if chosen_port else [5001, 5050, 8000, 8080, 5000]
+
+    def _is_port_in_use(p):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(('127.0.0.1', p)) == 0
+
+    target_port = None
+    for p in candidate_ports:
+        if not _is_port_in_use(p):
+            target_port = p
+            break
+
+    if target_port is None:
+        target_port = candidate_ports[0]
+
     my_pid = os.getpid()
-    try:
-        out = subprocess.check_output("netstat -ano", shell=True, text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            if ":5001 " in line and "LISTENING" in line:
-                parts = line.split()
-                pid = int(parts[-1])
-                if pid != my_pid and pid > 0:
-                    print(f"[STARTUP] Menghentikan proses server lama di port 5001 (PID={pid})...", flush=True)
-                    subprocess.call(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    if os.name == 'nt':
+        try:
+            out = subprocess.check_output("netstat -ano", shell=True, text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if f":{target_port} " in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = int(parts[-1])
+                    if pid != my_pid and pid > 0:
+                        print(f"[STARTUP] Menghentikan proses lama di port {target_port} (PID={pid})...", flush=True)
+                        subprocess.call(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     print("\n=======================================================")
-    print("🚀 Server ANPR jalan di http://localhost:5001 (Single-Pass PaddleOCR)")
+    print(f"🚀 Server ANPR jalan di http://0.0.0.0:{target_port} (Single-Pass PaddleOCR)")
+    print(f"🌐 Akses Dashboard dari PC / Browser: http://<IP_KOMPUTER>:{target_port}")
     print("=======================================================\n", flush=True)
-    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=target_port, debug=False, threaded=True)
