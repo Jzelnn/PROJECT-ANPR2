@@ -678,7 +678,7 @@ setInterval(updateClock, 1000);
 // GLOBAL STATE & VARIABLES
 // ============================================================
 const HOST = (window.location.hostname && window.location.hostname !== 'localhost') ? window.location.hostname : '127.0.0.1';
-const PORT = (window.location.port && window.location.port !== '') ? window.location.port : (window.ANPR_PORT || '5050');
+const PORT = (window.location.port && window.location.port !== '') ? window.location.port : (window.ANPR_PORT || '5001');
 const API_URL = `http://${HOST}:${PORT}/api/detect`;
 const RPI_CAPTURE_URL = `http://${HOST}:${PORT}/api/rpi/capture`;
 const STREAM_CAPTURE_URL = `http://${HOST}:${PORT}/api/stream/capture`;
