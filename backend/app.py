@@ -1760,12 +1760,12 @@ def verify_and_fix_plate_digits(plate_crop, parsed_plate, vehicle_type=None, all
     return f"{pref} {''.join(d_list)} {suff}"
 
 
-def read_plate_with_paddleocr(plate_crop, allow_multipass=True, should_skip_fallbacks=None):
+def read_plate_with_paddleocr(plate_crop, allow_multipass=False, should_skip_fallbacks=None):
     """
-    Membaca teks plat nomor menggunakan PaddleOCR dengan:
-    1. Normalisasi ukuran native PP-OCRv6 (height 48px + border replikasi agar huruf tepi 'B'/seri akhir tidak terpotong DBNet).
-    2. 2-Step Shear Rectification otomatis untuk plat miring (Camera PML51) tanpa memotong sudut karakter.
-    3. Eliminasi tanggal pajak, penyusunan multi-token, dan verifikasi sel digit piksel.
+    Membaca teks plat nomor menggunakan PaddleOCR murni Single-Pass (1x inferensi):
+    1. Normalisasi ukuran target_h=40px dengan border replikasi agar karakter tepi tidak terpotong.
+    2. Satu kali inferensi langsung via paddle_engine.run(pass1_crop) (~400ms).
+    3. Eliminasi tanggal pajak Samsat, perakitan kandidat nomor plat, dan seleksi confidence.
     """
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
@@ -2041,42 +2041,20 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     return ""
 
 
-def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None):
+def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None, is_stream=False):
     """
-    Pembacaan plat nomor Single-Pass via PaddleOCR + verifikasi sel piksel (~6ms)
-    dengan Fast-Path Char Model (~35ms) agar latensi foto selalu di bawah 1 detik.
+    Pembacaan plat nomor murni Single-Pass via PaddleOCR (hanya 1x pass inferensi):
+    Langsung memproses crop plat nomor dengan 1 pass PaddleOCR tanpa ekstra fallback
+    atau multipass, sehingga latensi pemrosesan gambar konsisten ~400-500ms dan
+    total response time selalu di bawah 1 detik (< 1000ms).
     """
     t_ens_start = time.time()
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
     raw_plate_crop = plate_crop
-    h = plate_crop.shape[0]
 
-    # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~35ms)
-    # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.55),
-    # langsung selesaikan tanpa memanggil PaddleOCR yang lebih berat (menghemat ~450ms CPU!)
-    if h >= 22:
-        c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
-        c_raw_fast = c_raw_fast.upper()
-        if len(line1_fast) >= 5 and c_conf_fast >= 0.55:
-            c_fused_fast = refine_indonesian_plate(c_raw_fast)
-            is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
-            if is_c_valid:
-                c_parts = c_fused_fast.split()
-                if len(c_parts) == 3 and (1 <= len(c_parts[1]) <= 4) and len(c_parts[2]) >= 2:
-                    c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused_fast, vehicle_type=vehicle_type)
-                    return {
-                        "final": c_fixed or c_fused_fast,
-                        "char_raw": c_raw_fast,
-                        "char_conf": c_conf_fast,
-                        "paddle_raw": "",
-                        "paddle_conf": 0.0,
-                        "confidence": c_conf_fast,
-                        "method": "fast_char_yolo_direct"
-                    }
-
-    # 1. Pembacaan Single-Pass via PaddleOCR (hanya 1x inferensi + verifikasi sel digit ~6ms)
+    # 1. Pembacaan Murni Single-Pass via PaddleOCR (tepat 1x pass)
     paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
         plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
     )
@@ -3961,7 +3939,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
         res = ensemble_plate_reading(
             crop,
             should_skip_fallbacks=lambda: _should_skip_ocr_fallbacks(track_id, crop_q),
-            vehicle_type=track_vtype
+            vehicle_type=track_vtype,
+            is_stream=True
         )
         t_ocr_end = time.time()
         ocr_duration_ms = (t_ocr_end - t_ocr_start) * 1000.0
@@ -4571,8 +4550,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                         return (time.time() - t_start) >= 1.75
                     ensemble_res = ensemble_plate_reading(
                         plate_crop,
-                        should_skip_fallbacks=_upload_budget_guard,
-                        vehicle_type=initial_vtype
+                        should_skip_fallbacks=None,
+                        vehicle_type=initial_vtype,
+                        is_stream=False
                     )
                     plate_text = ensemble_res.get("final")
                     ocr_method = ensemble_res.get("method")
