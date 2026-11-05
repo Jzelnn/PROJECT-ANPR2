@@ -979,10 +979,30 @@ async function testRpiPing(){
   btn.disabled = true;
   btn.textContent = "Testing...";
   try {
-    const resp = await fetch(`${RPI_PING_URL}?rpi_url=${encodeURIComponent(rpiUrl)}`);
-    const data = await resp.json();
-    if (data.status === "online"){
-      showToast(`Raspberry Pi is ONLINE (HTTP ${data.code})`);
+    let isOnline = false;
+    let code = 200;
+    try {
+      const resp = await fetch(`${RPI_PING_URL}?rpi_url=${encodeURIComponent(rpiUrl)}`);
+      const data = await resp.json();
+      if (data.status === "online"){
+        isOnline = true;
+        code = data.code || 200;
+      }
+    } catch(errBE) {
+      // Fallback: Ping langsung dari browser ke IP Raspberry Pi jika backend laptop belum aktif
+      try {
+        const directResp = await fetch(rpiUrl, { method: 'GET', mode: 'cors' });
+        if (directResp.ok || directResp.status < 500) {
+          isOnline = true;
+          code = directResp.status;
+        }
+      } catch(errDirect) {
+        throw new Error("Backend ANPR di laptop belum dinyalakan ('python backend/app.py') atau IP Raspberry Pi salah.");
+      }
+    }
+
+    if (isOnline){
+      showToast(`Raspberry Pi is ONLINE (HTTP ${code})`);
       updateLiveIndicator(true, "ONLINE");
     } else {
       alert(`Could not connect to Raspberry Pi at ${rpiUrl}.\n\nMake sure the Raspberry Pi is turned on and connected to the same WiFi.`);
