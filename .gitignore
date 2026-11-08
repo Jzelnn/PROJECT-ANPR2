@@ -34,3 +34,7 @@ test/scratch/
 *.ipynb
 .ipynb_checkpoints/
 
+
+# Local scratch & archives
+scratch/
+*.zip

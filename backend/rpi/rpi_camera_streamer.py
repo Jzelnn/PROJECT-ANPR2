@@ -1,35 +1,60 @@
-﻿"""
-Script Streaming Kamera untuk Raspberry Pi
+"""
+Script Streaming & Snapshot Kamera untuk Raspberry Pi
 Jalankan file ini di Raspberry Pi Anda:
-    python3 rpi_camera_streamer.py
+    python3 backend/rpi/rpi_camera_streamer.py
 
-Video akan dipancarkan di:
-    http://<IP-Raspberry-Pi>:8080/video_feed
+Mendukung:
+1. Video Stream MJPEG: http://<IP-Raspberry-Pi>:8080/video_feed
+2. Snapshot Jepret Foto: http://<IP-Raspberry-Pi>:8080/capture_image
 """
 
 import cv2
-from flask import Flask, Response
+import threading
+from flask import Flask, Response, jsonify
 
 app = Flask(__name__)
 
-# Gunakan index 0 untuk USB Webcam atau Pi Camera (V4L2)
-# Jika memakai Picamera2 di RPi 4/5, Anda juga bisa menggantinya dengan modul picamera2.
-camera = cv2.VideoCapture(0)
+# Otomatis cari index kamera yang aktif (0, 1, atau 2)
+camera = None
+for cam_idx in [0, 1, 2]:
+    cap = cv2.VideoCapture(cam_idx)
+    if cap.isOpened():
+        ret, test_frame = cap.read()
+        if ret and test_frame is not None:
+            camera = cap
+            print(f"✅ Kamera Raspberry Pi aktif di device index {cam_idx}")
+            break
+        cap.release()
 
-# Set resolusi streaming optimal untuk transmisi jaringan nirkabel (WiFi)
+if camera is None:
+    print("⚠️ Membuka default kamera index 0...")
+    camera = cv2.VideoCapture(0)
+
+# Set resolusi streaming optimal untuk WiFi
 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 camera.set(cv2.CAP_PROP_FPS, 30)
 
+camera_lock = threading.Lock()
+
+def read_frame():
+    """Mengambil 1 frame secara thread-safe."""
+    with camera_lock:
+        if not camera.isOpened():
+            return False, None
+        return camera.read()
+
 def generate_mjpeg():
     """Mengambil frame dari kamera dan membroadcast dalam format MJPEG stream."""
     while True:
-        success, frame = camera.read()
-        if not success:
+        success, frame = read_frame()
+        if not success or frame is None:
             continue
         
         # Kompres ke JPEG kualitas 80% (ringan dan jernih)
         ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        if not ret:
+            continue
         frame_bytes = buffer.tobytes()
 
         yield (b'--frame\r\n'
@@ -37,7 +62,11 @@ def generate_mjpeg():
 
 @app.route('/')
 def index():
-    return "<h3>Kamera Raspberry Pi ANPR Aktif!</h3><p>Stream URL: <a href='/video_feed'>/video_feed</a></p>"
+    return "<h3>Kamera Raspberry Pi ANPR Aktif!</h3><p>Stream: <a href='/video_feed'>/video_feed</a> | Snapshot: <a href='/capture_image'>/capture_image</a></p>"
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({"status": "online", "code": 200, "device": "Raspberry Pi Camera Streamer"})
 
 @app.route('/video_feed')
 def video_feed():
@@ -45,9 +74,24 @@ def video_feed():
     return Response(generate_mjpeg(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/capture_image', methods=['GET', 'POST'])
+@app.route('/capture', methods=['GET', 'POST'])
+def capture_snapshot():
+    """Endpoint Snapshot 1 foto untuk tombol Capture & Scan di dashboard."""
+    success, frame = read_frame()
+    if not success or frame is None:
+        return Response("Gagal membaca kamera", status=500, mimetype="text/plain")
+    
+    ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    if not ret:
+        return Response("Gagal encode JPEG", status=500, mimetype="text/plain")
+    
+    return Response(buffer.tobytes(), mimetype='image/jpeg')
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("🎥 Raspberry Pi Camera Streamer Aktif!")
-    print("Hubungkan dari Laptop di: http://<IP-Raspberry-Pi>:8080/video_feed")
+    print("🎥 Raspberry Pi Camera Streamer & Snapshot Aktif!")
+    print("Stream URL:   http://<IP-Raspberry-Pi>:8080/video_feed")
+    print("Snapshot URL: http://<IP-Raspberry-Pi>:8080/capture_image")
     print("=" * 60)
     app.run(host='0.0.0.0', port=8080, threaded=True)

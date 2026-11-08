@@ -20,7 +20,7 @@ start "" cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:5001"
 if exist "C:\Users\Lenovo\AppData\Local\Programs\Python\Python39\python.exe" (
     "C:\Users\Lenovo\AppData\Local\Programs\Python\Python39\python.exe" backend\app.py
 ) else (
-    py -3.9 backend\app.py
+    python backend\app.py
 )
 
 pause

@@ -5534,51 +5534,83 @@ def rpi_capture():
     rpi_url = data.get("rpi_url", "http://192.168.1.4:5000").rstrip("/")
 
     try:
+        image_bytes = None
         cap_url = f"{rpi_url}/capture_image"
         print(f"[INFO] Memanggil ALPR Kit RPi: {cap_url}")
-        r = requests.get(cap_url, timeout=12)
+        r = None
+        try:
+            r_try = requests.get(cap_url, timeout=5)
+            if r_try.status_code == 200:
+                r = r_try
+        except Exception as e_cap:
+            print(f"[WARN] capture_image gagal: {e_cap}")
 
-        image_bytes = None
-        content_type = r.headers.get("Content-Type", "")
-
-        # Kasus A: Respons langsung berupa binary gambar
-        if "image" in content_type:
-            image_bytes = r.content
-        else:
-            # Kasus B: Respons JSON berisi path gambar atau base64
+        if r is None:
             try:
-                res_json = r.json()
+                cap_url2 = f"{rpi_url}/capture"
+                r_try2 = requests.get(cap_url2, timeout=5)
+                if r_try2.status_code == 200:
+                    r = r_try2
             except Exception:
-                res_json = {}
+                pass
 
-            img_path = res_json.get("image_path") or res_json.get("path")
-            if not img_path and isinstance(res_json.get("data"), dict):
-                img_path = res_json["data"].get("image_path")
+        # Fallback otomatis ke stream MJPEG jika endpoint snapshot tidak ada
+        if r is None:
+            stream_target = rpi_url if "/video_feed" in rpi_url else f"{rpi_url.rstrip('/')}/video_feed"
+            print(f"[INFO] Mencoba mengambil 1 frame langsung dari stream MJPEG: {stream_target}")
+            try:
+                vcap = cv2.VideoCapture(stream_target)
+                if vcap.isOpened():
+                    ok, frm = vcap.read()
+                    vcap.release()
+                    if ok and frm is not None:
+                        _, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        image_bytes = buf.tobytes()
+                        print(f"[INFO] Berhasil mengambil frame dari stream: {len(image_bytes)} bytes")
+            except Exception as e_stream:
+                print(f"[WARN] Fallback stream frame grab gagal: {e_stream}")
 
-            if img_path:
-                get_img_url = f"{rpi_url}/get_image"
-                print(f"[INFO] Mengunduh foto hasil jepretan dari RPi: {get_img_url} ({img_path})")
-                r_img = requests.post(get_img_url, json={"image_path": img_path}, timeout=12)
-                if "image" in r_img.headers.get("Content-Type", ""):
-                    image_bytes = r_img.content
-                else:
-                    try:
-                        j_img = r_img.json()
-                        b64_str = j_img.get("image") or j_img.get("image_base64") or j_img.get("data")
-                        if b64_str:
-                            if "," in b64_str:
-                                b64_str = b64_str.split(",")[1]
-                            image_bytes = base64.b64decode(b64_str)
-                    except Exception:
-                        image_bytes = r_img.content
-            elif res_json.get("image_base64") or res_json.get("image"):
-                b64_str = res_json.get("image_base64") or res_json.get("image")
-                if "," in b64_str:
-                    b64_str = b64_str.split(",")[1]
-                image_bytes = base64.b64decode(b64_str)
+        if image_bytes is None and r is not None:
+            content_type = r.headers.get("Content-Type", "")
+
+            # Kasus A: Respons langsung berupa binary gambar
+            if "image" in content_type:
+                image_bytes = r.content
             else:
-                if len(r.content) > 1000:
-                    image_bytes = r.content
+                # Kasus B: Respons JSON berisi path gambar atau base64
+                try:
+                    res_json = r.json()
+                except Exception:
+                    res_json = {}
+
+                img_path = res_json.get("image_path") or res_json.get("path")
+                if not img_path and isinstance(res_json.get("data"), dict):
+                    img_path = res_json["data"].get("image_path")
+
+                if img_path:
+                    get_img_url = f"{rpi_url}/get_image"
+                    print(f"[INFO] Mengunduh foto hasil jepretan dari RPi: {get_img_url} ({img_path})")
+                    r_img = requests.post(get_img_url, json={"image_path": img_path}, timeout=12)
+                    if "image" in r_img.headers.get("Content-Type", ""):
+                        image_bytes = r_img.content
+                    else:
+                        try:
+                            j_img = r_img.json()
+                            b64_str = j_img.get("image") or j_img.get("image_base64") or j_img.get("data")
+                            if b64_str:
+                                if "," in b64_str:
+                                    b64_str = b64_str.split(",")[1]
+                                image_bytes = base64.b64decode(b64_str)
+                        except Exception:
+                            image_bytes = r_img.content
+                elif res_json.get("image_base64") or res_json.get("image"):
+                    b64_str = res_json.get("image_base64") or res_json.get("image")
+                    if "," in b64_str:
+                        b64_str = b64_str.split(",")[1]
+                    image_bytes = base64.b64decode(b64_str)
+                else:
+                    if len(r.content) > 1000:
+                        image_bytes = r.content
 
         if not image_bytes or len(image_bytes) < 100:
             return jsonify({
