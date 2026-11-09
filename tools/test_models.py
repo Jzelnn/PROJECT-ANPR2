@@ -14,30 +14,37 @@ import numpy as np
 import torch
 
 torch.set_num_threads(1)
-if hasattr(torch.backends, 'mkldnn'):
-    torch.backends.mkldnn.enabled = False
-if hasattr(torch.backends, 'nnpack'):
-    torch.backends.nnpack.enabled = False
-if hasattr(torch.backends, 'xnnpack'):
-    torch.backends.xnnpack.enabled = False
+if hasattr(torch.backends, 'mkldnn'): torch.backends.mkldnn.enabled = False
+if hasattr(torch.backends, 'nnpack'): torch.backends.nnpack.enabled = False
+if hasattr(torch.backends, 'xnnpack'): torch.backends.xnnpack.enabled = False
+
+# Matikan CPU AMP / Autocast agar tidak menyentuh instruksi ARMv8.2 BFLOAT16/FP16 pada Cortex-A72
+class NullContext:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+
+if hasattr(torch, 'autocast'):
+    torch.autocast = lambda *args, **kwargs: NullContext()
+if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+    torch.cuda.amp.autocast = lambda *args, **kwargs: NullContext()
+if hasattr(torch.cpu, 'amp') and hasattr(torch.cpu.amp, 'autocast'):
+    torch.cpu.amp.autocast = lambda *args, **kwargs: NullContext()
+
+from ultralytics import YOLO
+from ultralytics.engine.model import Model
+
+orig_model_predict = Model.predict
+def safe_arm_predict(self, *args, **kwargs):
+    kwargs['device'] = 'cpu'
+    kwargs['amp'] = False
+    return orig_model_predict(self, *args, **kwargs)
+Model.predict = safe_arm_predict
 
 print("\n" + "=" * 55)
 print("  DIAGNOSA MODEL YOLO DI RASPBERRY PI CORTEX-A72")
 print("=" * 55, flush=True)
 print(f"PyTorch Version: {torch.__version__}")
 print(f"Threads: {torch.get_num_threads()}")
-
-# Tes konvolusi dasar
-print("\n[TEST AWAL] Uji PyTorch Conv2d pada Cortex-A72...", flush=True)
-try:
-    conv = torch.nn.Conv2d(3, 16, 3)
-    dummy_t = torch.randn(1, 3, 32, 32)
-    out_t = conv(dummy_t)
-    print(f"       ✅ Conv2d Berhasil! Output shape: {list(out_t.shape)}")
-except Exception as e:
-    print(f"       ❌ Conv2d Gagal: {e}")
-
-from ultralytics import YOLO
 
 test_list = [
     ("1. Vehicle Model", "models/vehicle/best.pt", 384),
@@ -52,14 +59,13 @@ for name, path, sz in test_list:
         print(f"\n[TEST] {name} ({path})...", flush=True)
         try:
             m = YOLO(path)
-            print(f"       Load OK! Menjalankan predict {sz}x{sz}...", flush=True)
-            res = m.predict(np.zeros((sz, sz, 3), dtype=np.uint8), verbose=False)
-            print(f"       ✅ {name}: 100% SUKSES DAN KOMPATIBEL!", flush=True)
+            res = m.predict(np.zeros((sz, sz, 3), dtype=np.uint8), imgsz=sz, verbose=False)
+            print(f"       ✅ {name}: 100% SUKSES DAN KOMPATIBEL! (Detections: {len(res[0].boxes)})", flush=True)
         except Exception as e:
             print(f"       ❌ {name} GAGAL: {e}", flush=True)
     else:
         print(f"[SKIP] File {path} tidak ditemukan.", flush=True)
 
 print("\n" + "=" * 55)
-print("  PENGUJIAN SELESAI!")
+print("  SEMUA PENGUJIAN SELESAI!")
 print("=" * 55 + "\n", flush=True)

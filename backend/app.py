@@ -53,10 +53,32 @@ try:
         # Batasi PyTorch CPU threads (default 1 pada ARM64 Cortex-A72 untuk mencegah crash atomics)
         torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "1"))
         torch.set_num_threads(torch_threads)
+        
+        # Matikan CPU AMP / Autocast agar tidak menyentuh instruksi ARMv8.2 BFLOAT16/FP16 pada Cortex-A72
+        class NullContext:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+
+        if hasattr(torch, 'autocast'):
+            torch.autocast = lambda *args, **kwargs: NullContext()
+        if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+            torch.cuda.amp.autocast = lambda *args, **kwargs: NullContext()
+        if hasattr(torch.cpu, 'amp') and hasattr(torch.cpu.amp, 'autocast'):
+            torch.cpu.amp.autocast = lambda *args, **kwargs: NullContext()
 except ImportError:
     HAS_CUDA = False
 
 from ultralytics import YOLO
+from ultralytics.engine.model import Model
+
+# Kunci seluruh pemanggilan predict di ARM Cortex-A72 agar tidak memakai AMP / FP16 otomatis
+orig_model_predict = Model.predict
+def safe_arm_predict(self, *args, **kwargs):
+    if not HAS_CUDA:
+        kwargs['device'] = 'cpu'
+        kwargs['amp'] = False
+    return orig_model_predict(self, *args, **kwargs)
+Model.predict = safe_arm_predict
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")
