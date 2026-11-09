@@ -1,9 +1,12 @@
 import os
-# Batasi CPU threads OpenMP / OpenBLAS agar kompatibel 100% dengan ARMv8 Cortex-A72 Raspberry Pi & multi-core PC
+# Batasi CPU threads OpenMP / OpenBLAS & disable vector extensions agar kompatibel 100% dengan ARMv8 Cortex-A72 Raspberry Pi & multi-core PC
 os.environ["OPENBLAS_CORETYPE"] = os.environ.get("OPENBLAS_CORETYPE", "ARMV8")
 os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "1")
 os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "1")
 os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "1")
+os.environ["USE_XNNPACK"] = os.environ.get("USE_XNNPACK", "0")
+os.environ["TORCH_DISABLE_XNNPACK"] = os.environ.get("TORCH_DISABLE_XNNPACK", "1")
+os.environ["TORCH_NUM_THREADS"] = os.environ.get("TORCH_NUM_THREADS", "1")
 import re
 import time
 import datetime
@@ -43,10 +46,12 @@ try:
         torch.backends.mkldnn.enabled = False
     if hasattr(torch.backends, 'nnpack'):
         torch.backends.nnpack.enabled = False
+    if hasattr(torch.backends, 'xnnpack'):
+        torch.backends.xnnpack.enabled = False
     HAS_CUDA = torch.cuda.is_available()
     if not HAS_CUDA:
-        # Optimalkan PyTorch CPU threads untuk multi-core CPU (4 threads optimal di ARM64 & PC)
-        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
+        # Batasi PyTorch CPU threads (default 1 pada ARM64 Cortex-A72 untuk mencegah crash atomics)
+        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "1"))
         torch.set_num_threads(torch_threads)
 except ImportError:
     HAS_CUDA = False
@@ -1092,9 +1097,14 @@ def warmup_models():
         print(f"[WARN] Warmup error: {e}", flush=True)
         return {"completed": False, "warmup_ms": 0.0, "error": str(e)}
 
-warmup_res = warmup_models()
+if os.environ.get("SKIP_WARMUP", "0") == "1":
+    print("[WARMUP] SKIP_WARMUP=1: Melewati warmup dummy.", flush=True)
+    warmup_res = {"completed": True, "warmup_ms": 0.0, "error": None}
+else:
+    warmup_res = warmup_models()
+
 if not HAS_CUDA:
-    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 4)))
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", "1")))
 
 STARTUP_STATUS = {
     "ready": True,
