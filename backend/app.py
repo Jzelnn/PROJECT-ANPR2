@@ -51,34 +51,49 @@ os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")
 
-import paddle
-from paddle import inference as paddle_inference
-from paddlex.inference.models.runners.paddle_static import runner as static_runner
+DISABLE_PADDLE = os.environ.get("DISABLE_PADDLE", "0") == "1"
+paddle = None
+paddle_inference = None
+paddleocr = None
+PaddleOCR = None
 
-# Patch PaddleStaticRunner on CPU to disable oneDNN PIR attribution bug in PaddlePaddle 3.3.1
-orig_static_create = static_runner.PaddleStaticRunner._create
-def _custom_static_create(self):
-    model_paths = static_runner.get_model_paths(self.model_dir, self.model_file_prefix)
-    model_file, params_file = model_paths['paddle']
-    config = paddle_inference.Config(str(model_file), str(params_file))
-    if self._config.get("device_type") != "cpu" and HAS_CUDA:
-        config.enable_use_gpu(100, self._config.get("device_id", 0))
-    else:
-        config.disable_gpu()
-        if hasattr(config, "disable_onednn"):
-            config.disable_onednn()
-        if hasattr(config, "disable_mkldnn"):
-            config.disable_mkldnn()
-        config.set_cpu_math_library_num_threads(2)
-        if hasattr(config, "enable_new_ir"):
-            config.enable_new_ir(False)
-    config.disable_glog_info()
-    return paddle_inference.create_predictor(config)
+if not DISABLE_PADDLE:
+    try:
+        import paddle
+        from paddle import inference as paddle_inference
+        from paddlex.inference.models.runners.paddle_static import runner as static_runner
 
-static_runner.PaddleStaticRunner._create = _custom_static_create
+        # Patch PaddleStaticRunner on CPU to disable oneDNN PIR attribution bug in PaddlePaddle 3.3.1
+        orig_static_create = static_runner.PaddleStaticRunner._create
+        def _custom_static_create(self):
+            model_paths = static_runner.get_model_paths(self.model_dir, self.model_file_prefix)
+            model_file, params_file = model_paths['paddle']
+            config = paddle_inference.Config(str(model_file), str(params_file))
+            if self._config.get("device_type") != "cpu" and HAS_CUDA:
+                config.enable_use_gpu(100, self._config.get("device_id", 0))
+            else:
+                config.disable_gpu()
+                if hasattr(config, "disable_onednn"):
+                    config.disable_onednn()
+                if hasattr(config, "disable_mkldnn"):
+                    config.disable_mkldnn()
+                config.set_cpu_math_library_num_threads(2)
+                if hasattr(config, "enable_new_ir"):
+                    config.enable_new_ir(False)
+            config.disable_glog_info()
+            return paddle_inference.create_predictor(config)
 
-import paddleocr
-from paddleocr import PaddleOCR
+        static_runner.PaddleStaticRunner._create = _custom_static_create
+
+        import paddleocr
+        from paddleocr import PaddleOCR
+    except Exception as e_paddle_import:
+        print(f"[WARN] PaddleOCR tidak aktif ({e_paddle_import}). Menggunakan YOLO Character Model!")
+        paddle = None
+        paddleocr = None
+        PaddleOCR = None
+else:
+    print("[INFO] DISABLE_PADDLE=1 terdeteksi: Menjalankan mode cepat YOLO Character Model (Pure PyTorch)!")
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 import config
@@ -1022,7 +1037,13 @@ plate_infer_lock = threading.RLock()
 body_infer_lock = threading.RLock()
 char_infer_lock = threading.RLock()
 yolo_infer_lock = threading.RLock()
-paddle_engine = PaddleEngine(device="cpu")
+paddle_engine = None
+if not DISABLE_PADDLE and PaddleOCR is not None:
+    try:
+        paddle_engine = PaddleEngine(device="cpu")
+    except Exception as e_p_init:
+        print(f"[WARN] PaddleEngine gagal diinisialisasi: {e_p_init}. Menggunakan YOLO Character Model!")
+        paddle_engine = None
 ai_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ANPR_YOLO")
 plate_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ANPR_ASYNC_PLATE")
 ocr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ANPR_ASYNC_OCR")
@@ -1770,6 +1791,10 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=False, should_skip_fal
     h, w = plate_crop.shape[:2]
     if h == 0 or w == 0:
         return "", 0.0, []
+
+    if paddle_engine is None:
+        c_text, c_conf, line1 = read_plate_with_char_model(plate_crop)
+        return c_text, c_conf, [{"text": c_text, "conf": c_conf}]
 
     def _prep_paddle_img(img_bgr, target_h=40):
         ih, iw = img_bgr.shape[:2]
