@@ -39,10 +39,14 @@ if not hasattr(np, 'sctypes'):
 
 try:
     import torch
+    if hasattr(torch.backends, 'mkldnn'):
+        torch.backends.mkldnn.enabled = False
+    if hasattr(torch.backends, 'nnpack'):
+        torch.backends.nnpack.enabled = False
     HAS_CUDA = torch.cuda.is_available()
     if not HAS_CUDA:
-        # Optimalkan PyTorch CPU threads untuk multi-core CPU (6 threads memberikan throughput tertinggi)
-        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "6"))
+        # Optimalkan PyTorch CPU threads untuk multi-core CPU (4 threads optimal di ARM64 & PC)
+        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "4"))
         torch.set_num_threads(torch_threads)
 except ImportError:
     HAS_CUDA = False
