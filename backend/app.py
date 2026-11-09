@@ -1,8 +1,9 @@
 import os
-# Batasi CPU threads OpenMP / OpenBLAS agar tidak terjadi thrashing di CPU 22-core Windows
-os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "2")
-os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "2")
-os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "2")
+# Batasi CPU threads OpenMP / OpenBLAS agar kompatibel 100% dengan ARMv8 Cortex-A72 Raspberry Pi & multi-core PC
+os.environ["OPENBLAS_CORETYPE"] = os.environ.get("OPENBLAS_CORETYPE", "ARMV8")
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "1")
+os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "1")
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "1")
 import re
 import time
 import datetime
