@@ -149,7 +149,7 @@ FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of ev
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = False  # Keep false on CPU to prevent warnings
 if not HAS_CUDA:
-    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", 4)))
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", "1")))
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3
