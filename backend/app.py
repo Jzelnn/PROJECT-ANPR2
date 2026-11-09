@@ -70,15 +70,134 @@ except ImportError:
 
 from ultralytics import YOLO
 from ultralytics.engine.model import Model
+import torchvision
 
-# Kunci seluruh pemanggilan predict di ARM Cortex-A72 agar tidak memakai AMP / FP16 otomatis
-orig_model_predict = Model.predict
-def safe_arm_predict(self, *args, **kwargs):
-    if not HAS_CUDA:
-        kwargs['device'] = 'cpu'
-        kwargs['amp'] = False
-    return orig_model_predict(self, *args, **kwargs)
-Model.predict = safe_arm_predict
+class PureArmProbs:
+    def __init__(self, data):
+        self.data = data
+        self.top1 = int(data.argmax())
+        self.top1conf = float(data[self.top1])
+
+class PureArmBoxes:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+        self.id = None
+    def __len__(self):
+        return len(self.conf)
+    def __iter__(self):
+        for i in range(len(self.conf)):
+            class SingleBox:
+                def __init__(self, b, c, cl):
+                    self.xyxy = torch.stack([b]) if b.ndim == 1 else b
+                    self.conf = torch.tensor([c]) if not isinstance(c, torch.Tensor) else c
+                    self.cls = torch.tensor([cl]) if not isinstance(cl, torch.Tensor) else cl
+                    self.id = None
+            yield SingleBox(self.xyxy[i], self.conf[i], self.cls[i])
+
+class PureArmYoloResult:
+    def __init__(self, orig_shape, boxes=None, probs=None, names=None):
+        self.orig_shape = orig_shape
+        self.boxes = boxes if boxes is not None else PureArmBoxes(torch.empty((0, 4)), torch.empty((0,)), torch.empty((0,)))
+        self.probs = probs
+        self.names = names or {}
+
+def pure_arm_yolo_predict(self, source, imgsz=None, conf=0.25, iou=0.45, *args, **kwargs):
+    """
+    Pure PyTorch ARMv8.0 Cortex-A72 inference bypass for YOLO.
+    Bypasses Ultralytics predict() wrapper entirely to eliminate SIGILL.
+    """
+    if isinstance(source, (list, tuple)):
+        img = source[0]
+    else:
+        img = source
+    if isinstance(img, str):
+        img = cv2.imread(img)
+    if img is None or getattr(img, 'size', 0) == 0:
+        return [PureArmYoloResult((384, 384), names=getattr(self, 'names', {}))]
+
+    target_sz = int(imgsz) if imgsz is not None else 384
+    conf_th = float(conf) if conf is not None else 0.25
+    iou_th = float(iou) if iou is not None else 0.45
+
+    model = self.model
+    model.eval()
+
+    h0, w0 = img.shape[:2]
+    r = min(target_sz / max(1, h0), target_sz / max(1, w0))
+    new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
+    dw, dh = (target_sz - new_unpad[0]) / 2, (target_sz - new_unpad[1]) / 2
+
+    resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+
+    blob = padded[:, :, ::-1].transpose(2, 0, 1)
+    blob = np.ascontiguousarray(blob, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(blob).unsqueeze(0)
+
+    with torch.no_grad():
+        out = model(tensor)
+
+    pred = out[0] if isinstance(out, (list, tuple)) else out
+
+    # Kasus 1: Model Klasifikasi (seperti body_type model)
+    if pred.ndim == 2:
+        probs_data = pred[0].softmax(dim=-1)
+        probs_obj = PureArmProbs(probs_data)
+        return [PureArmYoloResult((h0, w0), probs=probs_obj, names=getattr(self, 'names', {}))]
+
+    # Kasus 2: Model Deteksi Bounding Box (Vehicle, Plate, Character)
+    pred = pred.transpose(1, 2)
+    pred = pred[0]
+
+    boxes_cxcywh = pred[:, :4]
+    scores_all = pred[:, 4:]
+    max_scores, class_ids = scores_all.max(dim=-1)
+
+    mask = max_scores > conf_th
+    if not mask.any():
+        empty_t = torch.empty((0, 4), dtype=torch.float32)
+        return [PureArmYoloResult((h0, w0), PureArmBoxes(empty_t, torch.empty((0,)), torch.empty((0,))), names=getattr(self, 'names', {}))]
+
+    boxes_cxcywh = boxes_cxcywh[mask]
+    scores = max_scores[mask]
+    cls = class_ids[mask]
+
+    x1 = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
+    y1 = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
+    x2 = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
+    y2 = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
+
+    x1 = (x1 - left) / r
+    y1 = (y1 - top) / r
+    x2 = (x2 - left) / r
+    y2 = (y2 - top) / r
+
+    x1.clamp_(0, w0)
+    y1.clamp_(0, h0)
+    x2.clamp_(0, w0)
+    y2.clamp_(0, h0)
+
+    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+
+    keep = torchvision.ops.nms(boxes_xyxy, scores, iou_th)
+
+    final_boxes = boxes_xyxy[keep]
+    final_scores = scores[keep]
+    final_cls = cls[keep]
+
+    boxes_obj = PureArmBoxes(final_boxes, final_scores, final_cls)
+    return [PureArmYoloResult((h0, w0), boxes_obj, names=getattr(self, 'names', {}))]
+
+# Pasang bypass ke Ultralytics jika berjalan di CPU (Raspberry Pi Cortex-A72)
+if not HAS_CUDA:
+    Model.predict = pure_arm_yolo_predict
+    Model.__call__ = pure_arm_yolo_predict
+    YOLO.predict = pure_arm_yolo_predict
+    YOLO.__call__ = pure_arm_yolo_predict
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")

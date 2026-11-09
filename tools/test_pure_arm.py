@@ -21,31 +21,38 @@ if hasattr(torch.backends, 'xnnpack'): torch.backends.xnnpack.enabled = False
 
 from ultralytics import YOLO
 
+class PureArmProbs:
+    def __init__(self, data):
+        self.data = data
+        self.top1 = int(data.argmax())
+        self.top1conf = float(data[self.top1])
+
+class PureArmBoxes:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+        self.id = None
+    def __len__(self):
+        return len(self.conf)
+    def __iter__(self):
+        for i in range(len(self.conf)):
+            class SingleBox:
+                def __init__(self, b, c, cl):
+                    self.xyxy = torch.stack([b]) if b.ndim == 1 else b
+                    self.conf = torch.tensor([c]) if not isinstance(c, torch.Tensor) else c
+                    self.cls = torch.tensor([cl]) if not isinstance(cl, torch.Tensor) else cl
+                    self.id = None
+            yield SingleBox(self.xyxy[i], self.conf[i], self.cls[i])
+
 class PureArmYoloResult:
-    """Mock objek Results Ultralytics agar kompatibel 100% dengan kode ANPR kita."""
-    class Boxes:
-        def __init__(self, xyxy, conf, cls):
-            self.xyxy = xyxy
-            self.conf = conf
-            self.cls = cls
-            self.id = None
-        def __len__(self):
-            return len(self.conf)
-        def __iter__(self):
-            for i in range(len(self.conf)):
-                class SingleBox:
-                    def __init__(self, b, c, cl):
-                        self.xyxy = [b]
-                        self.conf = [c]
-                        self.cls = [cl]
-                        self.id = None
-                yield SingleBox(self.xyxy[i], self.conf[i], self.cls[i])
-
-    def __init__(self, orig_shape, boxes):
+    def __init__(self, orig_shape, boxes=None, probs=None, names=None):
         self.orig_shape = orig_shape
-        self.boxes = boxes
+        self.boxes = boxes if boxes is not None else PureArmBoxes(torch.empty((0, 4)), torch.empty((0,)), torch.empty((0,)))
+        self.probs = probs
+        self.names = names or {}
 
-def pure_arm_yolo_predict(yolo_obj, img, imgsz=384, conf=0.25, iou=0.45):
+def pure_arm_yolo_predict(yolo_obj, img, imgsz=384, conf=0.25, iou=0.45, *args, **kwargs):
     """
     Inferensi YOLO murni (Pure PyTorch + Torchvision NMS) tanpa memanggil Ultralytics predict()
     yang memicu Illegal Instruction di Raspberry Pi Cortex-A72.
@@ -73,7 +80,14 @@ def pure_arm_yolo_predict(yolo_obj, img, imgsz=384, conf=0.25, iou=0.45):
         out = model(tensor)
 
     pred = out[0] if isinstance(out, (list, tuple)) else out
-    # Format pred: (1, 4 + nc, num_anchors) -> (1, num_anchors, 4 + nc)
+
+    # Kasus 1: Model Klasifikasi (seperti body_type model)
+    if pred.ndim == 2:
+        probs_data = pred[0].softmax(dim=-1)
+        probs_obj = PureArmProbs(probs_data)
+        return [PureArmYoloResult((h0, w0), probs=probs_obj, names=yolo_obj.names)]
+
+    # Kasus 2: Model Deteksi Bounding Box (Vehicle, Plate, Character)
     pred = pred.transpose(1, 2)
     pred = pred[0] # (num_anchors, 4 + nc)
 
@@ -84,7 +98,7 @@ def pure_arm_yolo_predict(yolo_obj, img, imgsz=384, conf=0.25, iou=0.45):
     mask = max_scores > conf
     if not mask.any():
         empty_t = torch.empty((0, 4), dtype=torch.float32)
-        return [PureArmYoloResult((h0, w0), PureArmYoloResult.Boxes(empty_t, torch.empty((0,)), torch.empty((0,))))]
+        return [PureArmYoloResult((h0, w0), PureArmBoxes(empty_t, torch.empty((0,)), torch.empty((0,))), names=yolo_obj.names)]
 
     boxes_cxcywh = boxes_cxcywh[mask]
     scores = max_scores[mask]
@@ -109,15 +123,15 @@ def pure_arm_yolo_predict(yolo_obj, img, imgsz=384, conf=0.25, iou=0.45):
 
     boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
 
-    # NMS via torchvision.ops.nms (sudah terbukti 100% jalan di Raspberry Pi!)
+    # NMS via torchvision.ops.nms
     keep = torchvision.ops.nms(boxes_xyxy, scores, iou)
 
     final_boxes = boxes_xyxy[keep]
     final_scores = scores[keep]
     final_cls = cls[keep]
 
-    boxes_obj = PureArmYoloResult.Boxes(final_boxes, final_scores, final_cls)
-    return [PureArmYoloResult((h0, w0), boxes_obj)]
+    boxes_obj = PureArmBoxes(final_boxes, final_scores, final_cls)
+    return [PureArmYoloResult((h0, w0), boxes_obj, names=yolo_obj.names)]
 
 
 print("\n" + "=" * 55)
@@ -137,10 +151,13 @@ for name, path, sz in test_list:
         print(f"\n[TEST] {name} ({path})...", flush=True)
         try:
             m = YOLO(path)
-            # Buat dummy image
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
             res = pure_arm_yolo_predict(m, dummy, imgsz=sz, conf=0.1)
-            print(f"       ✅ {name}: SUKSES 100%! Detections: {len(res[0].boxes)}", flush=True)
+            if res[0].probs is not None:
+                top_cls = res[0].names[res[0].probs.top1]
+                print(f"       ✅ {name}: SUKSES 100% (Klasifikasi: {top_cls}, Conf: {res[0].probs.top1conf:.2f})", flush=True)
+            else:
+                print(f"       ✅ {name}: SUKSES 100% (Deteksi Bounding Box: {len(res[0].boxes)})", flush=True)
         except Exception as e:
             print(f"       ❌ {name} GAGAL: {e}", flush=True)
             import traceback
