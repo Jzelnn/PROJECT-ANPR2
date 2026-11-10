@@ -26,8 +26,11 @@ os.chdir(ROOT)
 import cv2
 import numpy as np
 
-if len(sys.argv) < 2 or not os.path.exists(sys.argv[1]):
-    print("Pakai: python tools/diagnose_ocr.py path/foto_mobil.jpg")
+DEFAULT_IMG = os.path.join(ROOT, "output", "results", "temp_upload.jpg")
+img_path = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_IMG
+if not os.path.exists(img_path):
+    print(f"File tidak ditemukan: {img_path}")
+    print("Pakai: python tools/diagnose_ocr.py [path/foto_mobil.jpg]")
     sys.exit(1)
 
 print("[0] import backend (memuat model)...", flush=True)
@@ -38,8 +41,8 @@ print(f"    selesai {(time.time() - t0):.1f}s", flush=True)
 OUT = os.path.join(ROOT, "output", "diag")
 os.makedirs(OUT, exist_ok=True)
 
-img = cv2.imread(sys.argv[1])
-print(f"[1] foto {sys.argv[1]} shape={img.shape}", flush=True)
+img = cv2.imread(img_path)
+print(f"[1] foto {img_path} shape={img.shape}", flush=True)
 
 print("[2] run_anpr penuh (foto statis)...", flush=True)
 t = time.time()
@@ -85,13 +88,13 @@ for scale_h in (0, 120, 200):
             txt = "".join(i[2] for i in items)
             confs = " ".join(f"{i[2]}:{i[3]:.2f}" for i in items)
             print(f"    skala={tag:7s} imgsz={imgsz:3d} conf={conf:.2f} {ms:5.0f}ms n={len(items):2d} '{txt}'  [{confs}]", flush=True)
-            if imgsz == 160 and conf == 0.10:
+            if imgsz in (160, 640) and conf == 0.10:
                 ov = inp.copy()
                 for b in r.boxes:
                     x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
                     cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 255, 0), 1)
                     cv2.putText(ov, r.names[int(b.cls[0])], (x1, max(10, y1 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-                cv2.imwrite(os.path.join(OUT, f"chars_{tag}.jpg"), ov)
+                cv2.imwrite(os.path.join(OUT, f"chars_{tag}_sz{imgsz}.jpg"), ov)
 
 print("[5] RapidOCR pada crop yang sama", flush=True)
 try:

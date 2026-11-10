@@ -1616,8 +1616,9 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     else:
         proc_img = plate_crop
 
+    CHAR_INFER_IMGSZ = int(os.environ.get("ANPR_CHAR_IMGSZ", 640))
     with char_infer_lock:
-        result = char_model.predict(proc_img, imgsz=160, conf=conf, verbose=False)[0]
+        result = char_model.predict(proc_img, imgsz=CHAR_INFER_IMGSZ, conf=conf, verbose=False)[0]
     raw_dets = []
     for box in result.boxes:
         cname = result.names[int(box.cls[0])]
@@ -2279,7 +2280,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         print(f"[CHAR_OCR] variant={vname} raw='{r_raw}' conf={r_conf:.2f} fused='{fused}' valid={valid}", flush=True)
         if best is None or score > best[0]:
             best = (score, r_raw, r_conf, r_line1, fused, valid, vname)
-        if valid and r_conf >= 0.75:
+        if valid and r_conf >= 0.55:
             break
 
     c_raw, c_conf, line1, c_fused, c_valid = "", 0.0, [], "", False
@@ -2293,7 +2294,7 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         final_formatted = c_fixed or c_fused or c_raw
 
     # 1b. Cadangan RapidOCR (ONNX, recognition-only) bila char model belum menghasilkan plat valid
-    if not (c_valid and c_conf >= 0.60):
+    if not (c_valid and c_conf >= 0.50):
         r_text, r_conf = rapidocr_read_plate(plate_crop)
         if r_text:
             r_fused = refine_indonesian_plate("", r_text, [r_text]) or ""
