@@ -2282,14 +2282,29 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         if valid and r_conf >= 0.75:
             break
 
-    c_raw, c_conf, line1, c_fused = "", 0.0, [], ""
+    c_raw, c_conf, line1, c_fused, c_valid = "", 0.0, [], "", False
     if best:
-        _, c_raw, c_conf, line1, c_fused, _, _ = best
+        _, c_raw, c_conf, line1, c_fused, c_valid, _ = best
 
     final_formatted = ""
+    method_used = "pure_char_yolo"
     if c_raw:
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
+
+    # 1b. Cadangan RapidOCR (ONNX, recognition-only) bila char model belum menghasilkan plat valid
+    if not (c_valid and c_conf >= 0.60):
+        r_text, r_conf = rapidocr_read_plate(plate_crop)
+        if r_text:
+            r_fused = refine_indonesian_plate("", r_text, [r_text]) or ""
+            r_valid = bool(r_fused) and is_valid_indonesian_plate_structure(r_fused)[0]
+            print(f"[RAPID_OCR] raw='{r_text}' conf={r_conf:.2f} fused='{r_fused}' valid={r_valid} (char valid={c_valid})", flush=True)
+            if r_valid and (not c_valid or r_conf > c_conf):
+                final_formatted = verify_and_fix_plate_digits(raw_plate_crop, r_fused, vehicle_type=vehicle_type) or r_fused
+                c_raw, c_conf, method_used = r_text, r_conf, "rapidocr_rec"
+            elif not final_formatted and r_fused:
+                final_formatted = r_fused
+                c_raw, c_conf, method_used = r_text, r_conf, "rapidocr_rec"
 
     # 2. Fallback PaddleOCR hanya jika Paddle aktif dan char model kosong
     if not final_formatted and not DISABLE_PADDLE and paddle_engine is not None:
@@ -2307,10 +2322,55 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         "paddle_raw": "",
         "paddle_conf": 0.0,
         "confidence": c_conf if final_formatted else 0.0,
-        "method": "pure_char_yolo"
+        "method": method_used
     }
-    print(f"[ENSEMBLE_TIMING] dur={(time.time() - t_ens_start)*1000.0:.1f}ms final={final_formatted}", flush=True)
+    print(f"[ENSEMBLE_TIMING] dur={(time.time() - t_ens_start)*1000.0:.1f}ms final={final_formatted} method={method_used}", flush=True)
     return ret_ens
+
+
+_rapid_engine = None
+_rapid_failed = False
+_rapid_lock = threading.Lock()
+
+
+def rapidocr_read_plate(plate_crop):
+    """
+    Cadangan OCR: RapidOCR (model PaddleOCR via ONNX Runtime, aman di ARMv8.0 Cortex-A72).
+    Mode recognition-only (tanpa deteksi teks, plat sudah di-crop) pada ~72% bagian atas plat
+    (baris nomor polisi, tanpa baris masa berlaku pajak). Mengembalikan (teks, conf).
+    """
+    global _rapid_engine, _rapid_failed
+    if _rapid_failed or os.environ.get("ANPR_RAPIDOCR", "1") != "1":
+        return "", 0.0
+    if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
+        return "", 0.0
+    try:
+        with _rapid_lock:
+            if _rapid_engine is None:
+                from rapidocr_onnxruntime import RapidOCR
+                _rapid_engine = RapidOCR()
+                print("[RAPID_OCR] RapidOCR siap (ONNX Runtime).", flush=True)
+            h, w = plate_crop.shape[:2]
+            top = plate_crop[0:max(8, int(h * 0.72)), :]
+            if top.shape[0] < 48:
+                s = 48.0 / top.shape[0]
+                top = cv2.resize(top, (max(8, int(top.shape[1] * s)), 48), interpolation=cv2.INTER_CUBIC)
+            result, _ = _rapid_engine(top, use_det=False, use_cls=False, use_rec=True)
+        if not result:
+            return "", 0.0
+        texts = [(str(r[0]), float(r[1])) for r in result if r and len(r) >= 2]
+        if not texts:
+            return "", 0.0
+        text = "".join(t for t, _ in texts).upper()
+        conf = float(np.mean([c for _, c in texts]))
+        return text, conf
+    except ImportError:
+        _rapid_failed = True
+        print("[RAPID_OCR] rapidocr_onnxruntime tidak terpasang, cadangan dinonaktifkan.", flush=True)
+        return "", 0.0
+    except Exception as e:
+        print(f"[RAPID_OCR] error: {e}", flush=True)
+        return "", 0.0
 
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=False, body_hints=None):
