@@ -86,13 +86,18 @@ class PureArmBoxes:
         self.id = None
     def __len__(self):
         return len(self.conf)
+    def __bool__(self):
+        return len(self.conf) > 0
     def __iter__(self):
         for i in range(len(self.conf)):
             class SingleBox:
                 def __init__(self, b, c, cl):
-                    self.xyxy = torch.stack([b]) if b.ndim == 1 else b
-                    self.conf = torch.tensor([c]) if not isinstance(c, torch.Tensor) else c
-                    self.cls = torch.tensor([cl]) if not isinstance(cl, torch.Tensor) else cl
+                    b_t = b if isinstance(b, torch.Tensor) else torch.tensor(b, dtype=torch.float32)
+                    c_t = c if isinstance(c, torch.Tensor) else torch.tensor([c], dtype=torch.float32)
+                    cl_t = cl if isinstance(cl, torch.Tensor) else torch.tensor([cl], dtype=torch.float32)
+                    self.xyxy = b_t.unsqueeze(0) if b_t.ndim == 1 else b_t
+                    self.conf = c_t.unsqueeze(0) if c_t.ndim == 0 else c_t
+                    self.cls = cl_t.unsqueeze(0) if cl_t.ndim == 0 else cl_t
                     self.id = None
             yield SingleBox(self.xyxy[i], self.conf[i], self.cls[i])
 
@@ -103,13 +108,15 @@ class PureArmYoloResult:
         self.probs = probs
         self.names = names or {}
 
-def pure_arm_yolo_predict(self, source, imgsz=None, conf=0.25, iou=0.45, *args, **kwargs):
+def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.45, *args, **kwargs):
     """
     Pure PyTorch ARMv8.0 Cortex-A72 inference bypass for YOLO.
     Bypasses Ultralytics predict() wrapper entirely to eliminate SIGILL.
     """
+    if source is None:
+        source = kwargs.get('source', None)
     if isinstance(source, (list, tuple)):
-        img = source[0]
+        img = source[0] if len(source) > 0 else None
     else:
         img = source
     if isinstance(img, str):
@@ -117,9 +124,9 @@ def pure_arm_yolo_predict(self, source, imgsz=None, conf=0.25, iou=0.45, *args, 
     if img is None or getattr(img, 'size', 0) == 0:
         return [PureArmYoloResult((384, 384), names=getattr(self, 'names', {}))]
 
-    target_sz = int(imgsz) if imgsz is not None else 384
-    conf_th = float(conf) if conf is not None else 0.25
-    iou_th = float(iou) if iou is not None else 0.45
+    target_sz = int(imgsz if imgsz is not None else kwargs.get('imgsz', 384))
+    conf_th = float(conf if conf is not None else kwargs.get('conf', 0.25))
+    iou_th = float(iou if iou is not None else kwargs.get('iou', 0.45))
 
     model = self.model
     model.eval()
