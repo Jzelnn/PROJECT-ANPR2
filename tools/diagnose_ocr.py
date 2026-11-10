@@ -1,23 +1,20 @@
 """
-Diagnosa OCR plat di Raspberry Pi.
+Investigasi & Instrumentasi TAHAP A (Timing 2,1 Detik) & TAHAP B (Detektor Plat) + Diagnosa OCR.
 
-Pakai:
-    SKIP_WARMUP=1 DISABLE_PADDLE=1 python tools/diagnose_ocr.py path/foto_mobil.jpg
-
-Output:
-  - waktu tiap tahap
-  - bbox plat yang ditemukan + file crop plat (output/diag/plate_crop.jpg)
-  - hasil char model pada beberapa imgsz / skala / conf (+ overlay gambar)
-  - hasil RapidOCR (recognition-only dan full) pada crop yang sama
-Kirim teks output + isi folder output/diag/ ke saya.
+Pakai di Raspberry Pi / Laptop:
+    SKIP_WARMUP=1 DISABLE_PADDLE=1 ANPR_DEBUG_TIMING=1 python tools/diagnose_ocr.py [path/foto_mobil.jpg]
 """
 import os
 import sys
 import time
+import json
+import glob
+import statistics
 
 os.environ.setdefault("SKIP_WARMUP", "1")
 os.environ.setdefault("DISABLE_PADDLE", "1")
 os.environ.setdefault("OPENBLAS_CORETYPE", "ARMV8")
+os.environ["ANPR_DEBUG_TIMING"] = "1"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
@@ -26,146 +23,343 @@ os.chdir(ROOT)
 import cv2
 import numpy as np
 import torch
-import glob
 
-DEFAULT_IMG = os.path.join(ROOT, "output", "results", "temp_upload.jpg")
-img_path = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_IMG
-if not os.path.exists(img_path):
-    print(f"File tidak ditemukan: {img_path}")
-    print("Pakai: python tools/diagnose_ocr.py [path/foto_mobil.jpg]")
+# Cari foto uji otomatis jika tidak diberikan di argumen
+CANDIDATE_IMGS = [
+    os.path.join(ROOT, "output", "results", "temp_upload.jpg"),
+    os.path.join(ROOT, "output", "captures", "latest_result.jpg"),
+    os.path.join(ROOT, "output", "screenshots", "latest_result.jpg"),
+]
+for g in sorted(glob.glob(os.path.join(ROOT, "output", "**", "*.jpg"), recursive=True)):
+    if "diag" not in g and "debug_crops" not in g and "debug_plates" not in g:
+        CANDIDATE_IMGS.append(g)
+
+img_path = sys.argv[1] if len(sys.argv) >= 2 else next((p for p in CANDIDATE_IMGS if os.path.exists(p)), None)
+if not img_path or not os.path.exists(img_path):
+    print("File foto uji tidak ditemukan. Pakai: python tools/diagnose_ocr.py path/foto_mobil.jpg")
     sys.exit(1)
 
-print("[0] import backend (memuat model)...", flush=True)
-t0 = time.time()
+print("[0] Memuat backend/app.py...", flush=True)
+t0 = time.perf_counter()
 import app as A
-print(f"    selesai {(time.time() - t0):.1f}s", flush=True)
+print(f"    selesai dalam {(time.perf_counter() - t0):.2f}s\n", flush=True)
 
 OUT = os.path.join(ROOT, "output", "diag")
 os.makedirs(OUT, exist_ok=True)
 
-img = cv2.imread(img_path)
-print(f"[1] foto {img_path} shape={img.shape}", flush=True)
+with open(img_path, "rb") as f:
+    raw_file_bytes = f.read()
 
-print("[1b] Cek softmax model klasifikasi (body_type_model)...", flush=True)
+img_orig = cv2.imread(img_path)
+if img_orig is None:
+    print(f"Gagal membaca gambar: {img_path}")
+    sys.exit(1)
+ih, iw = img_orig.shape[:2]
+cv2.imwrite(os.path.join(OUT, "orig_full.jpg"), img_orig)
+print(f"[INFO] Foto uji: {img_path} (shape={img_orig.shape}, bytes={len(raw_file_bytes)})")
+print(f"       Disimpan ke: output/diag/orig_full.jpg\n", flush=True)
+
+# ==============================================================================
+# CEK MODEL METADATA & SOFTMAX KLASIFIKASI
+# ==============================================================================
+print("=" * 80)
+print("CEK METADATA MODEL & SOFTMAX BODY_TYPE")
+print("=" * 80)
+for m_label, m_obj in [
+    ("vehicle_model (models/vehicle/best.pt)", A.vehicle_model),
+    ("plate_detector (models/plate/best.pt)", A.plate_detector),
+    ("plate_model_legacy (models/plate/legacy.pt)", A.plate_model_legacy),
+    ("body_style_model (models/body_type/best.pt)", A.body_style_model),
+    ("char_model (models/character/best.pt)", A.char_model),
+]:
+    names = getattr(m_obj, "names", {})
+    print(f"  - {m_label:45s}: nc={len(names):2d} names={names}")
+
 try:
-    bm = A.body_type_model.model
+    bm = A.body_style_model.model
     bm.eval()
     dummy_t = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
     with torch.no_grad():
         b_out = bm(dummy_t)
     b_pred = b_out[0] if isinstance(b_out, (list, tuple)) else b_out
-    row_sum = float(b_pred[0].sum(-1))
-    row_min = float(b_pred[0].min())
-    top1_raw = float(b_pred[0].max())
-    top1_double_sm = float(b_pred[0].softmax(dim=-1).max())
-    print(f"    type(out)={type(b_out).__name__} pred.shape={tuple(b_pred.shape)} "
-          f"min={row_min:.4f} sum={row_sum:.4f} (≈1.0 berarti sudah softmax) "
-          f"top1_asli={top1_raw:.4f} vs top1_double_softmax={top1_double_sm:.4f}", flush=True)
+    print(f"  - Cek body_style_model raw output: type(out)={type(b_out).__name__} pred.shape={tuple(b_pred.shape)} "
+          f"min={float(b_pred[0].min()):.4f} sum={float(b_pred[0].sum(-1)):.4f} "
+          f"top1_raw={float(b_pred[0].max()):.4f} vs top1_double_softmax={float(b_pred[0].softmax(dim=-1).max()):.4f}\n", flush=True)
 except Exception as e:
-    print(f"    body_type check error: {e}", flush=True)
+    print(f"  - Cek body_style_model error: {e}\n", flush=True)
 
-print("[2] run_anpr penuh (foto statis)...", flush=True)
-t = time.time()
-res = A.run_anpr(img, is_stream=False)
-print(f"    total {(time.time() - t) * 1000:.0f}ms", flush=True)
-dets = res.get("detections") or []
+# ==============================================================================
+# TAHAP A: INVESTIGASI WAKTU 5x RUN (/api/detect END-TO-END)
+# ==============================================================================
+print("=" * 80)
+print("TAHAP A: INVESTIGASI WAKTU (5x RUN PADA FOTO YANG SAMA)")
+print("=" * 80)
+
+N_RUNS = 5
+stage_runs = {}
+stage_meta = {}
+stage_order = []
+perf_totals_pre_ann = []
+perf_totals_endpoint = []
+logged_perf_yolo = []
+logged_perf_track = []
+logged_perf_body = []
+logged_perf_ocr = []
+logged_perf_total = []
+
+last_res = None
+for run_idx in range(N_RUNS):
+    t_ep0 = time.perf_counter()
+
+    # 1. Decode gambar (persis /api/detect baris 5600-5602)
+    t_d0 = time.perf_counter()
+    nparr = np.frombuffer(raw_file_bytes, np.uint8)
+    img_dec = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    dec_ms = (time.perf_counter() - t_d0) * 1000.0
+
+    # 2. Panggil run_anpr(img, is_stream=False)
+    res = A.run_anpr(img_dec, is_stream=False)
+    last_res = res
+
+    # 3. Simpan record & serialisasi JSON (persis /api/detect baris 5615-5626)
+    t_s0 = time.perf_counter()
+    dets = res.get("detections") or []
+    if dets:
+        p_det = dets[0]
+        if p_det.get("is_newly_confirmed"):
+            A.save_parking_record(p_det, source_img=img_dec)
+    sav_ms = (time.perf_counter() - t_s0) * 1000.0
+
+    t_j0 = time.perf_counter()
+    _ = json.dumps({k: v for k, v in res.items() if not k.startswith("_")})
+    json_ms = (time.perf_counter() - t_j0) * 1000.0
+
+    ep_ms = (time.perf_counter() - t_ep0) * 1000.0
+    perf_totals_endpoint.append(ep_ms)
+
+    pb_info = res.get("perf_breakdown") or {}
+    logged_perf_yolo.append(float(pb_info.get("yolo_ms", 0.0)))
+    logged_perf_track.append(float(pb_info.get("track_ms", 0.0)))
+    logged_perf_body.append(float(pb_info.get("body_ms", 0.0)))
+    logged_perf_ocr.append(float(pb_info.get("ocr_ms", 0.0)))
+    logged_perf_total.append(float(pb_info.get("total_ms", 0.0)))
+
+    dbg_sum = res.get("_debug_timing_summary") or {}
+    perf_totals_pre_ann.append(float(dbg_sum.get("total_pre_annotate_ms", pb_info.get("total_ms", 0.0))))
+
+    all_stages_this_run = [
+        {"stage": "0_decode_imdecode", "model": "cv2.imdecode", "imgsz": f"{iw}x{ih}", "ms": dec_ms, "det_count": 1, "raw_count": 1}
+    ] + (res.get("_debug_timing_stages") or []) + [
+        {"stage": "98_save_parking_record", "model": "-", "imgsz": "-", "ms": sav_ms, "det_count": len(dets), "raw_count": len(dets)},
+        {"stage": "99_json_serialize", "model": "json.dumps", "imgsz": "-", "ms": json_ms, "det_count": 1, "raw_count": 1},
+    ]
+
+    for st in all_stages_this_run:
+        sname = st["stage"]
+        if sname not in stage_runs:
+            stage_runs[sname] = []
+            stage_order.append(sname)
+            stage_meta[sname] = (st["model"], st["imgsz"], st.get("raw_count", 0), st.get("det_count", 0))
+        stage_runs[sname].append(float(st["ms"]))
+
+print("\n--- TABEL WAKTU PER TAHAP (p50 / MEDIAN DARI 5x RUN) ---")
+print(f"{'Tahap':<30} | {'Model':<28} | {'imgsz':<11} | {'ms (p50)':>9} | {'Deteksi (raw -> valid)'}")
+print("-" * 108)
+sum_p50_inside_run_anpr_pre_ann = 0.0
+sum_p50_all_endpoint = 0.0
+for sname in stage_order:
+    p50_ms = statistics.median(stage_runs[sname])
+    mdl, sz, raw_c, val_c = stage_meta[sname]
+    print(f"{sname:<30} | {str(mdl):<28} | {str(sz):<11} | {p50_ms:9.2f} | raw={raw_c} -> valid={val_c}")
+    sum_p50_all_endpoint += p50_ms
+    if sname not in ("0_decode_imdecode", "encode_and_save_result", "98_save_parking_record", "99_json_serialize"):
+        sum_p50_inside_run_anpr_pre_ann += p50_ms
+
+p50_perf_total = statistics.median(perf_totals_pre_ann)
+p50_ep_total = statistics.median(perf_totals_endpoint)
+p50_log_yolo = statistics.median(logged_perf_yolo)
+p50_log_track = statistics.median(logged_perf_track)
+p50_log_body = statistics.median(logged_perf_body)
+p50_log_ocr = statistics.median(logged_perf_ocr)
+sum_logged_perf = p50_log_yolo + p50_log_track + p50_log_body + p50_log_ocr
+
+print("-" * 108)
+print(f"1. Yang tercatat di [PERF] lama (YOLO + Tracking + Body + OCR) : {sum_logged_perf:8.2f} ms "
+      f"(YOLO={p50_log_yolo:.1f}, Track={p50_log_track:.1f}, Body={p50_log_body:.1f}, OCR={p50_log_ocr:.1f})")
+print(f"2. Total [PERF] run_anpr (sebelum encode gambar)               : {p50_perf_total:8.2f} ms")
+print(f"   -> Selisih tak tercatat di [PERF] lama                      : {(p50_perf_total - sum_logged_perf):8.2f} ms "
+      f"(ini berasal dari plate_det_crop + plate_legacy_crop + plate_global_full + body_type yang tidak dimasukkan ke variabel t_body_total/t_ocr_total!)")
+print(f"3. Jumlah seluruh tahap terinstrumentasi (pre-annotate)        : {sum_p50_inside_run_anpr_pre_ann:8.2f} ms")
+print(f"   -> Selisih terhadap Total run_anpr (unexplained pre-ann)    : {(p50_perf_total - sum_p50_inside_run_anpr_pre_ann):8.2f} ms")
+print(f"4. Jumlah seluruh tahap Endpoint (/api/detect lengkap)         : {sum_p50_all_endpoint:8.2f} ms")
+print(f"5. Total Endpoint terukur (p50 dari 5x)                        : {p50_ep_total:8.2f} ms")
+print(f"   -> Selisih terhadap Total Endpoint (unexplained endpoint)   : {(p50_ep_total - sum_p50_all_endpoint):8.2f} ms\n", flush=True)
+
+# ==============================================================================
+# TAHAP B: KENAPA PLAT TIDAK TERDETEKSI (BUMPER CROP, OVERLAY, TES DIFERENSIAL)
+# ==============================================================================
+print("=" * 80)
+print("TAHAP B: INVESTIGASI DETEKTOR PLAT (CROP, FILTER GEOMETRI, & TES SKALA/CONF)")
+print("=" * 80)
+
+dets = (last_res or {}).get("detections") or []
 if not dets:
-    print("    TIDAK ADA deteksi kendaraan.")
-    sys.exit(0)
-d = dets[0]
-print(f"    vehicle={d.get('vehicle_type')} body={d.get('body_style')} "
-      f"plate_text={d.get('license_plate')!r} ocr_conf={d.get('ocr_confidence')} "
-      f"method={d.get('ocr_method')} plate_bbox={d.get('plate_bbox')}", flush=True)
-
-pb = d.get("plate_bbox")
-if not pb:
-    print("    PLAT TIDAK TERDETEKSI -> masalah ada di detektor plat, bukan OCR.")
+    print("TIDAK ADA KENDARAAN TERDETEKSI pada foto ini.")
     sys.exit(0)
 
-crop = A.crop_plate_with_padding(img, pb[0], pb[1], pb[2], pb[3])
-cv2.imwrite(os.path.join(OUT, "plate_crop.jpg"), crop)
-print(f"[3] crop plat shape={crop.shape} -> output/diag/plate_crop.jpg", flush=True)
+d0 = dets[0]
+vx1, vy1, vx2, vy2 = d0["bbox"]
+vw = max(1, vx2 - vx1)
+vh = max(1, vy2 - vy1)
+pad_x = int(vw * 0.06)
+pad_y_top = int(vh * 0.04)
+pad_y_bot = int(vh * 0.10)
+cx1 = max(0, vx1 - pad_x)
+cy1 = max(0, vy1 - pad_y_top)
+cx2 = min(iw, vx2 + pad_x)
+cy2 = min(ih, vy2 + pad_y_bot)
+bumper_crop = img_orig[cy1:cy2, cx1:cx2].copy()
 
-print("[4a] Sapuan ANPR_CHAR_IMGSZ x threads pada read_plate_with_char_model(crop)", flush=True)
-for n_th in (1, 2, 4):
-    try:
-        torch.set_num_threads(n_th)
-    except Exception:
-        pass
-    for sz in (160, 256, 320, 384, 480, 640):
-        os.environ["ANPR_CHAR_IMGSZ"] = str(sz)
-        t_s = time.perf_counter()
-        txt, conf_v, l1 = A.read_plate_with_char_model(crop, conf=0.15)
-        ms = (time.perf_counter() - t_s) * 1000.0
-        fused = A.refine_indonesian_plate(txt) if txt else ""
-        print(f"    threads={n_th} imgsz={sz:3d} -> {ms:5.0f}ms  raw={txt!r:10s} fused={fused!r:12s} conf={conf_v:.2f} n={len(l1)}", flush=True)
-torch.set_num_threads(1)
-os.environ["ANPR_CHAR_IMGSZ"] = "384"
+cv2.imwrite(os.path.join(OUT, "bumper_crop.jpg"), bumper_crop)
+ov_full_coords = img_orig.copy()
+cv2.rectangle(ov_full_coords, (vx1, vy1), (vx2, vy2), (0, 255, 0), 2)
+cv2.rectangle(ov_full_coords, (cx1, cy1), (cx2, cy2), (255, 200, 0), 2)
+cv2.putText(ov_full_coords, f"veh={vx1},{vy1},{vx2},{vy2} padded={cx1},{cy1},{cx2},{cy2}",
+            (max(10, cx1), max(25, cy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+cv2.imwrite(os.path.join(OUT, "orig_with_vehicle_and_bumper_coords.jpg"), ov_full_coords)
 
-print("[4b] Detail char_model mentah (skala x imgsz x conf) + simpan overlay", flush=True)
-cm = A.char_model
-h, w = crop.shape[:2]
-for scale_h in (0, 160):
-    if scale_h == 0:
-        inp, tag = crop, "asli"
-    else:
-        s = scale_h / float(h)
-        inp, tag = cv2.resize(crop, (max(8, int(w * s)), scale_h), interpolation=cv2.INTER_CUBIC), f"h={scale_h}"
-    for imgsz in (160, 256, 320, 384, 480, 640):
-        for conf in (0.10, 0.25):
-            t = time.time()
-            r = cm.predict(inp, imgsz=imgsz, conf=conf, verbose=False)[0]
-            ms = (time.time() - t) * 1000
-            items = []
-            for b in r.boxes:
-                x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
-                items.append(((x1 + x2) / 2, (y1 + y2) / 2, r.names[int(b.cls[0])], float(b.conf[0])))
-            items.sort(key=lambda z: z[0])
-            txt = "".join(i[2] for i in items)
-            confs = " ".join(f"{i[2]}:{i[3]:.2f}" for i in items)
-            print(f"    skala={tag:7s} imgsz={imgsz:3d} conf={conf:.2f} {ms:5.0f}ms n={len(items):2d} '{txt}'  [{confs}]", flush=True)
-            if imgsz in (160, 384, 640) and conf == 0.10 and scale_h == 0:
-                ov = inp.copy()
-                for b in r.boxes:
-                    x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
-                    cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 255, 0), 1)
-                    cv2.putText(ov, r.names[int(b.cls[0])], (x1, max(10, y1 - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-                cv2.imwrite(os.path.join(OUT, f"chars_{tag}_sz{imgsz}.jpg"), ov)
+print(f"[B1] Koordinat Kendaraan & Bumper Crop:")
+print(f"     - Image shape  : {iw}x{ih} (W x H)")
+print(f"     - Vehicle bbox : [{vx1}, {vy1}, {vx2}, {vy2}] (vw={vw}, vh={vh}, type={d0.get('vehicle_type')}, body={d0.get('body_style')})")
+print(f"     - Bumper crop  : [{cx1}, {cy1}, {cx2}, {cy2}] (shape={bumper_crop.shape[1]}x{bumper_crop.shape[0]}) -> output/diag/bumper_crop.jpg")
+print(f"     - Pipeline plate_bbox hasil akhir: {d0.get('plate_bbox')} | license_plate={d0.get('license_plate')!r}\n", flush=True)
 
-print("[5] RapidOCR pada crop yang sama", flush=True)
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    eng = RapidOCR()
-    top = crop[0:max(8, int(h * 0.72)), :]
-    t = time.time()
-    rr, _ = eng(top, use_det=False, use_cls=False, use_rec=True)
-    print(f"    rec-only (72% atas): {(time.time() - t) * 1000:.0f}ms -> {rr}", flush=True)
-    t = time.time()
-    rr, _ = eng(crop)
-    print(f"    full det+rec: {(time.time() - t) * 1000:.0f}ms -> {[(x[1], round(float(x[2]), 2)) for x in (rr or [])]}", flush=True)
-except Exception as e:
-    print(f"    RapidOCR error: {e}", flush=True)
 
-sample_crops = sorted(glob.glob(os.path.join(ROOT, "output", "results", "debug_plates", "*.jpg")))[:10]
-if sample_crops:
-    print(f"[6] Sapuan pada {len(sample_crops)} crop plat di output/results/debug_plates/", flush=True)
+recovered_plate_boxes = []
+
+
+def inspect_raw_yolo_and_filters(model_obj, model_tag, inp_img, is_crop, imgsz_list, conf_list):
+    """
+    Menjalankan model detektor plat dan menginspeksi:
+    1) Skor maksimum mentah per kelas langsung dari tensor output model (sebelum filter conf).
+    2) Cek apakah argmax lintas kelas (mobil vs plat-nomor) menekan skor plat-nomor.
+    3) Deteksi pada conf (0.25, 0.10, 0.05) beserta alasan mengapa box diterima/ditolak oleh filter pascaproses.
+    """
+    h0, w0 = inp_img.shape[:2]
+    names = getattr(model_obj, "names", {})
+    m_inner = model_obj.model
+    m_inner.eval()
+
+    print(f"--- Model: {model_tag} | Input: {'bumper_crop' if is_crop else 'full_img'} ({w0}x{h0}) | Classes: {names} ---")
+    for sz in imgsz_list:
+        r = min(sz / max(1, h0), sz / max(1, w0))
+        new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
+        pad_w = (32 - (new_unpad[0] % 32)) % 32
+        pad_h = (32 - (new_unpad[1] % 32)) % 32
+        dw, dh = pad_w / 2.0, pad_h / 2.0
+        interp = cv2.INTER_CUBIC if r > 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(inp_img, new_unpad, interpolation=interp)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        blob = np.ascontiguousarray(padded[:, :, ::-1].transpose(2, 0, 1), dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(blob).unsqueeze(0)
+
+        t_m0 = time.perf_counter()
+        with torch.no_grad():
+            out = m_inner(tensor)
+        infer_ms = (time.perf_counter() - t_m0) * 1000.0
+        pred = (out[0] if isinstance(out, (list, tuple)) else out).transpose(1, 2)[0]
+        scores_all = pred[:, 4:]
+        per_class_max = {
+            f"{cid}:{names.get(cid, str(cid))}": round(float(scores_all[:, cid].max()), 4)
+            for cid in range(scores_all.shape[1])
+        }
+        # Cek anchor terbaik khusus kelas plat (cls=2 pada best.pt, cls=0 pada legacy.pt)
+        plate_cid = 2 if scores_all.shape[1] > 2 else 0
+        best_p_idx = int(scores_all[:, plate_cid].argmax())
+        best_p_score = float(scores_all[best_p_idx, plate_cid])
+        best_p_cxcywh = pred[best_p_idx, :4].tolist()
+        px1 = int(round(max(0, min(w0, (best_p_cxcywh[0] - best_p_cxcywh[2] / 2 - left) / r))))
+        py1 = int(round(max(0, min(h0, (best_p_cxcywh[1] - best_p_cxcywh[3] / 2 - top) / r))))
+        px2 = int(round(max(0, min(w0, (best_p_cxcywh[0] + best_p_cxcywh[2] / 2 - left) / r))))
+        py2 = int(round(max(0, min(h0, (best_p_cxcywh[1] + best_p_cxcywh[3] / 2 - top) / r))))
+        abs_best_p = [cx1 + px1, cy1 + py1, cx1 + px2, cy1 + py2] if is_crop else [px1, py1, px2, py2]
+        suppressed_by_argmax = bool(scores_all.shape[1] > 1 and int(scores_all[best_p_idx].argmax()) != plate_cid)
+        print(f"  [imgsz={sz:3d} -> padded={padded.shape[1]}x{padded.shape[0]} | {infer_ms:5.1f}ms] Max raw score per kelas: {per_class_max}")
+        print(f"      Anchor plat tertinggi (cls={plate_cid}): score={best_p_score:.4f} abs_box={abs_best_p} suppressed_by_other_cls={suppressed_by_argmax}")
+        if best_p_score >= 0.04 and (abs_best_p[2] - abs_best_p[0]) >= 12 and (abs_best_p[3] - abs_best_p[1]) >= 6:
+            recovered_plate_boxes.append((best_p_score, abs_best_p, f"{model_tag}_sz{sz}"))
+
+        for cf in conf_list:
+            res = model_obj.predict(inp_img, conf=cf, imgsz=sz, verbose=False)[0]
+            box_summaries = []
+            for b in res.boxes:
+                cid = int(b.cls[0])
+                cname = names.get(cid, str(cid))
+                bconf = float(b.conf[0])
+                bx1, by1, bx2, by2 = map(int, b.xyxy[0].tolist())
+                abs_b = [cx1 + bx1, cy1 + by1, cx1 + bx2, cy1 + by2] if is_crop else [bx1, by1, bx2, by2]
+
+                # Cek alasan filter di run_anpr
+                reasons = []
+                if cname not in ["plat-nomor", "license_plate"] and len(names) > 1:
+                    reasons.append(f"REJECT_CLASS({cname})")
+                if not A.is_valid_plate_box(abs_b, iw, ih):
+                    bw_a, bh_a = max(1, abs_b[2] - abs_b[0]), max(1, abs_b[3] - abs_b[1])
+                    reasons.append(f"REJECT_GEOM(w={bw_a},h={bh_a},ar={bw_a/bh_a:.2f})")
+                rel_y = ((abs_b[1] + abs_b[3]) / 2.0 - vy1) / float(vh)
+                if d0.get("vehicle_type") != "motorcycle" and rel_y < 0.25:
+                    reasons.append(f"REJECT_REL_Y({rel_y:.2f}<0.25)")
+                if not is_crop:
+                    pcx, pcy = (abs_b[0] + abs_b[2]) / 2.0, (abs_b[1] + abs_b[3]) / 2.0
+                    if not ((vx1 - 35 <= pcx <= vx2 + 35) and (vy1 - 20 <= pcy <= vy2 + 45)):
+                        reasons.append("REJECT_OUTSIDE_VEH_MARGIN")
+
+                status_str = "ACCEPTED" if not reasons else ",".join(reasons)
+                box_summaries.append(f"{cname}({bconf:.3f}) box={abs_b} rel_y={rel_y:.2f} -> {status_str}")
+            print(f"      conf={cf:.2f}: n={len(res.boxes)} | {'; '.join(box_summaries) if box_summaries else 'TIDAK ADA DETEKSI'}")
+
+            # Simpan overlay pada conf=0.05
+            if cf == 0.05 and sz in (256, 384, 640):
+                ov = inp_img.copy()
+                for b in res.boxes:
+                    cid = int(b.cls[0])
+                    cname = names.get(cid, str(cid))
+                    bconf = float(b.conf[0])
+                    bx1, by1, bx2, by2 = map(int, b.xyxy[0].tolist())
+                    color = (0, 255, 0) if cname in ("plat-nomor", "license_plate") else (0, 165, 255)
+                    cv2.rectangle(ov, (bx1, by1), (bx2, by2), color, 2)
+                    cv2.putText(ov, f"{cname} {bconf:.2f}", (bx1, max(15, by1 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                tag_clean = model_tag.replace("/", "_").replace(" ", "_")
+                inp_clean = "crop" if is_crop else "full"
+                cv2.imwrite(os.path.join(OUT, f"overlay_{tag_clean}_{inp_clean}_sz{sz}.jpg"), ov)
+    print("", flush=True)
+
+
+inspect_raw_yolo_and_filters(A.plate_detector, "plate_best", bumper_crop, True, (256, 384, 640), (0.25, 0.10, 0.05))
+inspect_raw_yolo_and_filters(A.plate_model_legacy, "plate_legacy", bumper_crop, True, (256, 384, 640, 960), (0.25, 0.10, 0.05))
+inspect_raw_yolo_and_filters(A.plate_detector, "plate_best", img_orig, False, (384, 640), (0.25, 0.10, 0.05))
+
+# Jika ada plat yang berhasil ditemukan pada salah satu imgsz, jalankan juga sapuan OCR char_model
+pb_final = d0.get("plate_bbox")
+if not pb_final and recovered_plate_boxes:
+    recovered_plate_boxes.sort(key=lambda x: -x[0])
+    pb_final = recovered_plate_boxes[0][1]
+    print(f"[INFO] Menggunakan plate_bbox terbaik dari sapuan imgsz ({recovered_plate_boxes[0][2]}, score={recovered_plate_boxes[0][0]:.3f}): {pb_final}")
+
+if pb_final:
+    crop_p = A.crop_plate_with_padding(img_orig, pb_final[0], pb_final[1], pb_final[2], pb_final[3])
+    cv2.imwrite(os.path.join(OUT, "plate_crop.jpg"), crop_p)
+    print(f"\n[SAPUAN OCR PADA PLATE CROP ({crop_p.shape[1]}x{crop_p.shape[0]}) -> output/diag/plate_crop.jpg]")
     for sz in (256, 320, 384, 480, 640):
         os.environ["ANPR_CHAR_IMGSZ"] = str(sz)
-        times, valid_cnt, results_str = [], 0, []
-        for cp_path in sample_crops:
-            cp_im = cv2.imread(cp_path)
-            if cp_im is None:
-                continue
-            t_s = time.perf_counter()
-            txt, c_v, _ = A.read_plate_with_char_model(cp_im, conf=0.15)
-            times.append((time.perf_counter() - t_s) * 1000.0)
-            fused = A.refine_indonesian_plate(txt) if txt else ""
-            is_val = bool(fused) and A.is_valid_indonesian_plate_structure(fused)[0]
-            if is_val:
-                valid_cnt += 1
-            results_str.append(f"{os.path.basename(cp_path)}->{fused or txt}({c_v:.2f})")
-        avg_ms = sum(times) / max(1, len(times))
-        print(f"    imgsz={sz:3d} avg={avg_ms:5.0f}ms valid_struct={valid_cnt}/{len(sample_crops)} | {', '.join(results_str[:4])}", flush=True)
-os.environ["ANPR_CHAR_IMGSZ"] = "384"
+        t_s = time.perf_counter()
+        txt, conf_v, l1 = A.read_plate_with_char_model(crop_p, conf=0.15)
+        ms = (time.perf_counter() - t_s) * 1000.0
+        fused = A.refine_indonesian_plate(txt) if txt else ""
+        print(f"  imgsz={sz:3d} -> {ms:5.0f}ms  raw={txt!r:10s} fused={fused!r:12s} conf={conf_v:.2f} n={len(l1)}", flush=True)
+    os.environ["ANPR_CHAR_IMGSZ"] = "384"
 
-print("\nSELESAI. Kirim output ini + folder output/diag/ (plate_crop.jpg, chars_*.jpg).", flush=True)
+print("\nSELESAI. Semua gambar diagnostik telah disimpan di folder output/diag/.", flush=True)

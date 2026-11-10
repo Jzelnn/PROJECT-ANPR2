@@ -223,6 +223,9 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
     boxes_obj = PureArmBoxes(final_boxes, final_scores, final_cls)
     return [PureArmYoloResult((h0, w0), boxes_obj, names=getattr(self, 'names', {}))]
 
+_ORIG_MODEL_PREDICT = Model.predict
+_ORIG_MODEL_CALL = Model.__call__
+
 # Pasang bypass ke Ultralytics jika berjalan di CPU (Raspberry Pi Cortex-A72)
 if not HAS_CUDA:
     Model.predict = pure_arm_yolo_predict
@@ -4452,12 +4455,16 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None,
 
 def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
     t_start = time.time()
+    _dbg_timing = os.environ.get("ANPR_DEBUG_TIMING", "0") == "1"
+    _dbg_stages = [] if _dbg_timing else None
+    _t_perf_start = time.perf_counter() if _dbg_timing else 0.0
     if frame_id is not None and SAVE_DEBUG_CROPS:
         print(f"[FRAME_RECEIVED]\nframe_id={frame_id}", flush=True)
     v_conf_thresh = vehicle_conf if vehicle_conf is not None else VEHICLE_CONF_THRESH
     m_conf_thresh = motorcycle_conf if motorcycle_conf is not None else MOTORCYCLE_CONF_THRESH
     p_conf_thresh = plate_conf if plate_conf is not None else PLATE_CONF_THRESH
 
+    _t_dec0 = time.perf_counter() if _dbg_timing else 0.0
     if isinstance(image_input, np.ndarray):
         img = image_input
         image_path = "memory_frame"
@@ -4474,9 +4481,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     roi_brightness = get_roi_brightness(img)
     is_low_light = bool(roi_brightness < 85.0)
     infer_img = cv2.LUT(img, _GAMMA_LUT_NIGHT) if is_low_light else img
+    if _dbg_timing:
+        _dbg_stages.append({
+            "stage": "input_and_lut",
+            "model": "-",
+            "imgsz": f"{iw}x{ih}",
+            "ms": (time.perf_counter() - _t_dec0) * 1000.0,
+            "det_count": 0,
+            "raw_count": 0
+        })
 
     # 1. YOLO VEHICLE INFERENCE (plate detection is gated by interest area)
     t_yolo_0 = time.time()
+    _t_veh0 = time.perf_counter() if _dbg_timing else 0.0
     if SAVE_DEBUG_CROPS:
         print(f"[VEHICLE_INFER_START]\nframe_id={frame_id}", flush=True)
     infer_conf = min(v_conf_thresh, m_conf_thresh, VEHICLE_TRACK_CONTINUE_CONF)
@@ -4492,10 +4509,20 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo_end = time.time()
     t_yolo = t_yolo_end - t_yolo_0
     t_yolo_duration_ms = t_yolo * 1000.0
+    if _dbg_timing:
+        _dbg_stages.append({
+            "stage": "yolo_vehicle",
+            "model": "models/vehicle/best.pt",
+            "imgsz": v_imgsz,
+            "ms": (time.perf_counter() - _t_veh0) * 1000.0,
+            "det_count": len(vdet.boxes),
+            "raw_count": len(vdet.boxes)
+        })
     if SAVE_DEBUG_CROPS:
         print(f"[VEHICLE_INFER_END]\nframe_id={frame_id}\nduration_ms={t_yolo_duration_ms:.1f}\ninfer_ms={pure_infer_ms:.1f}\nlock_wait_ms={lock_wait_ms:.1f}", flush=True)
 
     # 2. EKSTRAKSI KANDIDAT KENDARAAN (Adaptive Day/Night & Dark-Car Confidence)
+    _t_sel0 = time.perf_counter() if _dbg_timing else 0.0
     candidates = []
     for box in vdet.boxes:
         v_cls = int(box.cls[0])
@@ -4602,10 +4629,21 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         else:
             candidates = scored_candidates
 
+    if _dbg_timing:
+        _dbg_stages.append({
+            "stage": "select_front_car",
+            "model": "-",
+            "imgsz": "-",
+            "ms": (time.perf_counter() - _t_sel0) * 1000.0,
+            "det_count": len(candidates),
+            "raw_count": len(scored_candidates)
+        })
+
     # Fallback Direct Plate Detection untuk Mode Upload / Single Photo:
     # Jika model bodi kendaraan miss (misal foto sangat zoom/crop bumper atau terhalang tiang),
     # langsung cari plat nomor di seluruh gambar agar foto tetap berhasil dibaca!
     if not is_stream and not candidates:
+        _t_fb_dir0 = time.perf_counter() if _dbg_timing else 0.0
         with plate_infer_lock:
             pdet_fallback = plate_detector.predict(img, conf=0.15, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
         for pbox in pdet_fallback.boxes:
@@ -4633,6 +4671,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     "front_score": 1000.0
                 })
                 break
+        if _dbg_timing:
+            _dbg_stages.append({
+                "stage": "plate_direct_no_car_fallback",
+                "model": "models/plate/best.pt",
+                "imgsz": IMG_SIZE,
+                "ms": (time.perf_counter() - _t_fb_dir0) * 1000.0,
+                "det_count": len(candidates),
+                "raw_count": len(pdet_fallback.boxes)
+            })
 
     if candidates:
         v_conf_log = f" veh_conf={candidates[0]['v_conf']:.3f} ({candidates[0]['v_conf']*100:.1f}%)"
@@ -4806,6 +4853,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 valid_crops = []
 
                 # Contextual Padded Crop for Bumper Plates
+                _t_bcrop0 = time.perf_counter() if _dbg_timing else 0.0
                 vw = max(1, x2 - x1)
                 vh = max(1, y2 - y1)
                 pad_x = int(vw * 0.06)
@@ -4816,8 +4864,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 cx2 = min(iw, x2 + pad_x)
                 cy2 = min(ih, y2 + pad_y_bot)
                 padded_crop = img[cy1:cy2, cx1:cx2]
+                if _dbg_timing:
+                    _dbg_stages.append({
+                        "stage": "bumper_crop",
+                        "model": "-",
+                        "imgsz": f"{cx2 - cx1}x{cy2 - cy1}",
+                        "ms": (time.perf_counter() - _t_bcrop0) * 1000.0,
+                        "det_count": 1 if padded_crop.size > 0 else 0,
+                        "raw_count": 1 if padded_crop.size > 0 else 0,
+                        "coords": [cx1, cy1, cx2, cy2]
+                    })
 
                 if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+                    _t_p1 = time.perf_counter() if _dbg_timing else 0.0
                     with plate_infer_lock:
                         pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                     for b in pdet_crop.boxes:
@@ -4835,8 +4894,18 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                             score = p_conf * y_factor
                             valid_crops.append((abs_box, p_conf, score))
+                    if _dbg_timing:
+                        _dbg_stages.append({
+                            "stage": "plate_det_crop",
+                            "model": "models/plate/best.pt",
+                            "imgsz": PLATE_INFER_IMGSZ,
+                            "ms": (time.perf_counter() - _t_p1) * 1000.0,
+                            "det_count": len(valid_crops),
+                            "raw_count": len(pdet_crop.boxes)
+                        })
 
                     if not valid_crops:
+                        _t_p2 = time.perf_counter() if _dbg_timing else 0.0
                         with plate_infer_lock:
                             pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                         for b in pdet_legacy.boxes:
@@ -4850,9 +4919,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                                 score = p_conf * y_factor
                                 valid_crops.append((abs_box, p_conf, score))
+                        if _dbg_timing:
+                            _dbg_stages.append({
+                                "stage": "plate_legacy_crop",
+                                "model": "models/plate/legacy.pt",
+                                "imgsz": PLATE_INFER_IMGSZ,
+                                "ms": (time.perf_counter() - _t_p2) * 1000.0,
+                                "det_count": len(valid_crops),
+                                "raw_count": len(pdet_legacy.boxes)
+                            })
 
                     if not valid_crops:
                         # Fallback ke deteksi plat global hanya jika crop bumper tidak mendeteksi plat
+                        _t_p3 = time.perf_counter() if _dbg_timing else 0.0
                         with plate_infer_lock:
                             pdet_global = plate_detector.predict(img, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                         for pbox in pdet_global.boxes:
@@ -4865,6 +4944,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 if is_valid_plate_box(gbox, iw, ih):
                                     if (x1 - 35 <= (gbox[0] + gbox[2]) / 2.0 <= x2 + 35) and (y1 - 20 <= (gbox[1] + gbox[3]) / 2.0 <= y2 + 45):
                                         valid_crops.append((gbox, pconf, pconf * 2.0))
+                        if _dbg_timing:
+                            _dbg_stages.append({
+                                "stage": "plate_global_full",
+                                "model": "models/plate/best.pt (full)",
+                                "imgsz": IMG_SIZE,
+                                "ms": (time.perf_counter() - _t_p3) * 1000.0,
+                                "det_count": len(valid_crops),
+                                "raw_count": len(pdet_global.boxes)
+                            })
 
                     if valid_crops:
                         valid_crops.sort(key=lambda x: -x[2])
@@ -4878,6 +4966,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                 if plate_crop.size > 0:
                     t_o0 = time.time()
+                    _t_ocr0 = time.perf_counter() if _dbg_timing else 0.0
                     ensemble_res = ensemble_plate_reading(
                         plate_crop,
                         should_skip_fallbacks=None,
@@ -4888,6 +4977,24 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     ocr_method = ensemble_res.get("method")
                     ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
                     t_ocr_total += (time.time() - t_o0)
+                    if _dbg_timing:
+                        _dbg_stages.append({
+                            "stage": "char_ocr_and_validate",
+                            "model": "models/character/best.pt",
+                            "imgsz": int(os.environ.get("ANPR_CHAR_IMGSZ", 384)),
+                            "ms": (time.perf_counter() - _t_ocr0) * 1000.0,
+                            "det_count": 1 if plate_text else 0,
+                            "raw_count": len(ensemble_res.get("char_raw") or "")
+                        })
+                elif _dbg_timing:
+                    _dbg_stages.append({
+                        "stage": "char_ocr_and_validate",
+                        "model": "models/character/best.pt (skipped)",
+                        "imgsz": int(os.environ.get("ANPR_CHAR_IMGSZ", 384)),
+                        "ms": 0.0,
+                        "det_count": 0,
+                        "raw_count": 0
+                    })
 
                 # Tahap Klasifikasi Bodi: Pada mode foto statis langsung jalankan secara sinkron
                 vehicle_type = initial_vtype
@@ -4897,6 +5004,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 t_body_total = 0.0
 
                 if initial_vtype != "motorcycle":
+                    _t_b0 = time.perf_counter() if _dbg_timing else 0.0
                     v_type_b, b_style_b, b_conf_b = classify_vehicle_indonesian(
                         img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
                     )
@@ -4906,6 +5014,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                         vehicle_type = v_type_b
                     existing_trk.cached_body_style = body_style
                     existing_trk.cached_body_conf = body_style_conf
+                    if _dbg_timing:
+                        _dbg_stages.append({
+                            "stage": "body_type",
+                            "model": "models/body_type/best.pt",
+                            "imgsz": 192,
+                            "ms": (time.perf_counter() - _t_b0) * 1000.0,
+                            "det_count": 1 if body_style else 0,
+                            "raw_count": 1 if body_style else 0
+                        })
 
                 effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
                 if abs_plate_bbox is not None:
@@ -4936,26 +5053,55 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
     # 5. FAST TEMPORAL CONFIRMATION (Evaluasi & Deferred OCR saat Confirmed)
     t_track_0 = time.time()
+    _t_trk0 = time.perf_counter() if _dbg_timing else 0.0
     results_out = confirmation_manager.update(results_out, is_stream=is_stream)
     t_track = time.time() - t_track_0
+    if _dbg_timing:
+        _dbg_stages.append({
+            "stage": "confirmation_update",
+            "model": "-",
+            "imgsz": "-",
+            "ms": (time.perf_counter() - _t_trk0) * 1000.0,
+            "det_count": len(results_out),
+            "raw_count": len(results_out)
+        })
 
     # Pastikan ndarray tidak pernah dikirim ke JSON / client
     for d in results_out:
         d.pop("plate_crop", None)
 
     t_total = time.time() - t_start
+    _t_perf_pre_ann = (time.perf_counter() - _t_perf_start) * 1000.0 if _dbg_timing else 0.0
     fps = 1.0 / max(1e-4, t_total)
 
     if not is_stream:
+        _t_ann0 = time.perf_counter() if _dbg_timing else 0.0
         data_uri, raw_b64, mime_type = generate_annotated_frame(img, results_out, interest_area=INTEREST_AREA, frame_id=frame_id, save_to_disk=True)
+        if _dbg_timing:
+            _dbg_stages.append({
+                "stage": "encode_and_save_result",
+                "model": "-",
+                "imgsz": f"{iw}x{ih}",
+                "ms": (time.perf_counter() - _t_ann0) * 1000.0,
+                "det_count": 1 if data_uri else 0,
+                "raw_count": 1 if data_uri else 0
+            })
     else:
         data_uri, raw_b64, mime_type = None, None, "image/jpeg"
 
     # 5. PERFORMANCE TELEMETRY LOGGING (Hanya log saat ada kendaraan di area deteksi)
     if candidates or results_out:
         print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+    if _dbg_timing:
+        _t_perf_full = (time.perf_counter() - _t_perf_start) * 1000.0
+        _sum_pre_ann = sum(s["ms"] for s in _dbg_stages if s["stage"] != "encode_and_save_result")
+        _sum_all = sum(s["ms"] for s in _dbg_stages)
+        print(f"[DEBUG_TIMING] total_pre_annotate={_t_perf_pre_ann:.1f}ms sum_pre_annotate={_sum_pre_ann:.1f}ms "
+              f"unexplained_pre={(_t_perf_pre_ann - _sum_pre_ann):.1f}ms total_with_annotate={_t_perf_full:.1f}ms sum_all={_sum_all:.1f}ms", flush=True)
+        for _st in _dbg_stages:
+            print(f"[DEBUG_TIMING_STAGE] stage={_st['stage']:28s} model={str(_st['model']):28s} imgsz={str(_st['imgsz']):10s} ms={_st['ms']:7.2f} raw={_st['raw_count']} valid={_st['det_count']}", flush=True)
 
-    return {
+    ret_dict = {
         "detections": results_out,
         "detection_time_sec": round(t_total, 3),
         "source": image_path,
@@ -4976,6 +5122,16 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "fps": round(fps, 1)
         }
     }
+    if _dbg_timing:
+        ret_dict["_debug_timing_stages"] = _dbg_stages
+        ret_dict["_debug_timing_summary"] = {
+            "total_pre_annotate_ms": round(_t_perf_pre_ann, 2),
+            "sum_pre_annotate_ms": round(_sum_pre_ann, 2),
+            "unexplained_pre_annotate_ms": round(_t_perf_pre_ann - _sum_pre_ann, 2),
+            "total_with_annotate_ms": round(_t_perf_full, 2),
+            "sum_all_ms": round(_sum_all, 2),
+        }
+    return ret_dict
 
 
 
@@ -5477,14 +5633,23 @@ def upload_video():
 def detect():
     if request.method == "OPTIONS":
         return "", 200
+    _dbg_timing = os.environ.get("ANPR_DEBUG_TIMING", "0") == "1"
+    _t_ep0 = time.perf_counter() if _dbg_timing else 0.0
     if "image" not in request.files:
         return jsonify({"error": "Tidak ada file 'image' yang dikirim"}), 400
+    _t_dec0 = time.perf_counter() if _dbg_timing else 0.0
     file = request.files["image"]
     file_bytes = file.read()
     nparr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    _dec_ms = (time.perf_counter() - _t_dec0) * 1000.0 if _dbg_timing else 0.0
     if img is None:
         return jsonify({"error": "Gagal mendekode file gambar"}), 400
+    if _dbg_timing or SAVE_DEBUG_CROPS:
+        try:
+            cv2.imwrite(os.path.join(config.RESULTS_DIR, "temp_upload.jpg"), img)
+        except Exception:
+            pass
 
     try:
         t0 = time.time()
@@ -5494,6 +5659,7 @@ def detect():
         ai_total_ms = int(round(ai_total_sec * 1000))
         result["detection_time_sec"] = ai_total_sec
         # Simpan ke memory RAM jika kendaraan terkonfirmasi (atau single photo upload)
+        _t_sav0 = time.perf_counter() if _dbg_timing else 0.0
         if result.get("detections"):
             primary_det = result["detections"][0]
             primary_det["latency_ms"] = ai_total_ms
@@ -5503,8 +5669,14 @@ def detect():
                 primary_det["record"] = rec
                 if rec and rec.get("snapshot_url"):
                     result["image_url"] = rec["snapshot_url"]
+        _sav_ms = (time.perf_counter() - _t_sav0) * 1000.0 if _dbg_timing else 0.0
+        _t_resp0 = time.perf_counter() if _dbg_timing else 0.0
+        resp = jsonify(result)
+        _resp_ms = (time.perf_counter() - _t_resp0) * 1000.0 if _dbg_timing else 0.0
+        if _dbg_timing:
+            print(f"[DEBUG_TIMING_ENDPOINT] decode_imdecode_ms={_dec_ms:.2f} save_record_ms={_sav_ms:.2f} jsonify_ms={_resp_ms:.2f} endpoint_total_ms={(time.perf_counter() - _t_ep0)*1000.0:.2f}", flush=True)
         print(f"[DETECT_ENDPOINT] total_endpoint_ms={(time.time() - t0)*1000.0:.1f}ms ai_ms={ai_total_ms}ms", flush=True)
-        return jsonify(result)
+        return resp
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
