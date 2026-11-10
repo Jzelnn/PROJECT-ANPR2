@@ -108,7 +108,7 @@ class PureArmYoloResult:
         self.probs = probs
         self.names = names or {}
 
-def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.45, *args, **kwargs):
+def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *args, **kwargs):
     """
     Pure PyTorch ARMv8.0 Cortex-A72 inference bypass for YOLO.
     Bypasses Ultralytics predict() wrapper entirely to eliminate SIGILL.
@@ -126,7 +126,7 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.45, *a
 
     target_sz = int(imgsz if imgsz is not None else kwargs.get('imgsz', 384))
     conf_th = float(conf if conf is not None else kwargs.get('conf', 0.25))
-    iou_th = float(iou if iou is not None else kwargs.get('iou', 0.45))
+    iou_th = float(iou if iou is not None else kwargs.get('iou', 0.7))
 
     model = self.model
     model.eval()
@@ -2247,21 +2247,47 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
     raw_plate_crop = plate_crop
     h = plate_crop.shape[0]
 
-    # 1. Evaluasi Character Model YOLO
-    c_raw, c_conf, line1 = read_plate_with_char_model(plate_crop, conf=0.15)
-    c_raw = c_raw.upper() if c_raw else ""
+    # 1. Multi-varian Character Model YOLO: asli -> rectified -> CLAHE -> sharpen.
+    #    Berhenti lebih awal begitu ada hasil dengan struktur plat Indonesia valid & conf bagus.
+    def _variants():
+        yield "orig", plate_crop
+        try:
+            rect_crop, angle = rectify_tilted_plate(plate_crop)
+            if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
+                yield "rectified", rect_crop
+        except Exception:
+            pass
+        try:
+            lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            yield "clahe", cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            blur = cv2.GaussianBlur(plate_crop, (0, 0), 1.6)
+            yield "sharpen", cv2.addWeighted(plate_crop, 1.8, blur, -0.8, 0)
+        except Exception:
+            pass
 
-    # Jika karakter kurang dari 4, coba dengan pelurusan sudut miring (rectify)
-    if len(c_raw) < 4:
-        rect_crop, angle = rectify_tilted_plate(plate_crop)
-        if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
-            r_raw, r_conf, r_line1 = read_plate_with_char_model(rect_crop, conf=0.15)
-            if len(r_raw) > len(c_raw):
-                c_raw, c_conf, line1 = r_raw.upper(), r_conf, r_line1
+    best = None  # (score, c_raw, c_conf, line1, fused, valid, name)
+    for vname, vimg in _variants():
+        r_raw, r_conf, r_line1 = read_plate_with_char_model(vimg, conf=0.15)
+        r_raw = r_raw.upper() if r_raw else ""
+        if not r_raw:
+            continue
+        fused = refine_indonesian_plate(r_raw) or ""
+        valid = bool(fused) and is_valid_indonesian_plate_structure(fused)[0]
+        score = (2.0 if valid else 0.0) + r_conf + 0.05 * min(len(r_raw), 9)
+        print(f"[CHAR_OCR] variant={vname} raw='{r_raw}' conf={r_conf:.2f} fused='{fused}' valid={valid}", flush=True)
+        if best is None or score > best[0]:
+            best = (score, r_raw, r_conf, r_line1, fused, valid, vname)
+        if valid and r_conf >= 0.75:
+            break
+
+    c_raw, c_conf, line1, c_fused = "", 0.0, [], ""
+    if best:
+        _, c_raw, c_conf, line1, c_fused, _, _ = best
 
     final_formatted = ""
     if c_raw:
-        c_fused = refine_indonesian_plate(c_raw)
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
 
