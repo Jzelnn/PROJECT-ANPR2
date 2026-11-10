@@ -132,19 +132,32 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
     model.eval()
 
     h0, w0 = img.shape[:2]
-    # Rectangular scaling yang mempertahankan aspek rasio asli tanpa distorsi/squash
-    r = min(target_sz / max(1, h0), target_sz / max(1, w0))
-    new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
-    
-    # Padding kelipatan 32 (stride YOLO) agar karakter plat tidak tertekan menjadi gepeng
-    pad_w = (32 - (new_unpad[0] % 32)) % 32
-    pad_h = (32 - (new_unpad[1] % 32)) % 32
-    dw, dh = pad_w / 2.0, pad_h / 2.0
+    is_cls_model = (type(model).__name__ == "ClassificationModel" or getattr(self, "task", "") == "classify")
 
-    resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+    if is_cls_model:
+        # Preprocessing resmi Ultralytics Classify: resize sisi terpendek ke target_sz lalu center-crop (target_sz, target_sz)
+        scale_c = target_sz / max(1, min(h0, w0))
+        cw, ch = max(target_sz, int(round(w0 * scale_c))), max(target_sz, int(round(h0 * scale_c)))
+        resized_c = cv2.resize(img, (cw, ch), interpolation=cv2.INTER_LINEAR)
+        y_off = (ch - target_sz) // 2
+        x_off = (cw - target_sz) // 2
+        padded = resized_c[y_off:y_off + target_sz, x_off:x_off + target_sz]
+        r, left, top = 1.0, 0, 0
+    else:
+        # Rectangular scaling yang mempertahankan aspek rasio asli tanpa distorsi/squash
+        r = min(target_sz / max(1, h0), target_sz / max(1, w0))
+        new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
+
+        # Padding kelipatan 32 (stride YOLO) agar karakter plat tidak tertekan menjadi gepeng
+        pad_w = (32 - (new_unpad[0] % 32)) % 32
+        pad_h = (32 - (new_unpad[1] % 32)) % 32
+        dw, dh = pad_w / 2.0, pad_h / 2.0
+
+        interp = cv2.INTER_CUBIC if r > 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(img, new_unpad, interpolation=interp)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
     blob = padded[:, :, ::-1].transpose(2, 0, 1)
     blob = np.ascontiguousarray(blob, dtype=np.float32) / 255.0
@@ -157,7 +170,12 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
 
     # Kasus 1: Model Klasifikasi (seperti body_type model)
     if pred.ndim == 2:
-        probs_data = pred[0].softmax(dim=-1)
+        row = pred[0]
+        # Hindari double-softmax: di mode eval Ultralytics Classify sudah mengeluarkan probabilitas (sum ≈ 1.0)
+        if float(row.min()) >= 0.0 and abs(float(row.sum()) - 1.0) < 1e-2:
+            probs_data = row
+        else:
+            probs_data = row.softmax(dim=-1)
         probs_obj = PureArmProbs(probs_data)
         return [PureArmYoloResult((h0, w0), probs=probs_obj, names=getattr(self, 'names', {}))]
 
@@ -1608,15 +1626,11 @@ def read_plate_with_char_model(plate_crop, conf=0.20, iou_threshold=0.35):
     if h == 0 or w == 0:
         return "", 0.0, []
 
-    # Upscale jika ukuran plat kecil agar deteksi karakter individual jauh lebih tajam
+    # Hindari double-resize: pure_arm_yolo_predict sudah melakukan INTER_CUBIC langsung ke CHAR_INFER_IMGSZ
     scale = 1.0
-    if h < 120:
-        scale = 160.0 / h
-        proc_img = cv2.resize(plate_crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-    else:
-        proc_img = plate_crop
+    proc_img = plate_crop
 
-    CHAR_INFER_IMGSZ = int(os.environ.get("ANPR_CHAR_IMGSZ", 640))
+    CHAR_INFER_IMGSZ = int(os.environ.get("ANPR_CHAR_IMGSZ", 384))
     with char_infer_lock:
         result = char_model.predict(proc_img, imgsz=CHAR_INFER_IMGSZ, conf=conf, verbose=False)[0]
     raw_dets = []

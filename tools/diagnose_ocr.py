@@ -25,6 +25,8 @@ os.chdir(ROOT)
 
 import cv2
 import numpy as np
+import torch
+import glob
 
 DEFAULT_IMG = os.path.join(ROOT, "output", "results", "temp_upload.jpg")
 img_path = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_IMG
@@ -43,6 +45,24 @@ os.makedirs(OUT, exist_ok=True)
 
 img = cv2.imread(img_path)
 print(f"[1] foto {img_path} shape={img.shape}", flush=True)
+
+print("[1b] Cek softmax model klasifikasi (body_type_model)...", flush=True)
+try:
+    bm = A.body_type_model.model
+    bm.eval()
+    dummy_t = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
+    with torch.no_grad():
+        b_out = bm(dummy_t)
+    b_pred = b_out[0] if isinstance(b_out, (list, tuple)) else b_out
+    row_sum = float(b_pred[0].sum(-1))
+    row_min = float(b_pred[0].min())
+    top1_raw = float(b_pred[0].max())
+    top1_double_sm = float(b_pred[0].softmax(dim=-1).max())
+    print(f"    type(out)={type(b_out).__name__} pred.shape={tuple(b_pred.shape)} "
+          f"min={row_min:.4f} sum={row_sum:.4f} (≈1.0 berarti sudah softmax) "
+          f"top1_asli={top1_raw:.4f} vs top1_double_softmax={top1_double_sm:.4f}", flush=True)
+except Exception as e:
+    print(f"    body_type check error: {e}", flush=True)
 
 print("[2] run_anpr penuh (foto statis)...", flush=True)
 t = time.time()
@@ -66,16 +86,32 @@ crop = A.crop_plate_with_padding(img, pb[0], pb[1], pb[2], pb[3])
 cv2.imwrite(os.path.join(OUT, "plate_crop.jpg"), crop)
 print(f"[3] crop plat shape={crop.shape} -> output/diag/plate_crop.jpg", flush=True)
 
-print("[4] char model: kombinasi skala x imgsz x conf", flush=True)
+print("[4a] Sapuan ANPR_CHAR_IMGSZ x threads pada read_plate_with_char_model(crop)", flush=True)
+for n_th in (1, 2, 4):
+    try:
+        torch.set_num_threads(n_th)
+    except Exception:
+        pass
+    for sz in (160, 256, 320, 384, 480, 640):
+        os.environ["ANPR_CHAR_IMGSZ"] = str(sz)
+        t_s = time.perf_counter()
+        txt, conf_v, l1 = A.read_plate_with_char_model(crop, conf=0.15)
+        ms = (time.perf_counter() - t_s) * 1000.0
+        fused = A.refine_indonesian_plate(txt) if txt else ""
+        print(f"    threads={n_th} imgsz={sz:3d} -> {ms:5.0f}ms  raw={txt!r:10s} fused={fused!r:12s} conf={conf_v:.2f} n={len(l1)}", flush=True)
+torch.set_num_threads(1)
+os.environ["ANPR_CHAR_IMGSZ"] = "384"
+
+print("[4b] Detail char_model mentah (skala x imgsz x conf) + simpan overlay", flush=True)
 cm = A.char_model
 h, w = crop.shape[:2]
-for scale_h in (0, 120, 200):
+for scale_h in (0, 160):
     if scale_h == 0:
         inp, tag = crop, "asli"
     else:
         s = scale_h / float(h)
         inp, tag = cv2.resize(crop, (max(8, int(w * s)), scale_h), interpolation=cv2.INTER_CUBIC), f"h={scale_h}"
-    for imgsz in (160, 256, 384, 640):
+    for imgsz in (160, 256, 320, 384, 480, 640):
         for conf in (0.10, 0.25):
             t = time.time()
             r = cm.predict(inp, imgsz=imgsz, conf=conf, verbose=False)[0]
@@ -88,7 +124,7 @@ for scale_h in (0, 120, 200):
             txt = "".join(i[2] for i in items)
             confs = " ".join(f"{i[2]}:{i[3]:.2f}" for i in items)
             print(f"    skala={tag:7s} imgsz={imgsz:3d} conf={conf:.2f} {ms:5.0f}ms n={len(items):2d} '{txt}'  [{confs}]", flush=True)
-            if imgsz in (160, 640) and conf == 0.10:
+            if imgsz in (160, 384, 640) and conf == 0.10 and scale_h == 0:
                 ov = inp.copy()
                 for b in r.boxes:
                     x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
@@ -109,5 +145,27 @@ try:
     print(f"    full det+rec: {(time.time() - t) * 1000:.0f}ms -> {[(x[1], round(float(x[2]), 2)) for x in (rr or [])]}", flush=True)
 except Exception as e:
     print(f"    RapidOCR error: {e}", flush=True)
+
+sample_crops = sorted(glob.glob(os.path.join(ROOT, "output", "results", "debug_plates", "*.jpg")))[:10]
+if sample_crops:
+    print(f"[6] Sapuan pada {len(sample_crops)} crop plat di output/results/debug_plates/", flush=True)
+    for sz in (256, 320, 384, 480, 640):
+        os.environ["ANPR_CHAR_IMGSZ"] = str(sz)
+        times, valid_cnt, results_str = [], 0, []
+        for cp_path in sample_crops:
+            cp_im = cv2.imread(cp_path)
+            if cp_im is None:
+                continue
+            t_s = time.perf_counter()
+            txt, c_v, _ = A.read_plate_with_char_model(cp_im, conf=0.15)
+            times.append((time.perf_counter() - t_s) * 1000.0)
+            fused = A.refine_indonesian_plate(txt) if txt else ""
+            is_val = bool(fused) and A.is_valid_indonesian_plate_structure(fused)[0]
+            if is_val:
+                valid_cnt += 1
+            results_str.append(f"{os.path.basename(cp_path)}->{fused or txt}({c_v:.2f})")
+        avg_ms = sum(times) / max(1, len(times))
+        print(f"    imgsz={sz:3d} avg={avg_ms:5.0f}ms valid_struct={valid_cnt}/{len(sample_crops)} | {', '.join(results_str[:4])}", flush=True)
+os.environ["ANPR_CHAR_IMGSZ"] = "384"
 
 print("\nSELESAI. Kirim output ini + folder output/diag/ (plate_crop.jpg, chars_*.jpg).", flush=True)
