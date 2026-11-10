@@ -2231,8 +2231,8 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
 
 def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None, is_stream=False):
     """
-    Pembacaan plat nomor Single-Pass via PaddleOCR + verifikasi sel piksel (~6ms)
-    dengan Fast-Path Char Model (~35ms) agar latensi foto selalu di bawah 1 detik.
+    Pembacaan plat nomor teroptimasi untuk Raspberry Pi Cortex-A72:
+    Pure PyTorch Character Model YOLO (~35ms) + Rectification fallback (~6ms).
     """
     t_ens_start = time.time()
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
@@ -2241,56 +2241,41 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
     raw_plate_crop = plate_crop
     h = plate_crop.shape[0]
 
-    # Fast-Path 0: Evaluasi Cepat Character Model YOLO (~35ms)
-    # Jika karakter plat terbaca tajam dan menghasilkan nomor plat standar Samsat valid (conf >= 0.55),
-    # langsung selesaikan tanpa memanggil PaddleOCR yang lebih berat (menghemat ~450ms CPU!)
-    if h >= 22:
-        c_raw_fast, c_conf_fast, line1_fast = read_plate_with_char_model(plate_crop, conf=0.18)
-        c_raw_fast = c_raw_fast.upper()
-        if len(line1_fast) >= 5 and c_conf_fast >= 0.55:
-            c_fused_fast = refine_indonesian_plate(c_raw_fast)
-            is_c_valid, c_type = is_valid_indonesian_plate_structure(c_fused_fast)
-            if is_c_valid:
-                c_parts = c_fused_fast.split()
-                if len(c_parts) == 3 and (1 <= len(c_parts[1]) <= 4) and len(c_parts[2]) >= 2:
-                    c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused_fast, vehicle_type=vehicle_type)
-                    return {
-                        "final": c_fixed or c_fused_fast,
-                        "char_raw": c_raw_fast,
-                        "char_conf": c_conf_fast,
-                        "paddle_raw": "",
-                        "paddle_conf": 0.0,
-                        "confidence": c_conf_fast,
-                        "method": "fast_char_yolo_direct"
-                    }
+    # 1. Evaluasi Character Model YOLO
+    c_raw, c_conf, line1 = read_plate_with_char_model(plate_crop, conf=0.15)
+    c_raw = c_raw.upper() if c_raw else ""
 
-    # 1. Pembacaan Murni Single-Pass via PaddleOCR (tepat 1x pass)
-    paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
-        plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
-    )
-    paddle_raw = paddle_raw.upper()
-    p_refined = refine_indonesian_plate("", paddle_raw, all_paddle)
+    # Jika karakter kurang dari 4, coba dengan pelurusan sudut miring (rectify)
+    if len(c_raw) < 4:
+        rect_crop, angle = rectify_tilted_plate(plate_crop)
+        if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
+            r_raw, r_conf, r_line1 = read_plate_with_char_model(rect_crop, conf=0.15)
+            if len(r_raw) > len(c_raw):
+                c_raw, c_conf, line1 = r_raw.upper(), r_conf, r_line1
 
-    all_valid_cands = []
-    for raw_t in (all_paddle or []):
-        cand_p = refine_indonesian_plate("", raw_t, all_paddle)
-        if cand_p and is_valid_indonesian_plate_structure(cand_p)[0]:
-            all_valid_cands.append(cand_p)
+    final_formatted = ""
+    if c_raw:
+        c_fused = refine_indonesian_plate(c_raw)
+        c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
+        final_formatted = c_fixed or c_fused or c_raw
 
-    final_formatted = p_refined or (paddle_raw if is_valid_indonesian_plate_structure(paddle_raw)[0] else "")
-    if final_formatted:
-        final_formatted = verify_and_fix_plate_digits(
-            raw_plate_crop, final_formatted, vehicle_type=vehicle_type, all_candidate_plates=all_valid_cands
+    # 2. Fallback PaddleOCR hanya jika Paddle aktif dan char model kosong
+    if not final_formatted and not DISABLE_PADDLE and paddle_engine is not None:
+        paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
+            plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
         )
+        paddle_raw = paddle_raw.upper() if paddle_raw else ""
+        p_refined = refine_indonesian_plate("", paddle_raw, all_paddle)
+        final_formatted = p_refined or paddle_raw
 
     ret_ens = {
         "final": final_formatted,
-        "char_raw": "",
-        "char_conf": 0.0,
-        "paddle_raw": paddle_raw,
-        "paddle_conf": paddle_conf,
-        "confidence": paddle_conf if final_formatted else 0.0,
-        "method": "fast_paddle_direct"
+        "char_raw": c_raw,
+        "char_conf": c_conf if c_raw else 0.0,
+        "paddle_raw": "",
+        "paddle_conf": 0.0,
+        "confidence": c_conf if final_formatted else 0.0,
+        "method": "pure_char_yolo"
     }
     print(f"[ENSEMBLE_TIMING] dur={(time.time() - t_ens_start)*1000.0:.1f}ms final={final_formatted}", flush=True)
     return ret_ens
@@ -3522,34 +3507,26 @@ class VehicleConfirmationManager:
                     det["candidate_matches"] = 1
                     det["plate_detected"] = bool(det.get("plate_bbox") or det.get("plate_detected"))
 
-                    # SINGLE PHOTO FAST PATH: Valid Indonesian plate structure with confidence >= 0.65
-                    if is_valid_struct and p_conf >= 0.65:
-                        now_ts = time.time()
-                        det["status"] = "CONFIRMED"
-                        det["ocr_status"] = "CONFIRMED"
-                        det["consistency"] = 1.0
-                        det["is_newly_confirmed"] = True
-                        det["confirmation_time"] = now_ts
-                        if trk:
-                            trk.status = "CONFIRMED"
-                            trk.is_locked = True
-                            trk.confirmed_data = det.copy()
-                            if det.get("plate_bbox"):
-                                trk.last_plate_bbox = det.get("plate_bbox")
-                        print(f"""[CONFIRMATION]
+                    # SINGLE PHOTO FAST PATH: Langsung konfirmasi kendaraan & plat nomor di mode upload foto
+                    now_ts = time.time()
+                    det["status"] = "CONFIRMED"
+                    det["ocr_status"] = "CONFIRMED" if (p_text and len(p_clean) >= 2) else "ANALYZING"
+                    det["consistency"] = 1.0
+                    det["is_newly_confirmed"] = True
+                    det["confirmation_time"] = now_ts
+                    det["analyzing_frame_count"] = 3
+                    det["analyzing_max_frames"] = 3
+                    if trk:
+                        trk.status = "CONFIRMED"
+                        trk.is_locked = True
+                        trk.confirmed_data = det.copy()
+                        if det.get("plate_bbox"):
+                            trk.last_plate_bbox = det.get("plate_bbox")
+                    print(f"""[CONFIRMATION]
 track={tid}
 plate="{p_clean}"
 reason=SINGLE_PHOTO_FAST_PATH (conf={p_conf:.2f})
 time_from_good_ocr_to_confirmation_ms=0.0""")
-                    else:
-                        det["status"] = "ANALYZING"
-                        det["ocr_status"] = "ANALYZING"
-                        det["consistency"] = 0.5
-                        det["is_newly_confirmed"] = False
-                        det["analyzing_frame_count"] = 1
-                        det["analyzing_max_frames"] = 3
-                        if trk:
-                            trk.status = "ANALYZING"
                     det.pop("plate_crop", None)
                 return detections
 
