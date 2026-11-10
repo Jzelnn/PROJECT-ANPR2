@@ -362,4 +362,31 @@ if pb_final:
         print(f"  imgsz={sz:3d} -> {ms:5.0f}ms  raw={txt!r:10s} fused={fused!r:12s} conf={conf_v:.2f} n={len(l1)}", flush=True)
     os.environ["ANPR_CHAR_IMGSZ"] = "384"
 
+    t_r0 = time.perf_counter()
+    r_txt, r_cnf, r_all = A.rapidocr_read_plate(crop_p, return_all=True)
+    r_ms = (time.perf_counter() - t_r0) * 1000.0
+    print(f"  [RapidOCR ONNX] -> {r_ms:5.0f}ms  raw={r_txt!r} all={r_all} conf={r_cnf:.2f}", flush=True)
+
+    t_e0 = time.perf_counter()
+    ens_res = A.ensemble_plate_reading(crop_p)
+    e_ms = (time.perf_counter() - t_e0) * 1000.0
+    print(f"  [Hybrid Ensemble] -> {e_ms:5.0f}ms  final={ens_res.get('final')!r} method={ens_res.get('method')} conf={ens_res.get('confidence'):.2f}", flush=True)
+else:
+    sample_car_plate = os.path.join(ROOT, "test", "images", "New folder", "New folder", "IN_WSMPM1883119253389.png")
+    if os.path.exists(sample_car_plate) and os.path.abspath(img_path) != os.path.abspath(sample_car_plate):
+        print("\n" + "=" * 80)
+        print("UJI OTOMATIS PADA FOTO MOBIL DENGAN PLAT JELAS (B 1542 DOL)")
+        print("=" * 80)
+        img_sample = cv2.imread(sample_car_plate)
+        if img_sample is not None:
+            A.confirmation_manager.tracks.clear()
+            t_s0 = time.perf_counter()
+            res_s = A.run_anpr(sample_car_plate, frame_img=img_sample.copy(), is_stream=False, frame_id=999, single_vehicle_mode=True)
+            s_ms = (time.perf_counter() - t_s0) * 1000.0
+            dets_s = res_s.get("detections") or []
+            d_s = dets_s[0] if dets_s else {}
+            print(f"[HASIL UJI B 1542 DOL] Total={s_ms:.1f}ms | vehicle={d_s.get('vehicle_type')} | body={d_s.get('body_style')} "
+                  f"| plate_bbox={d_s.get('plate_bbox')} | license_plate={d_s.get('license_plate')!r} "
+                  f"| method={d_s.get('ocr_method')} | conf={d_s.get('plate_confidence')}", flush=True)
+
 print("\nSELESAI. Semua gambar diagnostik telah disimpan di folder output/diag/.", flush=True)

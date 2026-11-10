@@ -336,8 +336,9 @@ LOST_INTEREST_OUTSIDE_FRAMES = int(os.environ.get("ANPR_LOST_FRAMES", 2))
 # Plate detection refresh: do not queue duplicate/stale plate inference.
 # Re-run only when the cached plate is old enough or the previous attempt failed.
 PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.35))
-PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 256))
+PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 320))
 PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.12))
+DEEP_PLATE_FALLBACK = os.environ.get("ANPR_DEEP_PLATE_FALLBACK", "0") == "1"
 
 
 
@@ -2255,91 +2256,99 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
 
 def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None, is_stream=False):
     """
-    Pembacaan plat nomor teroptimasi untuk Raspberry Pi Cortex-A72:
-    Pure PyTorch Character Model YOLO (~35ms) + Rectification fallback (~6ms).
+    Pembacaan plat nomor Hybrid teroptimasi untuk Raspberry Pi Cortex-A72:
+    1) Pass 1: Pure PyTorch Character Model YOLO (imgsz=384) pada crop asli.
+    2) Pass 2: RapidOCR (PP-OCRv4 via C++ ONNX Runtime) + Cross-Model Fusion (char_raw + rapid_raw).
+    3) Pass 3 (Hanya bila belum valid): 1 varian perbaikan citra (rectified / CLAHE).
     """
     t_ens_start = time.time()
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
     raw_plate_crop = plate_crop
-    h = plate_crop.shape[0]
 
-    # 1. Multi-varian Character Model YOLO: asli -> rectified -> CLAHE -> sharpen.
-    #    Berhenti lebih awal begitu ada hasil dengan struktur plat Indonesia valid & conf bagus.
-    def _variants():
-        yield "orig", plate_crop
-        try:
-            rect_crop, angle = rectify_tilted_plate(plate_crop)
-            if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
-                yield "rectified", rect_crop
-        except Exception:
-            pass
-        try:
-            lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
-            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-            yield "clahe", cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            blur = cv2.GaussianBlur(plate_crop, (0, 0), 1.6)
-            yield "sharpen", cv2.addWeighted(plate_crop, 1.8, blur, -0.8, 0)
-        except Exception:
-            pass
-
-    best = None  # (score, c_raw, c_conf, line1, fused, valid, name)
-    for vname, vimg in _variants():
-        r_raw, r_conf, r_line1 = read_plate_with_char_model(vimg, conf=0.15)
-        r_raw = r_raw.upper() if r_raw else ""
-        if not r_raw:
-            continue
-        fused = refine_indonesian_plate(r_raw) or ""
-        valid = bool(fused) and is_valid_indonesian_plate_structure(fused)[0]
-        score = (2.0 if valid else 0.0) + r_conf + 0.05 * min(len(r_raw), 9)
-        print(f"[CHAR_OCR] variant={vname} raw='{r_raw}' conf={r_conf:.2f} fused='{fused}' valid={valid}", flush=True)
-        if best is None or score > best[0]:
-            best = (score, r_raw, r_conf, r_line1, fused, valid, vname)
-        if valid and r_conf >= 0.55:
-            break
-
-    c_raw, c_conf, line1, c_fused, c_valid = "", 0.0, [], "", False
-    if best:
-        _, c_raw, c_conf, line1, c_fused, c_valid, _ = best
+    # 1. Pass Utama: YOLO Character Model pada crop asli
+    c_raw, c_conf, line1 = read_plate_with_char_model(plate_crop, conf=0.15)
+    c_raw = c_raw.upper() if c_raw else ""
+    c_fused = refine_indonesian_plate(c_raw) if c_raw else ""
+    c_valid = bool(c_fused) and is_valid_indonesian_plate_structure(c_fused)[0]
+    print(f"[CHAR_OCR] variant=orig raw='{c_raw}' conf={c_conf:.2f} fused='{c_fused}' valid={c_valid}", flush=True)
 
     final_formatted = ""
     method_used = "pure_char_yolo"
+    best_conf = c_conf if c_raw else 0.0
+    r_text, r_conf, r_all_texts = "", 0.0, []
+
     if c_raw:
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
 
-    # 1b. Cadangan RapidOCR (ONNX, recognition-only) bila char model belum menghasilkan plat valid
-    if not (c_valid and c_conf >= 0.50):
-        r_text, r_conf = rapidocr_read_plate(plate_crop)
-        if r_text:
-            r_fused = refine_indonesian_plate("", r_text, [r_text]) or ""
+    # 2. Hybrid C++ ONNX Runtime (RapidOCR PP-OCR) + Cross-Model Fusion dengan char_raw
+    if not (c_valid and c_conf >= 0.52):
+        r_text, r_conf, r_all_texts = rapidocr_read_plate(plate_crop, return_all=True)
+        if r_text or r_all_texts:
+            # Gabungkan (fuse) char_raw dari YOLO dengan r_text/r_all_texts dari RapidOCR PP-OCR
+            r_fused = refine_indonesian_plate(c_raw, r_text, r_all_texts) or refine_indonesian_plate("", r_text, r_all_texts) or ""
             r_valid = bool(r_fused) and is_valid_indonesian_plate_structure(r_fused)[0]
-            print(f"[RAPID_OCR] raw='{r_text}' conf={r_conf:.2f} fused='{r_fused}' valid={r_valid} (char valid={c_valid})", flush=True)
-            if r_valid and (not c_valid or r_conf > c_conf):
+            print(f"[RAPID_OCR] raw='{r_text}' all={r_all_texts} conf={r_conf:.2f} fused='{r_fused}' valid={r_valid} (char valid={c_valid})", flush=True)
+            if r_valid and (not c_valid or r_conf >= c_conf or len(r_fused.replace(" ", "")) > len((c_fused or "").replace(" ", ""))):
                 final_formatted = verify_and_fix_plate_digits(raw_plate_crop, r_fused, vehicle_type=vehicle_type) or r_fused
-                c_raw, c_conf, method_used = r_text, r_conf, "rapidocr_rec"
-            elif not final_formatted and r_fused:
-                final_formatted = r_fused
-                c_raw, c_conf, method_used = r_text, r_conf, "rapidocr_rec"
+                best_conf = max(c_conf, r_conf) if c_raw else r_conf
+                method_used = "hybrid_char_rapidocr" if c_raw else "rapidocr_onnx"
+                c_valid = True
+            elif not final_formatted and (r_fused or r_text):
+                final_formatted = r_fused or r_text
+                best_conf = r_conf
+                method_used = "rapidocr_onnx"
 
-    # 2. Fallback PaddleOCR hanya jika Paddle aktif dan char model kosong
+    # 3. Fallback maksimal 1 varian perbaikan citra (rectified jika miring, atau CLAHE) hanya bila belum valid
+    if not (c_valid and is_valid_indonesian_plate_structure(final_formatted)[0]):
+        if should_skip_fallbacks is None or not should_skip_fallbacks():
+            enh_name, enh_img = None, None
+            try:
+                rect_crop, angle = rectify_tilted_plate(plate_crop)
+                if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
+                    enh_name, enh_img = "rectified", rect_crop
+            except Exception:
+                pass
+            if enh_img is None:
+                try:
+                    lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
+                    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+                    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                    enh_name, enh_img = "clahe", cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                except Exception:
+                    pass
+            if enh_img is not None:
+                e_raw, e_conf, _ = read_plate_with_char_model(enh_img, conf=0.15)
+                e_raw = e_raw.upper() if e_raw else ""
+                if e_raw:
+                    e_fused = refine_indonesian_plate(e_raw, r_text, r_all_texts) or refine_indonesian_plate(e_raw) or ""
+                    e_valid = bool(e_fused) and is_valid_indonesian_plate_structure(e_fused)[0]
+                    print(f"[CHAR_OCR] variant={enh_name} raw='{e_raw}' conf={e_conf:.2f} fused='{e_fused}' valid={e_valid}", flush=True)
+                    if e_valid or (not final_formatted and e_fused):
+                        final_formatted = verify_and_fix_plate_digits(raw_plate_crop, e_fused or e_raw, vehicle_type=vehicle_type) or e_fused or e_raw
+                        c_raw = e_raw
+                        best_conf = max(best_conf, e_conf)
+                        method_used = f"char_yolo_{enh_name}"
+
+    # 4. Fallback PaddleOCR hanya jika Paddle aktif dan belum ada hasil
     if not final_formatted and not DISABLE_PADDLE and paddle_engine is not None:
         paddle_raw, paddle_conf, all_paddle = read_plate_with_paddleocr(
             plate_crop, allow_multipass=False, should_skip_fallbacks=should_skip_fallbacks
         )
         paddle_raw = paddle_raw.upper() if paddle_raw else ""
-        p_refined = refine_indonesian_plate("", paddle_raw, all_paddle)
+        p_refined = refine_indonesian_plate(c_raw, paddle_raw, all_paddle)
         final_formatted = p_refined or paddle_raw
+        best_conf = max(best_conf, paddle_conf)
 
     ret_ens = {
         "final": final_formatted,
         "char_raw": c_raw,
         "char_conf": c_conf if c_raw else 0.0,
-        "paddle_raw": "",
-        "paddle_conf": 0.0,
-        "confidence": c_conf if final_formatted else 0.0,
+        "paddle_raw": r_text,
+        "paddle_conf": r_conf,
+        "confidence": best_conf if final_formatted else 0.0,
         "method": method_used
     }
     print(f"[ENSEMBLE_TIMING] dur={(time.time() - t_ens_start)*1000.0:.1f}ms final={final_formatted} method={method_used}", flush=True)
@@ -2351,44 +2360,121 @@ _rapid_failed = False
 _rapid_lock = threading.Lock()
 
 
-def rapidocr_read_plate(plate_crop):
+def rapidocr_read_plate(plate_crop, return_all=False):
     """
-    Cadangan OCR: RapidOCR (model PaddleOCR via ONNX Runtime, aman di ARMv8.0 Cortex-A72).
-    Mode recognition-only (tanpa deteksi teks, plat sudah di-crop) pada ~72% bagian atas plat
-    (baris nomor polisi, tanpa baris masa berlaku pajak). Mengembalikan (teks, conf).
+    Mesin OCR C++ ONNX Runtime: RapidOCR (model PP-OCRv4 PaddleOCR di atas ONNX Runtime, aman di ARMv8.0 Cortex-A72).
+    Mendukung:
+    1) Pra-pemrosesan otomatis plat hitam Indonesia (invert_and_enhance_dark_plate) & border replication.
+    2) Fast recognition-only (use_det=False) pada ~74% bagian atas plat (baris nomor polisi).
+    3) Fallback full detection + recognition (use_det=True) dengan filter tanggal pajak Samsat (is_tax_date).
     """
     global _rapid_engine, _rapid_failed
+    empty_ret = ("", 0.0, []) if return_all else ("", 0.0)
     if _rapid_failed or os.environ.get("ANPR_RAPIDOCR", "1") != "1":
-        return "", 0.0
+        return empty_ret
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
-        return "", 0.0
+        return empty_ret
     try:
         with _rapid_lock:
             if _rapid_engine is None:
                 from rapidocr_onnxruntime import RapidOCR
                 _rapid_engine = RapidOCR()
-                print("[RAPID_OCR] RapidOCR siap (ONNX Runtime).", flush=True)
+                print("[RAPID_OCR] RapidOCR siap (C++ ONNX Runtime).", flush=True)
+
             h, w = plate_crop.shape[:2]
-            top = plate_crop[0:max(8, int(h * 0.72)), :]
-            if top.shape[0] < 48:
-                s = 48.0 / top.shape[0]
-                top = cv2.resize(top, (max(8, int(top.shape[1] * s)), 48), interpolation=cv2.INTER_CUBIC)
-            result, _ = _rapid_engine(top, use_det=False, use_cls=False, use_rec=True)
-        if not result:
-            return "", 0.0
-        texts = [(str(r[0]), float(r[1])) for r in result if r and len(r) >= 2]
-        if not texts:
-            return "", 0.0
-        text = "".join(t for t, _ in texts).upper()
-        conf = float(np.mean([c for _, c in texts]))
-        return text, conf
+            top_raw = plate_crop[0:max(10, int(h * 0.74)), :]
+            th, tw = top_raw.shape[:2]
+            scale = 48.0 / float(max(1, th))
+            top_res = cv2.resize(
+                top_raw,
+                (max(16, int(tw * scale)), 48),
+                interpolation=cv2.INTER_CUBIC if th < 48 else cv2.INTER_AREA
+            )
+            top_pad = cv2.copyMakeBorder(top_res, 4, 4, 8, 8, cv2.BORDER_REPLICATE)
+
+            gray_top = cv2.cvtColor(top_pad, cv2.COLOR_BGR2GRAY)
+            is_dark = float(np.median(gray_top)) < 85.0 and float(gray_top.mean()) < 105.0
+            rec_inputs = [top_pad]
+            if is_dark:
+                try:
+                    inv_top = invert_and_enhance_dark_plate(top_pad, gray=gray_top)
+                    rec_inputs.insert(0, inv_top)
+                except Exception:
+                    pass
+
+            all_raw_texts = []
+            best_text, best_conf = "", 0.0
+
+            # Pass A: Fast Recognition-only (tanpa deteksi teks, ~35-50ms di C++ ONNX)
+            for inp in rec_inputs:
+                res_rec, _ = _rapid_engine(inp, use_det=False, use_cls=False, use_rec=True)
+                if not res_rec:
+                    continue
+                for r in res_rec:
+                    if r and len(r) >= 2:
+                        txt_cand = str(r[0]).strip().upper()
+                        cnf_cand = float(r[1])
+                        if txt_cand and cnf_cand >= 0.20 and not is_tax_date(txt_cand):
+                            if txt_cand not in all_raw_texts:
+                                all_raw_texts.append(txt_cand)
+                            parsed = refine_indonesian_plate("", txt_cand, [txt_cand])
+                            is_v = bool(parsed) and is_valid_indonesian_plate_structure(parsed)[0]
+                            if (is_v and cnf_cand >= best_conf) or (not best_text and cnf_cand > best_conf):
+                                best_text, best_conf = txt_cand, cnf_cand
+                if best_text and is_valid_indonesian_plate_structure(refine_indonesian_plate("", best_text, all_raw_texts))[0]:
+                    break
+
+            # Pass B: Full Detection + Recognition jika Pass A belum menghasilkan struktur plat valid
+            best_parsed = refine_indonesian_plate("", best_text, all_raw_texts) if best_text else ""
+            if not (best_parsed and is_valid_indonesian_plate_structure(best_parsed)[0]):
+                full_scale = 64.0 / float(max(1, h))
+                full_res = cv2.resize(
+                    plate_crop,
+                    (max(24, int(w * full_scale)), 64),
+                    interpolation=cv2.INTER_CUBIC if h < 64 else cv2.INTER_AREA
+                )
+                full_pad = cv2.copyMakeBorder(full_res, 6, 6, 10, 10, cv2.BORDER_REPLICATE)
+                if is_dark:
+                    try:
+                        full_pad = invert_and_enhance_dark_plate(full_pad)
+                    except Exception:
+                        pass
+                res_det, _ = _rapid_engine(full_pad, use_det=True, use_cls=False, use_rec=True)
+                if res_det:
+                    det_items = []
+                    for item in res_det:
+                        if item and len(item) >= 3:
+                            box_pts, txt_d, cnf_d = item[0], str(item[1]).strip().upper(), float(item[2])
+                            if not txt_d or cnf_d < 0.20 or is_tax_date(txt_d):
+                                continue
+                            try:
+                                x_left = float(min(pt[0] for pt in box_pts))
+                                y_center = float(np.mean([pt[1] for pt in box_pts]))
+                            except Exception:
+                                x_left, y_center = 0.0, 0.0
+                            # Abaikan teks pajak kecil di bagian paling bawah (> 75% tinggi crop)
+                            if y_center > full_pad.shape[0] * 0.76 and len( det_items ) >= 1:
+                                continue
+                            det_items.append((x_left, txt_d, cnf_d))
+                    if det_items:
+                        det_items.sort(key=lambda x: x[0])
+                        for _, td, _ in det_items:
+                            if td not in all_raw_texts:
+                                all_raw_texts.append(td)
+                        joined_det = " ".join(td for _, td, _ in det_items)
+                        avg_det_conf = float(np.mean([cd for _, _, cd in det_items]))
+                        if joined_det not in all_raw_texts:
+                            all_raw_texts.insert(0, joined_det)
+                        best_text, best_conf = joined_det, avg_det_conf
+
+        return (best_text, best_conf, all_raw_texts) if return_all else (best_text, best_conf)
     except ImportError:
         _rapid_failed = True
         print("[RAPID_OCR] rapidocr_onnxruntime tidak terpasang, cadangan dinonaktifkan.", flush=True)
-        return "", 0.0
+        return empty_ret
     except Exception as e:
         print(f"[RAPID_OCR] error: {e}", flush=True)
-        return "", 0.0
+        return empty_ret
 
 
 def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=False, body_hints=None):
@@ -4692,6 +4778,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_yolo = time.time() - t_yolo_0
 
     results_out = []
+    t_plate_total = 0.0
     t_body_total = 0.0
     t_ocr_total = 0.0
 
@@ -4876,7 +4963,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     })
 
                 if padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
-                    _t_p1 = time.perf_counter() if _dbg_timing else 0.0
+                    _t_p1 = time.perf_counter()
                     with plate_infer_lock:
                         pdet_crop = plate_detector.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                     for b in pdet_crop.boxes:
@@ -4894,18 +4981,25 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                             score = p_conf * y_factor
                             valid_crops.append((abs_box, p_conf, score))
+                    _dt_p1 = time.perf_counter() - _t_p1
+                    t_plate_total += _dt_p1
                     if _dbg_timing:
                         _dbg_stages.append({
                             "stage": "plate_det_crop",
                             "model": "models/plate/best.pt",
                             "imgsz": PLATE_INFER_IMGSZ,
-                            "ms": (time.perf_counter() - _t_p1) * 1000.0,
+                            "ms": _dt_p1 * 1000.0,
                             "det_count": len(valid_crops),
                             "raw_count": len(pdet_crop.boxes)
                         })
 
-                    if not valid_crops:
-                        _t_p2 = time.perf_counter() if _dbg_timing else 0.0
+                    # Pipeline Trimming: Hanya jalankan fallback legacy & full-frame jika ANPR_DEEP_PLATE_FALLBACK=1
+                    # atau ukuran crop kendaraan sangat kecil (vw < 120 atau vh < 120).
+                    # Menghemat ~1.405 ms pada Raspberry Pi 4 ketika padded_crop sudah mencakup area kendaraan.
+                    need_deep_fallback = DEEP_PLATE_FALLBACK or (vw < 120 or vh < 120)
+
+                    if not valid_crops and need_deep_fallback:
+                        _t_p2 = time.perf_counter()
                         with plate_infer_lock:
                             pdet_legacy = plate_model_legacy.predict(padded_crop, conf=0.04, imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                         for b in pdet_legacy.boxes:
@@ -4919,19 +5013,21 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 y_factor = 2.4 if rel_y >= 0.55 else (1.2 if rel_y >= 0.40 else 0.6)
                                 score = p_conf * y_factor
                                 valid_crops.append((abs_box, p_conf, score))
+                        _dt_p2 = time.perf_counter() - _t_p2
+                        t_plate_total += _dt_p2
                         if _dbg_timing:
                             _dbg_stages.append({
                                 "stage": "plate_legacy_crop",
                                 "model": "models/plate/legacy.pt",
                                 "imgsz": PLATE_INFER_IMGSZ,
-                                "ms": (time.perf_counter() - _t_p2) * 1000.0,
+                                "ms": _dt_p2 * 1000.0,
                                 "det_count": len(valid_crops),
                                 "raw_count": len(pdet_legacy.boxes)
                             })
 
-                    if not valid_crops:
-                        # Fallback ke deteksi plat global hanya jika crop bumper tidak mendeteksi plat
-                        _t_p3 = time.perf_counter() if _dbg_timing else 0.0
+                    if not valid_crops and need_deep_fallback:
+                        # Fallback ke deteksi plat global hanya jika crop sangat kecil atau deep fallback aktif
+                        _t_p3 = time.perf_counter()
                         with plate_infer_lock:
                             pdet_global = plate_detector.predict(img, conf=p_conf_thresh, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
                         for pbox in pdet_global.boxes:
@@ -4944,12 +5040,14 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 if is_valid_plate_box(gbox, iw, ih):
                                     if (x1 - 35 <= (gbox[0] + gbox[2]) / 2.0 <= x2 + 35) and (y1 - 20 <= (gbox[1] + gbox[3]) / 2.0 <= y2 + 45):
                                         valid_crops.append((gbox, pconf, pconf * 2.0))
+                        _dt_p3 = time.perf_counter() - _t_p3
+                        t_plate_total += _dt_p3
                         if _dbg_timing:
                             _dbg_stages.append({
                                 "stage": "plate_global_full",
                                 "model": "models/plate/best.pt (full)",
                                 "imgsz": IMG_SIZE,
-                                "ms": (time.perf_counter() - _t_p3) * 1000.0,
+                                "ms": _dt_p3 * 1000.0,
                                 "det_count": len(valid_crops),
                                 "raw_count": len(pdet_global.boxes)
                             })
@@ -4997,17 +5095,19 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     })
 
                 # Tahap Klasifikasi Bodi: Pada mode foto statis langsung jalankan secara sinkron
+                # (Dapat di-trim via ANPR_SKIP_BODY_CLASSIFIER=1 untuk menghemat ~207ms di Raspberry Pi 4)
                 vehicle_type = initial_vtype
                 body_style = None
                 body_style_conf = None
                 body_pending = False
-                t_body_total = 0.0
 
-                if initial_vtype != "motorcycle":
-                    _t_b0 = time.perf_counter() if _dbg_timing else 0.0
+                if initial_vtype != "motorcycle" and os.environ.get("ANPR_SKIP_BODY_CLASSIFIER", "0") != "1":
+                    _t_b0 = time.perf_counter()
                     v_type_b, b_style_b, b_conf_b = classify_vehicle_indonesian(
                         img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
                     )
+                    _dt_b0 = time.perf_counter() - _t_b0
+                    t_body_total += _dt_b0
                     body_style = b_style_b
                     body_style_conf = b_conf_b
                     if v_type_b:
@@ -5019,7 +5119,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                             "stage": "body_type",
                             "model": "models/body_type/best.pt",
                             "imgsz": 192,
-                            "ms": (time.perf_counter() - _t_b0) * 1000.0,
+                            "ms": _dt_b0 * 1000.0,
                             "det_count": 1 if body_style else 0,
                             "raw_count": 1 if body_style else 0
                         })
@@ -5091,7 +5191,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
     # 5. PERFORMANCE TELEMETRY LOGGING (Hanya log saat ada kendaraan di area deteksi)
     if candidates or results_out:
-        print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
+        print(f"[PERF] YOLO: {round(t_yolo*1000, 1)}ms | Plate: {round(t_plate_total*1000, 1)}ms | Tracking: {round(t_track*1000, 1)}ms | Body: {round(t_body_total*1000, 1)}ms | OCR: {round(t_ocr_total*1000, 1)}ms | Total: {round(t_total*1000, 1)}ms | FPS: {round(fps, 1)}")
     if _dbg_timing:
         _t_perf_full = (time.perf_counter() - _t_perf_start) * 1000.0
         _sum_pre_ann = sum(s["ms"] for s in _dbg_stages if s["stage"] != "encode_and_save_result")
@@ -5115,6 +5215,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             "yolo_ms": round(t_yolo * 1000, 1),
             "yolo_infer_ms": round(pure_infer_ms, 1),
             "yolo_lock_wait_ms": round(lock_wait_ms, 1),
+            "plate_ms": round(t_plate_total * 1000, 1),
             "track_ms": round(t_track * 1000, 1),
             "body_ms": round(t_body_total * 1000, 1),
             "ocr_ms": round(t_ocr_total * 1000, 1),
