@@ -132,9 +132,14 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.45, *a
     model.eval()
 
     h0, w0 = img.shape[:2]
+    # Rectangular scaling yang mempertahankan aspek rasio asli tanpa distorsi/squash
     r = min(target_sz / max(1, h0), target_sz / max(1, w0))
     new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
-    dw, dh = (target_sz - new_unpad[0]) / 2, (target_sz - new_unpad[1]) / 2
+    
+    # Padding kelipatan 32 (stride YOLO) agar karakter plat tidak tertekan menjadi gepeng
+    pad_w = (32 - (new_unpad[0] % 32)) % 32
+    pad_h = (32 - (new_unpad[1] % 32)) % 32
+    dw, dh = pad_w / 2.0, pad_h / 2.0
 
     resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
@@ -190,7 +195,8 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.45, *a
 
     boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
 
-    keep = torchvision.ops.nms(boxes_xyxy, scores, iou_th)
+    # Class-Aware Batched NMS: Karakter berbeda kelas (misal '9' dan '0') tidak saling menghapus!
+    keep = torchvision.ops.batched_nms(boxes_xyxy, scores, cls, iou_th)
 
     final_boxes = boxes_xyxy[keep]
     final_scores = scores[keep]
@@ -4782,41 +4788,35 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     ocr_conf = float(ensemble_res.get("confidence", 0.0) or 0.0)
                     t_ocr_total += (time.time() - t_o0)
 
-                # Tahap Bodi Asinkron: Plat keluar dulu, bodi menyusul di background
+                # Tahap Klasifikasi Bodi: Pada mode foto statis langsung jalankan secara sinkron
                 vehicle_type = initial_vtype
                 body_style = None
                 body_style_conf = None
-                body_pending = (initial_vtype != "motorcycle")
+                body_pending = False
                 t_body_total = 0.0
+
+                if initial_vtype != "motorcycle":
+                    v_type_b, b_style_b, b_conf_b = classify_vehicle_indonesian(
+                        img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
+                    )
+                    body_style = b_style_b
+                    body_style_conf = b_conf_b
+                    if v_type_b:
+                        vehicle_type = v_type_b
+                    existing_trk.cached_body_style = body_style
+                    existing_trk.cached_body_conf = body_style_conf
 
                 effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
                 if abs_plate_bbox is not None:
                     existing_trk.update_plate_bbox(abs_plate_bbox, [x1, y1, x2, y2], frame_id=frame_id)
-
-                # Picu klasifikasi bodi asinkron SETELAH OCR selesai agar tidak bersaing CPU
-                if body_pending:
-                    existing_trk.body_pending = True
-                    body_executor.submit(
-                        _async_body_task,
-                        cand_track_id,
-                        img.copy(),
-                        [x1, y1, x2, y2],
-                        initial_vtype,
-                        v_conf,
-                        has_bus_det,
-                        body_hints,
-                        frame_id,
-                        capture_timestamp,
-                        time.time()
-                    )
 
                 results_out.append({
                     "track_id": cand_track_id,
                     "frame_id": frame_id,
                     "vehicle_type": vehicle_type,
                     "body_style": body_style,
-                    "body_style_confidence": None,
-                    "body_pending": body_pending,
+                    "body_style_confidence": body_style_conf,
+                    "body_pending": False,
                     "license_plate": plate_text,
                     "ocr_method": ocr_method,
                     "vehicle_confidence": round(v_conf, 3),
