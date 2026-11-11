@@ -159,6 +159,233 @@ def _default_gt_path():
     return os.path.join(ROOT, "tools", "eval", "ground_truth.csv")
 
 
+def get_system_power_and_clock():
+    """Mengambil informasi status charger/baterai dan frekuensi clock CPU (MHz) via psutil."""
+    info = {
+        "power_plugged": None,
+        "battery_percent": None,
+        "cpu_freq_current_mhz": None,
+        "cpu_freq_max_mhz": None,
+        "logical_cores": os.cpu_count(),
+    }
+    if HAS_PSUTIL:
+        try:
+            bat = psutil.sensors_battery()
+            if bat is not None:
+                info["power_plugged"] = bool(bat.power_plugged)
+                info["battery_percent"] = round(float(bat.percent), 1)
+        except Exception:
+            pass
+        try:
+            freq = psutil.cpu_freq()
+            if freq is not None:
+                info["cpu_freq_current_mhz"] = round(float(freq.current), 1)
+                info["cpu_freq_max_mhz"] = round(float(freq.max), 1)
+        except Exception:
+            pass
+    return info
+
+
+def run_interleaved_l2_eval(args, valid_rows):
+    """
+    Menjalankan evaluasi Langkah 2 secara BERGANTIAN (Interleaved A/B/A/B...)
+    antara:
+      - Varian A (Baseline L1): pure_arm_yolo_predict aktif + torch_threads = 1
+      - Varian B (Langkah 2)  : native Ultralytics predict pada x86_64 + torch_threads = optimal (2..4)
+    """
+    import cv2 as cv2_mod
+    import app as app_mod
+
+    ocr_call_counter = {"count": 0}
+    orig_char_fn = getattr(app_mod, "read_plate_with_char_model", None)
+    if orig_char_fn:
+        def _wrapped_char(*a, **kw):
+            ocr_call_counter["count"] += 1
+            return orig_char_fn(*a, **kw)
+        app_mod.read_plate_with_char_model = _wrapped_char
+
+    opt_threads = int(getattr(app_mod, "_DEFAULT_CPU_THREADS", "2"))
+    sys_start = get_system_power_and_clock()
+
+    print("=" * 94)
+    print(
+        f"INTERLEAVED A/B BENCHMARK (LANGKAH 2) | Foto: {len(valid_rows)} | Runs: {args.runs}x bergantian (A/B) | "
+        f"Charger={sys_start['power_plugged']} ({sys_start['battery_percent']}%) | "
+        f"CPU Clock={sys_start['cpu_freq_current_mhz']}/{sys_start['cpu_freq_max_mhz']} MHz"
+    )
+    print(f"  - Varian A (Baseline L1) : pure_arm_yolo_predict=ON  | torch_threads=1")
+    print(f"  - Varian B (Langkah 2)   : pure_arm_yolo_predict=OFF | torch_threads={opt_threads}")
+    print("=" * 94, flush=True)
+
+    # Warmup 1 foto untuk kedua varian agar inisialisasi memori internal tidak membiaskan foto pertama
+    if valid_rows:
+        w_img = cv2_mod.imread(valid_rows[0]["abs_file"])
+        if w_img is not None:
+            for w_mode in ("A", "B"):
+                if w_mode == "A":
+                    app_mod.set_pure_arm_mode(True)
+                    app_mod.torch.set_num_threads(1)
+                else:
+                    app_mod.set_pure_arm_mode(False)
+                    app_mod.torch.set_num_threads(opt_threads)
+                app_mod.confirmation_manager.tracks.clear()
+                app_mod.run_anpr(w_img.copy(), is_stream=False, frame_id=1, single_vehicle_mode=True)
+
+    def _new_bucket():
+        return {
+            "yolo_ms": [],
+            "plate_ms": [],
+            "ocr_ms": [],
+            "body_ms": [],
+            "total_ms": [],
+            "wall_ms": [],
+            "cpu_pct": [],
+            "ocr_calls": [],
+            "clock_mhz": [],
+            "preds": {},
+        }
+
+    bucket_a = _new_bucket()
+    bucket_b = _new_bucket()
+    sampler = CpuSampler()
+
+    for idx, row in enumerate(valid_rows, start=1):
+        img_bgr = cv2_mod.imread(row["abs_file"])
+        if img_bgr is None:
+            continue
+
+        runs_a, runs_b = [], []
+        wall_a, wall_b = [], []
+        cpu_a, cpu_b = [], []
+        calls_a, calls_b = [], []
+        pred_a, pred_b = "", ""
+
+        for r_i in range(args.runs):
+            # Gilir urutan: genap A lalu B, ganjil B lalu A untuk menghilangkan bias urutan dalam satu foto
+            order = ("A", "B") if (r_i % 2 == 0) else ("B", "A")
+            for variant in order:
+                if variant == "A":
+                    app_mod.set_pure_arm_mode(True)
+                    app_mod.torch.set_num_threads(1)
+                else:
+                    app_mod.set_pure_arm_mode(False)
+                    app_mod.torch.set_num_threads(opt_threads)
+
+                app_mod.confirmation_manager.tracks.clear()
+                ocr_call_counter["count"] = 0
+                sampler.start()
+                t0 = time.perf_counter()
+                res = app_mod.run_anpr(
+                    img_bgr.copy(),
+                    is_stream=False,
+                    frame_id=(idx * 1000 + r_i * 10 + (1 if variant == "A" else 2)),
+                    single_vehicle_mode=True,
+                )
+                w_ms = (time.perf_counter() - t0) * 1000.0
+                c_pct = sampler.stop()
+                st = extract_stage_timings(res)
+                dets = res.get("detections") or []
+                p_str = (dets[0].get("license_plate") or "") if dets else ""
+
+                if variant == "A":
+                    runs_a.append(st)
+                    wall_a.append(w_ms)
+                    cpu_a.append(c_pct)
+                    calls_a.append(ocr_call_counter["count"])
+                    pred_a = p_str
+                else:
+                    runs_b.append(st)
+                    wall_b.append(w_ms)
+                    cpu_b.append(c_pct)
+                    calls_b.append(ocr_call_counter["count"])
+                    pred_b = p_str
+
+        clk_now = get_system_power_and_clock().get("cpu_freq_current_mhz") or 0.0
+        for k in ("yolo_ms", "plate_ms", "ocr_ms", "body_ms", "total_ms"):
+            bucket_a[k].append(statistics.median(s[k] for s in runs_a))
+            bucket_b[k].append(statistics.median(s[k] for s in runs_b))
+        bucket_a["wall_ms"].append(statistics.median(wall_a))
+        bucket_b["wall_ms"].append(statistics.median(wall_b))
+        bucket_a["cpu_pct"].append(statistics.median(cpu_a))
+        bucket_b["cpu_pct"].append(statistics.median(cpu_b))
+        bucket_a["ocr_calls"].append(statistics.median(calls_a))
+        bucket_b["ocr_calls"].append(statistics.median(calls_b))
+        bucket_a["clock_mhz"].append(clk_now)
+        bucket_b["clock_mhz"].append(clk_now)
+        bucket_a["preds"][row["file"]] = pred_a
+        bucket_b["preds"][row["file"]] = pred_b
+
+        ta = bucket_a["total_ms"][-1]
+        tb = bucket_b["total_ms"][-1]
+        same_pred = (normalize_plate(pred_a) == normalize_plate(pred_b))
+        print(
+            f"[{idx:02d}/{len(valid_rows):02d}] A_total={ta:6.1f}ms vs B_total={tb:6.1f}ms | "
+            f"A_pred={pred_a!r:11s} B_pred={pred_b!r:11s} ({'SAME' if same_pred else 'DIFF'}) | clk={clk_now:.0f}MHz | {row['file']}",
+            flush=True,
+        )
+
+    # Kembalikan ke konfigurasi default Langkah 2
+    app_mod.set_pure_arm_mode(app_mod.should_enable_pure_arm())
+    app_mod.torch.set_num_threads(opt_threads)
+
+    def _summarize(b):
+        lat = {}
+        for k in ("yolo_ms", "plate_ms", "ocr_ms", "body_ms", "total_ms", "wall_ms"):
+            lat[k] = {
+                "p50": round(percentile(b[k], 50), 2),
+                "p95": round(percentile(b[k], 95), 2),
+            }
+        return {
+            "latency_ms": lat,
+            "avg_cpu_pct": round(statistics.mean(b["cpu_pct"]), 1) if b["cpu_pct"] else 0.0,
+            "avg_ocr_calls": round(statistics.mean(b["ocr_calls"]), 2) if b["ocr_calls"] else 0.0,
+            "avg_clock_mhz": round(statistics.mean(b["clock_mhz"]), 1) if b["clock_mhz"] else 0.0,
+        }
+
+    sum_a = _summarize(bucket_a)
+    sum_b = _summarize(bucket_b)
+    same_count = sum(
+        1 for f in bucket_a["preds"]
+        if normalize_plate(bucket_a["preds"][f]) == normalize_plate(bucket_b["preds"][f])
+    )
+    sys_end = get_system_power_and_clock()
+
+    print("\n" + "=" * 94)
+    print("HASIL INTERLEAVED A/B LANGKAH 2 (Lantai Noise Teramati ~25%)")
+    print("=" * 94)
+    for k in ("yolo_ms", "plate_ms", "ocr_ms", "body_ms", "total_ms", "wall_ms"):
+        a50, a95 = sum_a["latency_ms"][k]["p50"], sum_a["latency_ms"][k]["p95"]
+        b50, b95 = sum_b["latency_ms"][k]["p50"], sum_b["latency_ms"][k]["p95"]
+        diff_p50 = ((b50 - a50) / a50 * 100.0) if a50 > 0 else 0.0
+        note = "tidak terbedakan (<25%)" if abs(diff_p50) < 25.0 else "BERBEDA NYATA (>=25%)"
+        print(f"  - {k:10s} | A (p50/p95): {a50:6.1f}/{a95:6.1f} ms | B (p50/p95): {b50:6.1f}/{b95:6.1f} ms | delta p50: {diff_p50:+5.1f}% [{note}]")
+    print(f"  - CPU%       | A: {sum_a['avg_cpu_pct']:.1f}% | B: {sum_b['avg_cpu_pct']:.1f}%")
+    print(f"  - OCR calls  | A: {sum_a['avg_ocr_calls']:.2f}x | B: {sum_b['avg_ocr_calls']:.2f}x")
+    print(f"  - Konsistensi bacaan plat A vs B: {same_count}/{len(bucket_a['preds'])} foto identik")
+    print("=" * 94, flush=True)
+
+    out_dir = os.path.join(ROOT, "output", "eval")
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = args.out or os.path.join(out_dir, f"interleaved_l2_{int(time.time())}.json")
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "protocol": "interleaved_A_B",
+        "photos_count": len(bucket_a["preds"]),
+        "runs_per_photo_per_variant": args.runs,
+        "noise_floor_pct": 25.0,
+        "system_start": sys_start,
+        "system_end": sys_end,
+        "variant_A_baseline_l1": sum_a,
+        "variant_B_langkah_2": sum_b,
+        "plate_consistency_same_count": same_count,
+        "preds_A": bucket_a["preds"],
+        "preds_B": bucket_b["preds"],
+    }
+    with open(out_file, "w", encoding="utf-8") as f_out:
+        json.dump(payload, f_out, indent=2, ensure_ascii=False)
+    print(f"[INFO] Laporan Interleaved A/B disimpan ke: {out_file}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluasi Terukur Pipeline ANPR")
     parser.add_argument("--gt", default=_default_gt_path(), help="Path file ground_truth.local.csv atau ground_truth.csv")
@@ -167,6 +394,7 @@ def main():
     parser.add_argument("--token", default=os.environ.get("ANPR_API_TOKEN", ""), help="API token untuk --mode endpoint")
     parser.add_argument("--runs", type=int, default=5, help="Jumlah pengulangan per foto (default: 5)")
     parser.add_argument("--limit", type=int, default=0, help="Batasi jumlah foto dari CSV (0 = semua)")
+    parser.add_argument("--interleaved-l2", action="store_true", help="Jalankan evaluasi A/B bergantian untuk Langkah 2")
     parser.add_argument("--out", default="", help="Simpan hasil JSON ke file tertentu")
     args = parser.parse_args()
 
@@ -181,8 +409,16 @@ def main():
     valid_rows = [r for r in gt_rows if os.path.isfile(r["abs_file"])]
     missing_rows = [r for r in gt_rows if not os.path.isfile(r["abs_file"])]
 
+    if args.interleaved_l2:
+        run_interleaved_l2_eval(args, valid_rows)
+        return
+
+    sys_info = get_system_power_and_clock()
     print("=" * 88)
-    print(f"EVALUASI ANPR | Mode: {args.mode.upper()} | Runs: {args.runs}x | Foto Valid: {len(valid_rows)}/{len(gt_rows)} | Arch: {platform.machine()}")
+    print(
+        f"EVALUASI ANPR | Mode: {args.mode.upper()} | Runs: {args.runs}x | Foto Valid: {len(valid_rows)}/{len(gt_rows)} | "
+        f"Arch: {platform.machine()} | Charger: {sys_info['power_plugged']} | Clock: {sys_info['cpu_freq_current_mhz']} MHz"
+    )
     print("=" * 88, flush=True)
     if missing_rows:
         print(f"[WARN] {len(missing_rows)} file gambar di CSV tidak ditemukan di disk.")

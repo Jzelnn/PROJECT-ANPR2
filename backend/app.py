@@ -1,16 +1,28 @@
 import os
-# Batasi CPU threads OpenMP / OpenBLAS & disable vector extensions agar kompatibel 100% dengan ARMv8 Cortex-A72 Raspberry Pi & multi-core PC
-os.environ["OPENBLAS_CORETYPE"] = os.environ.get("OPENBLAS_CORETYPE", "ARMV8")
-os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", "1")
-os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", "1")
-os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", "1")
-os.environ["USE_XNNPACK"] = os.environ.get("USE_XNNPACK", "0")
-os.environ["TORCH_DISABLE_XNNPACK"] = os.environ.get("TORCH_DISABLE_XNNPACK", "1")
-os.environ["TORCH_NUM_THREADS"] = os.environ.get("TORCH_NUM_THREADS", "1")
+import sys
+import platform
+
+# Deteksi arsitektur CPU secara dinamis:
+# - Pada Linux ARM64 (Raspberry Pi 4 Cortex-A72): batasi 1 thread dan matikan XNNPACK/BFloat16 agar bebas SIGILL/atomics crash.
+# - Pada Laptop/Server x86_64: gunakan jumlah thread optimal (2 s/d 4) dan biarkan akselerasi vektor MKL-DNN/XNNPACK aktif.
+_MACHINE_ARCH = platform.machine().lower()
+IS_ARM_CPU = _MACHINE_ARCH in ("aarch64", "arm64") or _MACHINE_ARCH.startswith("arm")
+IS_LINUX_ARM64 = (sys.platform == "linux" and _MACHINE_ARCH in ("aarch64", "arm64"))
+_DEFAULT_CPU_THREADS = "1" if IS_ARM_CPU else str(min(4, max(2, (os.cpu_count() or 4) // 2)))
+_CONFIGURED_THREADS = os.environ.get("ANPR_TORCH_THREADS") or os.environ.get("TORCH_NUM_THREADS") or _DEFAULT_CPU_THREADS
+
+if IS_ARM_CPU:
+    os.environ["OPENBLAS_CORETYPE"] = os.environ.get("OPENBLAS_CORETYPE", "ARMV8")
+    os.environ["USE_XNNPACK"] = os.environ.get("USE_XNNPACK", "0")
+    os.environ["TORCH_DISABLE_XNNPACK"] = os.environ.get("TORCH_DISABLE_XNNPACK", "1")
+
+os.environ["OMP_NUM_THREADS"] = os.environ.get("OMP_NUM_THREADS", _CONFIGURED_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = os.environ.get("OPENBLAS_NUM_THREADS", _CONFIGURED_THREADS)
+os.environ["MKL_NUM_THREADS"] = os.environ.get("MKL_NUM_THREADS", _CONFIGURED_THREADS)
+os.environ["TORCH_NUM_THREADS"] = _CONFIGURED_THREADS
 import re
 import time
 import datetime
-import sqlite3
 import shutil
 import io
 import csv
@@ -28,7 +40,7 @@ from urllib.parse import urlparse
 import numpy as np
 import cv2
 # Batasi thread pool internal OpenCV agar tidak oversubscribe CPU cores bersama PyTorch & PaddleOCR
-cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "2")))
+cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "1" if IS_ARM_CPU else "2")))
 from flask import Flask, request, jsonify, Response, send_from_directory, send_file
 from flask_cors import CORS
 from flask_sock import Sock
@@ -45,29 +57,30 @@ if not hasattr(np, 'sctypes'):
 
 try:
     import torch
-    if hasattr(torch.backends, 'mkldnn'):
-        torch.backends.mkldnn.enabled = False
-    if hasattr(torch.backends, 'nnpack'):
-        torch.backends.nnpack.enabled = False
-    if hasattr(torch.backends, 'xnnpack'):
-        torch.backends.xnnpack.enabled = False
+    if IS_ARM_CPU:
+        if hasattr(torch.backends, 'mkldnn'):
+            torch.backends.mkldnn.enabled = False
+        if hasattr(torch.backends, 'nnpack'):
+            torch.backends.nnpack.enabled = False
+        if hasattr(torch.backends, 'xnnpack'):
+            torch.backends.xnnpack.enabled = False
     HAS_CUDA = torch.cuda.is_available()
     if not HAS_CUDA:
-        # Batasi PyTorch CPU threads (default 1 pada ARM64 Cortex-A72 untuk mencegah crash atomics)
-        torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "1"))
+        torch_threads = int(_CONFIGURED_THREADS)
         torch.set_num_threads(torch_threads)
         
-        # Matikan CPU AMP / Autocast agar tidak menyentuh instruksi ARMv8.2 BFLOAT16/FP16 pada Cortex-A72
-        class NullContext:
-            def __enter__(self): return self
-            def __exit__(self, *args): pass
+        if IS_ARM_CPU:
+            # Matikan CPU AMP / Autocast pada ARM64 agar tidak menyentuh instruksi ARMv8.2 BFLOAT16/FP16 pada Cortex-A72
+            class NullContext:
+                def __enter__(self): return self
+                def __exit__(self, *args): pass
 
-        if hasattr(torch, 'autocast'):
-            torch.autocast = lambda *args, **kwargs: NullContext()
-        if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
-            torch.cuda.amp.autocast = lambda *args, **kwargs: NullContext()
-        if hasattr(torch.cpu, 'amp') and hasattr(torch.cpu.amp, 'autocast'):
-            torch.cpu.amp.autocast = lambda *args, **kwargs: NullContext()
+            if hasattr(torch, 'autocast'):
+                torch.autocast = lambda *args, **kwargs: NullContext()
+            if hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast'):
+                torch.cuda.amp.autocast = lambda *args, **kwargs: NullContext()
+            if hasattr(torch.cpu, 'amp') and hasattr(torch.cpu.amp, 'autocast'):
+                torch.cpu.amp.autocast = lambda *args, **kwargs: NullContext()
 except ImportError:
     HAS_CUDA = False
 
@@ -228,13 +241,46 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
 
 _ORIG_MODEL_PREDICT = Model.predict
 _ORIG_MODEL_CALL = Model.__call__
+_ORIG_YOLO_PREDICT = YOLO.predict
+_ORIG_YOLO_CALL = YOLO.__call__
 
-# Pasang bypass ke Ultralytics jika berjalan di CPU (Raspberry Pi Cortex-A72)
-if not HAS_CUDA:
-    Model.predict = pure_arm_yolo_predict
-    Model.__call__ = pure_arm_yolo_predict
-    YOLO.predict = pure_arm_yolo_predict
-    YOLO.__call__ = pure_arm_yolo_predict
+
+def should_enable_pure_arm(platform_str=None, machine_str=None, env_val=None):
+    """
+    Menentukan apakah bypass pure_arm_yolo_predict diaktifkan.
+    Aktif HANYA bila:
+      - sys.platform == "linux" dan machine in ("aarch64", "arm64") dan ANPR_PURE_ARM != "0", ATAU
+      - ANPR_PURE_ARM == "1" secara eksplisit.
+    Tidak aktif di macOS (darwin) maupun Windows/Linux x86_64 secara default.
+    """
+    plat = (platform_str if platform_str is not None else sys.platform).lower()
+    mach = (machine_str if machine_str is not None else platform.machine()).lower()
+    raw_env = (env_val if env_val is not None else os.environ.get("ANPR_PURE_ARM", "")).strip()
+    if raw_env == "1":
+        return True
+    if raw_env == "0":
+        return False
+    return plat == "linux" and mach in ("aarch64", "arm64")
+
+
+def set_pure_arm_mode(enabled):
+    """Mengaktifkan atau menonaktifkan monkeypatch pure_arm_yolo_predict secara dinamis."""
+    global USE_PURE_ARM
+    USE_PURE_ARM = bool(enabled)
+    if USE_PURE_ARM and not HAS_CUDA:
+        Model.predict = pure_arm_yolo_predict
+        Model.__call__ = pure_arm_yolo_predict
+        YOLO.predict = pure_arm_yolo_predict
+        YOLO.__call__ = pure_arm_yolo_predict
+    else:
+        Model.predict = _ORIG_MODEL_PREDICT
+        Model.__call__ = _ORIG_MODEL_CALL
+        YOLO.predict = _ORIG_YOLO_PREDICT
+        YOLO.__call__ = _ORIG_YOLO_CALL
+    return USE_PURE_ARM
+
+
+USE_PURE_ARM = set_pure_arm_mode(should_enable_pure_arm())
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")
@@ -305,7 +351,7 @@ FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of ev
 DEVICE = os.environ.get("ANPR_DEVICE", "cuda" if HAS_CUDA else "cpu")
 USE_FP16 = False  # Keep false on CPU to prevent warnings
 if not HAS_CUDA:
-    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", "1")))
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", _CONFIGURED_THREADS)))
 
 # Fast Temporal Confirmation Configuration
 MIN_OBSERVATIONS = 3

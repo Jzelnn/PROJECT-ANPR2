@@ -335,6 +335,22 @@ class TestAnprInvariants(unittest.TestCase):
             else:
                 os.environ["ANPR_CORS_ORIGINS"] = old_cors
 
+    def test_07_pure_arm_platform_detection(self):
+        """
+        Pastikan logika should_enable_pure_arm sesuai spesifikasi Langkah 2:
+        - Aktif di Linux aarch64/arm64 saat ANPR_PURE_ARM kosong atau "1"
+        - Mati di Linux aarch64/arm64 saat ANPR_PURE_ARM="0"
+        - Mati di macOS (darwin arm64) dan Windows/Linux x86_64 secara default
+        - Aktif di mana saja jika ANPR_PURE_ARM="1"
+        """
+        self.assertTrue(A.should_enable_pure_arm("linux", "aarch64", ""))
+        self.assertTrue(A.should_enable_pure_arm("linux", "arm64", ""))
+        self.assertFalse(A.should_enable_pure_arm("linux", "aarch64", "0"))
+        self.assertFalse(A.should_enable_pure_arm("darwin", "arm64", ""))
+        self.assertFalse(A.should_enable_pure_arm("win32", "AMD64", ""))
+        self.assertFalse(A.should_enable_pure_arm("linux", "x86_64", ""))
+        self.assertTrue(A.should_enable_pure_arm("win32", "AMD64", "1"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
