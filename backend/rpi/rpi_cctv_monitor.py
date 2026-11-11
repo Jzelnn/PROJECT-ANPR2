@@ -25,15 +25,18 @@ Tombol Kontrol di Layar Monitor:
 =============================================================================
 """
 
+import os
 import cv2
 import time
 import requests
 import argparse
 import threading
+import numpy as np
 from datetime import datetime
 
 parser = argparse.ArgumentParser(description="Raspberry Pi CCTV Monitor Client for ANPR")
 parser.add_argument("--server", default="http://127.0.0.1:5001", help="URL Server ANPR (contoh: http://192.168.1.100:5001)")
+parser.add_argument("--token", default=os.environ.get("ANPR_API_TOKEN", ""), help="Token API (default dari env ANPR_API_TOKEN)")
 parser.add_argument("--fps", type=int, default=25, help="Target FPS tampilan monitor")
 parser.add_argument("--auto", action="store_true", help="Langsung aktifkan Auto-Scan saat mulai")
 args = parser.parse_args()
@@ -41,6 +44,17 @@ args = parser.parse_args()
 SERVER_URL = args.server.rstrip("/")
 STREAM_URL = f"{SERVER_URL}/api/live_stream"
 DETECT_URL = f"{SERVER_URL}/api/detect_current"
+API_TOKEN = (args.token or "").strip()
+
+
+def _get_auth_headers():
+    if not API_TOKEN:
+        return {}
+    return {
+        "Authorization": f"Bearer {API_TOKEN}",
+        "X-API-Token": API_TOKEN,
+    }
+
 
 # State global
 latest_detection = None
@@ -57,7 +71,7 @@ def async_scan_worker():
     global is_scanning, latest_detection, scan_status_text, scan_time_sec
     try:
         t0 = time.time()
-        resp = requests.post(DETECT_URL, timeout=4)
+        resp = requests.post(DETECT_URL, headers=_get_auth_headers(), timeout=4)
         scan_time_sec = round(time.time() - t0, 2)
         if resp.status_code == 200:
             data = resp.json()
@@ -86,6 +100,42 @@ def trigger_scan():
     threading.Thread(target=async_scan_worker, daemon=True).start()
 
 
+def iter_mjpeg_frames(stream_url, headers):
+    """Membaca stream MJPEG dengan dukungan header autentikasi token."""
+    if not headers:
+        cap = cv2.VideoCapture(stream_url)
+        if not cap.isOpened():
+            return
+        try:
+            while True:
+                ret, frm = cap.read()
+                if not ret or frm is None:
+                    time.sleep(0.05)
+                    continue
+                yield frm
+        finally:
+            cap.release()
+    else:
+        with requests.get(stream_url, headers=headers, stream=True, timeout=10) as r:
+            if r.status_code != 200:
+                print(f"[ERROR] Stream ditolak server (HTTP {r.status_code}). Periksa ANPR_API_TOKEN.")
+                return
+            buf = b""
+            for chunk in r.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                buf += chunk
+                a = buf.find(b"\xff\xd8")
+                b = buf.find(b"\xff\xd9")
+                if a != -1 and b != -1 and b > a:
+                    jpg = buf[a : b + 2]
+                    buf = buf[b + 2 :]
+                    arr = np.frombuffer(jpg, dtype=np.uint8)
+                    frm = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frm is not None:
+                        yield frm
+
+
 def main():
     global auto_scan, last_scan_time
 
@@ -99,21 +149,13 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    cap = cv2.VideoCapture(STREAM_URL)
-    if not cap.isOpened():
-        print(f"[ERROR] Gagal membuka stream dari {STREAM_URL}")
-        print("Pastikan app.py di laptop sudah berjalan dan kamera sudah Connect.")
-        return
+    frame_gen = iter_mjpeg_frames(STREAM_URL, _get_auth_headers())
 
     fps_display = 0.0
     frame_count = 0
     fps_timer = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.05)
-            continue
+    for frame in frame_gen:
 
         h, w = frame.shape[:2]
         frame_count += 1
@@ -179,7 +221,6 @@ def main():
             new_prop = cv2.WINDOW_NORMAL if prop == cv2.WINDOW_FULLSCREEN else cv2.WINDOW_FULLSCREEN
             cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, new_prop)
 
-    cap.release()
     cv2.destroyAllWindows()
 
 

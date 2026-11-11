@@ -17,7 +17,11 @@ output/results/*
 !output/results/.gitkeep
 output/logs/*
 !output/logs/.gitkeep
+output/eval/
 output/parking_history.json
+
+# Ground truth lokal berlabel (jangan pernah di-commit ke git; hanya template kosong yang di-commit)
+tools/eval/ground_truth.local.csv
 
 # Bobot model (besar). File yang sudah dilacak git tetap dilacak.
 models/**/*.pt
@@ -33,7 +37,6 @@ test/scratch/
 # Jupyter Notebooks & Scratch
 *.ipynb
 .ipynb_checkpoints/
-
 
 # Local scratch & archives
 scratch/

@@ -152,9 +152,16 @@ def extract_stage_timings(res_dict):
     }
 
 
+def _default_gt_path():
+    local_gt = os.path.join(ROOT, "tools", "eval", "ground_truth.local.csv")
+    if os.path.isfile(local_gt):
+        return local_gt
+    return os.path.join(ROOT, "tools", "eval", "ground_truth.csv")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluasi Terukur Pipeline ANPR")
-    parser.add_argument("--gt", default=os.path.join(ROOT, "tools", "eval", "ground_truth.csv"), help="Path file ground_truth.csv")
+    parser.add_argument("--gt", default=_default_gt_path(), help="Path file ground_truth.local.csv atau ground_truth.csv")
     parser.add_argument("--mode", choices=["direct", "endpoint"], default="direct", help="Mode evaluasi: direct (run_anpr) atau endpoint (POST /api/detect)")
     parser.add_argument("--url", default="http://127.0.0.1:5001/api/detect", help="URL endpoint untuk --mode endpoint")
     parser.add_argument("--token", default=os.environ.get("ANPR_API_TOKEN", ""), help="API token untuk --mode endpoint")

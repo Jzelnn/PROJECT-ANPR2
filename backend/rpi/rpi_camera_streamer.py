@@ -8,11 +8,34 @@ Mendukung:
 2. Snapshot Jepret Foto: http://<IP-Raspberry-Pi>:8080/capture_image
 """
 
+import os
+import hmac
 import cv2
 import threading
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
+
+
+def _check_streamer_token():
+    expected = os.environ.get("ANPR_API_TOKEN", "").strip()
+    if not expected:
+        return True
+    auth_hdr = request.headers.get("Authorization", "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        tok = auth_hdr[7:].strip()
+    else:
+        tok = request.headers.get("X-API-Token", "").strip()
+    return bool(tok and hmac.compare_digest(tok, expected))
+
+
+@app.before_request
+def enforce_streamer_auth():
+    if request.path in ("/", "/ping"):
+        return None
+    if not _check_streamer_token():
+        return jsonify({"error": "Unauthorized: ANPR_API_TOKEN required"}), 401
+    return None
 
 # Otomatis cari index kamera yang aktif (0, 1, atau 2)
 camera = None

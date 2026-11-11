@@ -15,6 +15,9 @@ import shutil
 import io
 import csv
 import base64
+import hmac
+import hashlib
+import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, Counter
@@ -937,6 +940,13 @@ def _save_parking_record_internal(det, source_img=None, source_img_path=None):
 # 1. Live stream di monitor CCTV benar-benar bergerak mulus (25 FPS).
 # 2. Deteksi instan: frame selalu siap di RAM sehingga scan < 1 detik (bebas jeda RTSP 3s).
 # ============================================================
+def _redact_url(url_str):
+    """Menyensor password pada URL berformat scheme://user:password@host sebelum dicetak ke log/status."""
+    if not url_str or not isinstance(url_str, str):
+        return url_str
+    return re.sub(r'([a-zA-Z0-9+.-]+://[^:/\s@]+:)([^@\s]+)(@)', r'\1***\3', url_str)
+
+
 class CameraStreamManager:
     def __init__(self):
         self.lock = threading.RLock()
@@ -1009,7 +1019,7 @@ class CameraStreamManager:
             return {
                 "running": self.running,
                 "status": self.status,
-                "stream_url": self.stream_url,
+                "stream_url": _redact_url(self.stream_url),
                 "fps": round(self.fps, 1),
                 "has_frame": self.latest_frame is not None,
                 "error": self.error_msg
@@ -1017,9 +1027,13 @@ class CameraStreamManager:
 
     def _resolve_stream_source(self):
         url = self.stream_url.strip()
-        # Jika user tidak mengganti teks placeholder PASSWORD_ANDA, otomatis gunakan password CCTV Mddcoid*
+        env_user = os.environ.get("ANPR_CCTV_USER", "").strip()
+        env_pass = os.environ.get("ANPR_CCTV_PASSWORD", "").strip()
+        eff_user = self.username or env_user or "admin"
+        eff_pass = self.password or env_pass
+
         if "PASSWORD_ANDA" in url:
-            url = url.replace("PASSWORD_ANDA", self.password or "Mddcoid*")
+            url = url.replace("PASSWORD_ANDA", eff_pass)
 
         is_isapi = "/isapi/" in url.lower() or url.lower().endswith("/picture")
         if is_isapi:
@@ -1027,9 +1041,8 @@ class CameraStreamManager:
             ip_m = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', url)
             if ip_m:
                 ip = ip_m.group(1)
-                u = self.username or "admin"
-                p = self.password or "Mddcoid*"
-                return f"rtsp://{u}:{p}@{ip}:554/Streaming/Channels/101", True
+                auth_part = f"{eff_user}:{eff_pass}@" if eff_pass else (f"{eff_user}@" if eff_user else "")
+                return f"rtsp://{auth_part}{ip}:554/Streaming/Channels/101", True
         elif not url.lower().startswith(("rtsp://", "rtsps://", "http://", "https://")):
             # Resolve relative file path to PROJECT_ROOT
             if not os.path.isabs(url):
@@ -1038,16 +1051,16 @@ class CameraStreamManager:
                     url = cand_path
             # Anggap IP camera RTSP jika bukan file
             if not os.path.isfile(url):
-                u = self.username or "admin"
-                p = self.password or "Mddcoid*"
-                return f"rtsp://{u}:{p}@{url}:554/Streaming/Channels/101", True
+                auth_part = f"{eff_user}:{eff_pass}@" if eff_pass else (f"{eff_user}@" if eff_user else "")
+                return f"rtsp://{auth_part}{url}:554/Streaming/Channels/101", True
 
         is_rtsp = url.lower().startswith(("rtsp://", "rtsps://"))
         return url, is_rtsp
 
     def _worker_loop(self):
         source_url, is_rtsp = self._resolve_stream_source()
-        print(f"[STREAM] Membuka koneksi video permanen ke: {source_url}")
+        safe_url = _redact_url(source_url)
+        print(f"[STREAM] Membuka koneksi video permanen ke: {safe_url}")
 
         if is_rtsp:
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -1063,7 +1076,7 @@ class CameraStreamManager:
         if not cap.isOpened():
             with self.lock:
                 self.status = "error"
-                self.error_msg = f"Gagal membuka koneksi ke: {source_url}"
+                self.error_msg = f"Gagal membuka koneksi ke: {safe_url}"
                 self.running = False
             print(f"[STREAM ERROR] {self.error_msg}")
             return
@@ -5237,8 +5250,222 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+
+def _get_allowed_cors_origins():
+    raw = os.environ.get("ANPR_CORS_ORIGINS", "").strip()
+    if not raw:
+        return []
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+_initial_cors_origins = _get_allowed_cors_origins()
+if _initial_cors_origins:
+    CORS(app, resources={r"/*": {"origins": _initial_cors_origins}})
 sock = Sock(app)
+
+
+def _get_configured_api_token():
+    return os.environ.get("ANPR_API_TOKEN", "").strip()
+
+
+def _is_auth_disabled():
+    return os.environ.get("ANPR_AUTH_DISABLED", "0").strip() == "1"
+
+
+_FALLBACK_SESSION_SECRET = secrets.token_hex(32)
+SESSION_COOKIE_NAME = "anpr_session"
+SESSION_TTL_SECONDS = 12 * 3600  # 12 jam
+_AUTH_RATE_LOCK = threading.Lock()
+_AUTH_FAILED_ATTEMPTS = {}  # ip -> [timestamps]
+AUTH_RATE_LIMIT_MAX_FAILS = 10
+AUTH_RATE_LIMIT_WINDOW_SEC = 60.0
+
+
+def _get_session_secret_bytes():
+    env_sec = os.environ.get("ANPR_SESSION_SECRET", "").strip()
+    sec_str = env_sec if env_sec else _FALLBACK_SESSION_SECRET
+    return sec_str.encode("utf-8")
+
+
+def create_session_cookie_value(ttl_sec=SESSION_TTL_SECONDS, now_ts=None):
+    now_val = int(time.time()) if now_ts is None else int(now_ts)
+    exp_ts = now_val + int(ttl_sec)
+    nonce = secrets.token_hex(8)
+    payload = f"v1.{exp_ts}.{nonce}"
+    sig = hmac.new(_get_session_secret_bytes(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def verify_session_cookie_value(cookie_val, now_ts=None):
+    if not cookie_val or not isinstance(cookie_val, str):
+        return False
+    parts = cookie_val.strip().split(".")
+    if len(parts) != 4:
+        return False
+    ver, exp_str, nonce, provided_sig = parts
+    if ver != "v1" or not exp_str.isdigit() or not nonce or not provided_sig:
+        return False
+    payload = f"{ver}.{exp_str}.{nonce}"
+    expected_sig = hmac.new(_get_session_secret_bytes(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(provided_sig, expected_sig):
+        return False
+    now_val = int(time.time()) if now_ts is None else int(now_ts)
+    if int(exp_str) < now_val:
+        return False
+    return True
+
+
+def _extract_request_api_token(req):
+    auth_hdr = req.headers.get("Authorization", "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        return auth_hdr[7:].strip()
+    x_tok = req.headers.get("X-API-Token", "").strip()
+    if x_tok:
+        return x_tok
+    return ""
+
+
+def _is_valid_header_token(req, expected_token):
+    if not expected_token:
+        return True
+    provided = _extract_request_api_token(req)
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, expected_token)
+
+
+def _is_valid_session_cookie(req):
+    c_val = req.cookies.get(SESSION_COOKIE_NAME, "")
+    return verify_session_cookie_value(c_val)
+
+
+def _is_origin_allowed(req):
+    req_origin = (req.headers.get("Origin") or "").strip().rstrip("/")
+    if not req_origin:
+        return True
+    allowed_origins = _get_allowed_cors_origins()
+    if "*" in allowed_origins or req_origin in allowed_origins:
+        return True
+    host_origin = (req.host_url or "").strip().rstrip("/")
+    if host_origin and req_origin == host_origin:
+        return True
+    # Izinkan kecocokan localhost <-> 127.0.0.1 pada port yang sama untuk kemudahan akses browser lokal
+    try:
+        p_req = urlparse(req_origin)
+        p_host = urlparse(host_origin)
+        local_hosts = ("127.0.0.1", "localhost")
+        if p_req.hostname in local_hosts and p_host.hostname in local_hosts and (p_req.port or 80) == (p_host.port or 80):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+@app.before_request
+def enforce_api_token_auth():
+    if request.method == "OPTIONS":
+        return None
+
+    path = request.path or ""
+    # Halaman utama HTML publik (agar pengguna bisa memasukkan token di UI Dashboard)
+    if path in ("/", "/dashboard", "/favicon.ico"):
+        return None
+    # Endpoint login/logout sesi memiliki penanganan autentikasi & rate-limit tersendiri
+    if path in ("/api/auth/session", "/api/auth/logout"):
+        return None
+
+    expected_token = _get_configured_api_token()
+    if not expected_token:
+        return None
+
+    is_protected = path.startswith("/api/") or path.startswith("/captures/") or path == "/view_result"
+    if not is_protected:
+        return None
+
+    # 1. Semua metode pengubah state (POST/PUT/DELETE/PATCH) WAJIB menyertakan header Authorization / X-API-Token
+    #    Cookie sesi TIDAK diterima untuk mencegah serangan CSRF!
+    if request.method not in ("GET", "HEAD"):
+        if not _is_valid_header_token(request, expected_token):
+            return jsonify({
+                "error": "Unauthorized: permintaan pengubah data (POST/PUT/DELETE) wajib menyertakan header Authorization / X-API-Token."
+            }), 401
+        return None
+
+    # 2. Untuk permintaan baca (GET/HEAD: /api/health, /api/history, /api/export, /api/live_stream,
+    #    /api/latest_result_image, /captures/*, /view_result), terima header token ATAU cookie sesi yang sah.
+    if _is_valid_header_token(request, expected_token) or _is_valid_session_cookie(request):
+        return None
+
+    return jsonify({
+        "error": "Unauthorized: token API atau sesi tidak valid."
+    }), 401
+
+
+@app.route("/api/auth/session", methods=["POST", "OPTIONS"])
+def auth_create_session():
+    """Menukarkan header X-API-Token / Authorization yang sah dengan HttpOnly SameSite=Lax session cookie untuk elemen <img> / GET."""
+    if request.method == "OPTIONS":
+        return "", 200
+
+    client_ip = request.remote_addr or "unknown"
+    now_ts = time.time()
+    with _AUTH_RATE_LOCK:
+        history = [t for t in _AUTH_FAILED_ATTEMPTS.get(client_ip, []) if (now_ts - t) < AUTH_RATE_LIMIT_WINDOW_SEC]
+        _AUTH_FAILED_ATTEMPTS[client_ip] = history
+        if len(history) >= AUTH_RATE_LIMIT_MAX_FAILS:
+            return jsonify({
+                "error": "Too Many Requests: terlalu banyak percobaan autentikasi gagal. Coba lagi dalam 1 menit."
+            }), 429
+
+    expected_token = _get_configured_api_token()
+    if not expected_token:
+        # Jika server berjalan tanpa ANPR_API_TOKEN (mode lokal), tetap terbitkan cookie sesi agar alur UI seragam
+        cookie_val = create_session_cookie_value()
+        resp = jsonify({"status": "ok", "auth_required": False, "expires_in": SESSION_TTL_SECONDS})
+        secure_flag = os.environ.get("ANPR_COOKIE_SECURE", "0").strip() == "1"
+        resp.set_cookie(
+            SESSION_COOKIE_NAME,
+            cookie_val,
+            max_age=SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="Lax",
+            secure=secure_flag,
+            path="/",
+        )
+        return resp
+
+    if not _is_valid_header_token(request, expected_token):
+        with _AUTH_RATE_LOCK:
+            _AUTH_FAILED_ATTEMPTS.setdefault(client_ip, []).append(now_ts)
+        return jsonify({"error": "Unauthorized: token API salah atau kosong."}), 401
+
+    with _AUTH_RATE_LOCK:
+        _AUTH_FAILED_ATTEMPTS.pop(client_ip, None)
+
+    cookie_val = create_session_cookie_value()
+    secure_flag = os.environ.get("ANPR_COOKIE_SECURE", "0").strip() == "1"
+    resp = jsonify({"status": "ok", "auth_required": True, "expires_in": SESSION_TTL_SECONDS})
+    resp.set_cookie(
+        SESSION_COOKIE_NAME,
+        cookie_val,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=secure_flag,
+        path="/",
+    )
+    return resp
+
+
+@app.route("/api/auth/logout", methods=["POST", "OPTIONS"])
+def auth_logout_session():
+    """Menghapus cookie sesi dari browser."""
+    if request.method == "OPTIONS":
+        return "", 200
+    resp = jsonify({"status": "ok", "message": "Sesi berhasil dihapus"})
+    resp.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return resp
 
 
 # ============================================================
@@ -5371,7 +5598,58 @@ stream_inference_worker = StreamInferenceWorker()
 # WEBSOCKET REAL-TIME STREAMING ENDPOINT
 # ============================================================
 @sock.route('/ws/live')
+def _live_ws_endpoint(ws):
+    return live_ws(ws)
+
+
 def live_ws(ws):
+    # Validasi Origin wajib dilakukan untuk mencegah Cross-Site WebSocket Hijacking (CSWSH)
+    if not _is_origin_allowed(request):
+        try:
+            ws.send(json.dumps({"type": "auth_error", "error": "Forbidden WebSocket Origin"}))
+            ws.close()
+        except Exception:
+            pass
+        return
+
+    expected_token = _get_configured_api_token()
+    if expected_token:
+        # Jangan pernah menerima token dari query string URL.
+        # Terima via header Authorization/X-API-Token, Sec-WebSocket-Protocol (anpr-token.<token>),
+        # atau pesan pertama {"type": "auth", "token": "..."}.
+        ws_authed = False
+        if _is_valid_header_token(request, expected_token):
+            ws_authed = True
+        else:
+            proto_hdr = request.headers.get("Sec-WebSocket-Protocol", "")
+            for proto_item in proto_hdr.split(","):
+                proto_item = proto_item.strip()
+                if proto_item.startswith("anpr-token.") and hmac.compare_digest(proto_item[len("anpr-token."):], expected_token):
+                    ws_authed = True
+                    break
+
+        if not ws_authed:
+            try:
+                first_data = ws.receive(timeout=5.0)
+                if first_data is not None:
+                    if isinstance(first_data, bytes):
+                        first_data = first_data.decode("utf-8", errors="ignore")
+                    first_msg = json.loads(first_data)
+                    if isinstance(first_msg, dict) and first_msg.get("type") == "auth":
+                        msg_tok = str(first_msg.get("token", "")).strip()
+                        if msg_tok and hmac.compare_digest(msg_tok, expected_token):
+                            ws_authed = True
+            except Exception:
+                ws_authed = False
+
+        if not ws_authed:
+            try:
+                ws.send(json.dumps({"type": "auth_error", "error": "Unauthorized WebSocket connection"}))
+                ws.close()
+            except Exception:
+                pass
+            return
+
     ws_broadcaster.register(ws)
     try:
         init_payload = {
@@ -5391,7 +5669,9 @@ def live_ws(ws):
                         data = data.decode('utf-8', errors='ignore')
                     msg = json.loads(data)
                     m_type = msg.get("type")
-                    if m_type == "ping":
+                    if m_type == "auth":
+                        ws_broadcaster.send(ws, {"type": "auth_ok", "time": time.time()})
+                    elif m_type == "ping":
                         ws_broadcaster.send(ws, {"type": "pong", "time": time.time()})
                     elif m_type == "detect_frame":
                         # Latest-Only WS Frame Queue Drain: jika ada frame lebih baru di buffer socket, lewati frame lama
@@ -5564,9 +5844,20 @@ def config_interest_area():
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    allowed_origins = _get_allowed_cors_origins()
+    req_origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    host_origin = (request.host_url or "").strip().rstrip("/")
+
+    if "*" in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    elif req_origin and (req_origin in allowed_origins or req_origin == host_origin):
+        response.headers["Access-Control-Allow-Origin"] = req_origin
+        response.headers["Vary"] = "Origin"
+    else:
+        response.headers.pop("Access-Control-Allow-Origin", None)
+
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Token"
     return response
 
 
@@ -5634,7 +5925,7 @@ def stream_start():
     return jsonify({
         "status": "ok" if ok else "error",
         "message": msg,
-        "stream_url": stream_url
+        "stream_url": _redact_url(stream_url)
     })
 
 
@@ -6026,11 +6317,11 @@ def stream_capture():
 
         if not cap.isOpened():
             dev_type = "CCTV RTSP" if is_rtsp else "Kamera/DroidCam"
-            return jsonify({"error": f"Gagal membuka koneksi ke {dev_type} di: {stream_url}. Pastikan perangkat aktif dan kredensial/IP benar."}), 502
+            return jsonify({"error": f"Gagal membuka koneksi ke {dev_type} di: {_redact_url(stream_url)}. Pastikan perangkat aktif dan kredensial/IP benar."}), 502
         ret, frame = cap.read()
         cap.release()
         if not ret or frame is None:
-            return jsonify({"error": f"Gagal membaca frame video dari: {stream_url}"}), 502
+            return jsonify({"error": f"Gagal membaca frame video dari: {_redact_url(stream_url)}"}), 502
 
         temp_path = config.TEMP_UPLOAD_PATH
         cv2.imwrite(temp_path, frame)
@@ -6050,8 +6341,10 @@ def stream_capture():
 def rpi_ping():
     """Memeriksa status koneksi ke ALPR Kit di Raspberry Pi."""
     rpi_url = request.args.get("rpi_url", "http://192.168.1.4:5000").rstrip("/")
+    tok = _get_configured_api_token()
+    req_headers = {"X-API-Token": tok, "Authorization": f"Bearer {tok}"} if tok else {}
     try:
-        r = requests.get(rpi_url, timeout=3)
+        r = requests.get(rpi_url, headers=req_headers, timeout=3)
         return jsonify({"status": "online", "code": r.status_code, "url": rpi_url})
     except Exception as e:
         return jsonify({"status": "offline", "error": str(e), "url": rpi_url}), 200
@@ -6071,6 +6364,8 @@ def rpi_capture():
 
     data = request.get_json(silent=True) or {}
     rpi_url = data.get("rpi_url", "http://192.168.1.4:5000").rstrip("/")
+    tok = _get_configured_api_token()
+    req_headers = {"X-API-Token": tok, "Authorization": f"Bearer {tok}"} if tok else {}
 
     try:
         image_bytes = None
@@ -6078,7 +6373,7 @@ def rpi_capture():
         print(f"[INFO] Memanggil ALPR Kit RPi: {cap_url}")
         r = None
         try:
-            r_try = requests.get(cap_url, timeout=5)
+            r_try = requests.get(cap_url, headers=req_headers, timeout=5)
             if r_try.status_code == 200:
                 r = r_try
         except Exception as e_cap:
@@ -6087,7 +6382,7 @@ def rpi_capture():
         if r is None:
             try:
                 cap_url2 = f"{rpi_url}/capture"
-                r_try2 = requests.get(cap_url2, timeout=5)
+                r_try2 = requests.get(cap_url2, headers=req_headers, timeout=5)
                 if r_try2.status_code == 200:
                     r = r_try2
             except Exception:
@@ -6129,7 +6424,7 @@ def rpi_capture():
                 if img_path:
                     get_img_url = f"{rpi_url}/get_image"
                     print(f"[INFO] Mengunduh foto hasil jepretan dari RPi: {get_img_url} ({img_path})")
-                    r_img = requests.post(get_img_url, json={"image_path": img_path}, timeout=12)
+                    r_img = requests.post(get_img_url, json={"image_path": img_path}, headers=req_headers, timeout=12)
                     if "image" in r_img.headers.get("Content-Type", ""):
                         image_bytes = r_img.content
                     else:
@@ -6164,7 +6459,7 @@ def rpi_capture():
         # Proses dengan pipeline ANPR lokal (YOLO Kendaraan + Plat + Karakter + Samsat Rules)
         result = run_anpr(temp_path)
 
-        # Simpan otomatis ke database SQLite
+        # Simpan otomatis ke database
         if result.get("detections"):
             primary_det = result["detections"][0]
             rec = save_parking_record(primary_det, temp_path)
@@ -6186,10 +6481,35 @@ def rpi_capture():
         return jsonify({"error": str(e)}), 500
 
 
+def validate_startup_security_config(bind_host=None):
+    """
+    Memastikan jika server melakukan bind ke selain localhost (misal 0.0.0.0),
+    ANPR_API_TOKEN wajib diisi kecuali ANPR_AUTH_DISABLED=1 disetel secara eksplisit.
+    """
+    host = (bind_host or os.environ.get("ANPR_BIND_HOST", "0.0.0.0")).strip()
+    is_local = host in ("127.0.0.1", "localhost", "::1")
+    has_token = bool(_get_configured_api_token())
+    auth_disabled = _is_auth_disabled()
+    if not is_local and not has_token and not auth_disabled:
+        msg = (
+            f"[SECURITY ERROR] Menolak menjalankan server pada host non-localhost ({host}) "
+            "tanpa ANPR_API_TOKEN! Setel environment variable ANPR_API_TOKEN=<rahasia> "
+            "atau ANPR_BIND_HOST=127.0.0.1, atau setel ANPR_AUTH_DISABLED=1 jika di jaringan lokal terisolasi."
+        )
+        return False, msg
+    return True, "OK"
+
+
 if __name__ == "__main__":
     import subprocess
     import sys
     import socket
+
+    bind_host = os.environ.get("ANPR_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    sec_ok, sec_msg = validate_startup_security_config(bind_host)
+    if not sec_ok:
+        print(sec_msg, file=sys.stderr, flush=True)
+        sys.exit(1)
 
     # Dukungan port fleksibel: argumen baris perintah (--port X atau X), environment variable, atau default
     chosen_port = None
@@ -6239,7 +6559,7 @@ if __name__ == "__main__":
             pass
 
     print("\n=======================================================")
-    print(f"🚀 Server ANPR jalan di http://0.0.0.0:{target_port} (Single-Pass PaddleOCR)")
+    print(f"🚀 Server ANPR jalan di http://{bind_host}:{target_port}")
     print(f"🌐 Akses Dashboard dari PC / Browser: http://<IP_KOMPUTER>:{target_port}")
     print("=======================================================\n", flush=True)
-    app.run(host="0.0.0.0", port=target_port, debug=False, threaded=True)
+    app.run(host=bind_host, port=target_port, debug=False, threaded=True)
