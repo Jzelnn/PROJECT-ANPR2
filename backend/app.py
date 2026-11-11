@@ -2320,6 +2320,51 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
     return ""
 
 
+def _plate_norm(text):
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def plate_number_row(plate_crop, vehicle_type=None, ratio=None):
+    """
+    Baris nomor polisi di bagian atas plat. Baris bawah biasanya masa berlaku pajak.
+    Motor sering dua baris (nomor di atas, seri di bawah), jadi default motor = crop penuh.
+    ANPR_CHAR_ROW_RATIO=0.74 mencoba membuang baris pajak. Default 1 (crop penuh):
+    pada 30 foto uji, 0.74 menghilangkan digit yang tadinya terbaca.
+    """
+    if plate_crop is None or getattr(plate_crop, "size", 0) == 0:
+        return plate_crop
+    if ratio is None:
+        key = "ANPR_CHAR_ROW_RATIO_MOTOR" if vehicle_type == "motorcycle" else "ANPR_CHAR_ROW_RATIO"
+        try:
+            ratio = float(os.environ.get(key, "1"))
+        except (TypeError, ValueError):
+            ratio = 1.0
+    ratio = min(1.0, max(0.45, ratio))
+    h = int(plate_crop.shape[0])
+    if ratio >= 0.99 or h < 12:
+        return plate_crop
+    cut = max(8, int(round(h * ratio)))
+    if cut >= h:
+        return plate_crop
+    return plate_crop[0:cut, :]
+
+
+def prefer_rapid_reading(c_fused, c_conf, c_valid, r_fused, r_conf, r_valid):
+    """
+    RapidOCR menggantikan model karakter hanya bila hasilnya valid dan lebih yakin,
+    atau bila model karakter belum valid. ANPR_OCR_LONGER_WINS=1 mengembalikan aturan lama
+    (string yang lebih panjang menang meski confidence-nya lebih rendah).
+    """
+    if not r_valid:
+        return False
+    if not c_valid:
+        return True
+    if os.environ.get("ANPR_OCR_LONGER_WINS", "0") == "1":
+        if len(_plate_norm(r_fused)) > len(_plate_norm(c_fused)):
+            return True
+    return float(r_conf or 0.0) >= float(c_conf or 0.0)
+
+
 def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=None, is_stream=False):
     """
     Pembacaan plat nomor Hybrid teroptimasi untuk Raspberry Pi Cortex-A72:
@@ -2332,9 +2377,14 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         return {"final": "", "confidence": 0.0, "method": "invalid_crop"}
 
     raw_plate_crop = plate_crop
+    row_crop = plate_number_row(plate_crop, vehicle_type=vehicle_type)
+    try:
+        char_conf_thresh = float(os.environ.get("ANPR_CHAR_CONF", "0.15"))
+    except (TypeError, ValueError):
+        char_conf_thresh = 0.15
 
-    # 1. Pass Utama: YOLO Character Model pada crop asli
-    c_raw, c_conf, line1 = read_plate_with_char_model(plate_crop, conf=0.15)
+    # 1. Pass Utama: YOLO Character Model pada baris nomor polisi
+    c_raw, c_conf, line1 = read_plate_with_char_model(row_crop, conf=char_conf_thresh)
     c_raw = c_raw.upper() if c_raw else ""
     c_fused = refine_indonesian_plate(c_raw) if c_raw else ""
     c_valid = bool(c_fused) and is_valid_indonesian_plate_structure(c_fused)[0]
@@ -2349,15 +2399,23 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
 
-    # 2. Hybrid C++ ONNX Runtime (RapidOCR PP-OCR) + Cross-Model Fusion dengan char_raw
-    if not (c_valid and c_conf >= 0.52):
-        r_text, r_conf, r_all_texts = rapidocr_read_plate(plate_crop, return_all=True)
+    # 2. RapidOCR hanya dilewati bila model karakter sudah valid dan sangat yakin.
+    # Ambang lama 0.52 membuat bacaan sedang (mis. 0.53) memblokir mesin kedua.
+    # ANPR_CHAR_SKIP_RAPID=0.52 mengembalikan ambang lama.
+    try:
+        skip_rapid_at = float(os.environ.get("ANPR_CHAR_SKIP_RAPID", "0.85"))
+    except (TypeError, ValueError):
+        skip_rapid_at = 0.85
+    if not (c_valid and c_conf >= skip_rapid_at):
+        r_text, r_conf, r_all_texts = rapidocr_read_plate(
+            plate_crop, return_all=True, allow_full_det=not c_valid
+        )
         if r_text or r_all_texts:
             # Gabungkan (fuse) char_raw dari YOLO dengan r_text/r_all_texts dari RapidOCR PP-OCR
             r_fused = refine_indonesian_plate(c_raw, r_text, r_all_texts) or refine_indonesian_plate("", r_text, r_all_texts) or ""
             r_valid = bool(r_fused) and is_valid_indonesian_plate_structure(r_fused)[0]
             print(f"[RAPID_OCR] raw='{r_text}' all={r_all_texts} conf={r_conf:.2f} fused='{r_fused}' valid={r_valid} (char valid={c_valid})", flush=True)
-            if r_valid and (not c_valid or r_conf >= c_conf or len(r_fused.replace(" ", "")) > len((c_fused or "").replace(" ", ""))):
+            if prefer_rapid_reading(c_fused, c_conf, c_valid, r_fused, r_conf, r_valid):
                 final_formatted = verify_and_fix_plate_digits(raw_plate_crop, r_fused, vehicle_type=vehicle_type) or r_fused
                 best_conf = max(c_conf, r_conf) if c_raw else r_conf
                 method_used = "hybrid_char_rapidocr" if c_raw else "rapidocr_onnx"
@@ -2372,21 +2430,21 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         if should_skip_fallbacks is None or not should_skip_fallbacks():
             enh_name, enh_img = None, None
             try:
-                rect_crop, angle = rectify_tilted_plate(plate_crop)
+                rect_crop, angle = rectify_tilted_plate(row_crop)
                 if rect_crop is not None and getattr(rect_crop, "size", 0) > 0 and abs(angle) > 1.5:
                     enh_name, enh_img = "rectified", rect_crop
             except Exception:
                 pass
             if enh_img is None:
                 try:
-                    lab = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2LAB)
+                    lab = cv2.cvtColor(row_crop, cv2.COLOR_BGR2LAB)
                     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
                     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
                     enh_name, enh_img = "clahe", cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
                 except Exception:
                     pass
             if enh_img is not None:
-                e_raw, e_conf, _ = read_plate_with_char_model(enh_img, conf=0.15)
+                e_raw, e_conf, _ = read_plate_with_char_model(enh_img, conf=char_conf_thresh)
                 e_raw = e_raw.upper() if e_raw else ""
                 if e_raw:
                     e_fused = refine_indonesian_plate(e_raw, r_text, r_all_texts) or refine_indonesian_plate(e_raw) or ""
@@ -2426,7 +2484,7 @@ _rapid_failed = False
 _rapid_lock = threading.Lock()
 
 
-def rapidocr_read_plate(plate_crop, return_all=False):
+def rapidocr_read_plate(plate_crop, return_all=False, allow_full_det=True):
     """
     Mesin OCR C++ ONNX Runtime: RapidOCR (model PP-OCRv4 PaddleOCR di atas ONNX Runtime, aman di ARMv8.0 Cortex-A72).
     Mendukung:
@@ -2448,7 +2506,11 @@ def rapidocr_read_plate(plate_crop, return_all=False):
                 print("[RAPID_OCR] RapidOCR siap (C++ ONNX Runtime).", flush=True)
 
             h, w = plate_crop.shape[:2]
-            top_raw = plate_crop[0:max(10, int(h * 0.74)), :]
+            try:
+                rapid_ratio = float(os.environ.get("ANPR_RAPID_ROW_RATIO", "0.74"))
+            except (TypeError, ValueError):
+                rapid_ratio = 0.74
+            top_raw = plate_number_row(plate_crop, ratio=rapid_ratio)
             th, tw = top_raw.shape[:2]
             scale = 48.0 / float(max(1, th))
             top_res = cv2.resize(
@@ -2490,9 +2552,15 @@ def rapidocr_read_plate(plate_crop, return_all=False):
                 if best_text and is_valid_indonesian_plate_structure(refine_indonesian_plate("", best_text, all_raw_texts))[0]:
                     break
 
-            # Pass B: Full Detection + Recognition jika Pass A belum menghasilkan struktur plat valid
+            # Pass B: deteksi penuh. Lambat (~2 dtk). Dilewati bila char sudah valid,
+            # atau ANPR_RAPID_FULL_DET=0. ANPR_RAPID_FULL_DET=1 memaksa Pass B.
             best_parsed = refine_indonesian_plate("", best_text, all_raw_texts) if best_text else ""
-            if not (best_parsed and is_valid_indonesian_plate_structure(best_parsed)[0]):
+            full_det_flag = os.environ.get("ANPR_RAPID_FULL_DET", "auto")
+            if full_det_flag == "0":
+                allow_full_det = False
+            elif full_det_flag == "1":
+                allow_full_det = True
+            if allow_full_det and not (best_parsed and is_valid_indonesian_plate_structure(best_parsed)[0]):
                 full_scale = 64.0 / float(max(1, h))
                 full_res = cv2.resize(
                     plate_crop,

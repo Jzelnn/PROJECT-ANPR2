@@ -5,6 +5,7 @@ ultralytics
 paddleocr>=3.0
 paddlepaddle>=3.0
 opencv-python
+rapidocr-onnxruntime>=1.4
 requests
 numpy
 

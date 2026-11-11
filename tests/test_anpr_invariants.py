@@ -509,6 +509,28 @@ class TestAnprInvariants(unittest.TestCase):
             else:
                 os.environ["ANPR_BODY_IMGSZ"] = old
 
+    def test_11_plate_row_crop_and_longer_string_does_not_win(self):
+        """Baris pajak terpotong. String yang lebih panjang tidak menggantikan bacaan yang lebih yakin."""
+        img = np.zeros((40, 120, 3), dtype=np.uint8)
+        os.environ["ANPR_CHAR_ROW_RATIO"] = "0.74"
+        row = A.plate_number_row(img, vehicle_type="car")
+        self.assertEqual(row.shape[0], int(round(40 * 0.74)))
+        os.environ["ANPR_CHAR_ROW_RATIO"] = "1"
+        self.assertEqual(A.plate_number_row(img, vehicle_type="car").shape[0], 40)
+        motor = A.plate_number_row(img, vehicle_type="motorcycle")
+        self.assertEqual(motor.shape[0], 40)
+        os.environ.pop("ANPR_CHAR_ROW_RATIO", None)
+        os.environ.pop("ANPR_CHAR_ROW_RATIO_MOTOR", None)
+        self.assertEqual(A.plate_number_row(img, vehicle_type="car").shape[0], 40)
+
+        os.environ["ANPR_OCR_LONGER_WINS"] = "0"
+        self.assertFalse(A.prefer_rapid_reading("B 1234 AB", 0.80, True, "B 1234 ABC", 0.40, True))
+        self.assertTrue(A.prefer_rapid_reading("B 12 A", 0.40, False, "B 1234 ABC", 0.70, True))
+        self.assertTrue(A.prefer_rapid_reading("B 1234 AB", 0.50, True, "B 1234 ABC", 0.80, True))
+        os.environ["ANPR_OCR_LONGER_WINS"] = "1"
+        self.assertTrue(A.prefer_rapid_reading("B 1234 AB", 0.80, True, "B 1234 ABC", 0.40, True))
+        os.environ.pop("ANPR_OCR_LONGER_WINS", None)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
