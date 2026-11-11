@@ -351,6 +351,47 @@ PLATE_REDETECT_INTERVAL_SEC = float(os.environ.get("ANPR_PLATE_REDETECT_SEC", 0.
 PLATE_INFER_IMGSZ = int(os.environ.get("ANPR_PLATE_IMGSZ", 320))
 PLATE_INFER_CONF = float(os.environ.get("ANPR_PLATE_INFER_CONF", 0.12))
 DEEP_PLATE_FALLBACK = os.environ.get("ANPR_DEEP_PLATE_FALLBACK", "0") == "1"
+# Ambang yang sama dengan gerbang Entry History untuk hasil yang sudah ditandai terkonfirmasi.
+SINGLE_PHOTO_CONFIRM_CONF = 0.65
+
+
+def unreadable_status_enabled():
+    """ANPR_UNREADABLE=0 mengembalikan perilaku lama (foto selalu CONFIRMED). Default aman: 1."""
+    return os.environ.get("ANPR_UNREADABLE", "1") != "0"
+
+
+def body_async_on_photo():
+    """ANPR_BODY_ASYNC=0 menjalankan klasifikasi bodi sinkron di jalur foto. Default: tidak menghalangi OCR."""
+    return os.environ.get("ANPR_BODY_ASYNC", "1") != "0"
+
+
+def body_infer_imgsz():
+    """Ukuran input klasifikasi bodi. Default 192. ANPR_BODY_IMGSZ=224 hanya untuk uji."""
+    try:
+        return int(os.environ.get("ANPR_BODY_IMGSZ", "192"))
+    except (TypeError, ValueError):
+        return 192
+
+
+def build_perf_breakdown(yolo_ms, plate_ms, track_ms, body_ms, ocr_ms, total_ms, fps, yolo_infer_ms=0.0, yolo_lock_wait_ms=0.0):
+    """
+    Skema latensi. Key lama dipertahankan:
+    vehicle_ms (alias yolo_ms), plate_ms, ocr_ms, body_ms, total_ms.
+    total_ms tidak memasukkan body_ms bila bodi dijalankan asinkron (body_ms = 0 di respons ini).
+    """
+    yolo_ms = round(float(yolo_ms), 1)
+    return {
+        "yolo_ms": yolo_ms,
+        "vehicle_ms": yolo_ms,
+        "yolo_infer_ms": round(float(yolo_infer_ms), 1),
+        "yolo_lock_wait_ms": round(float(yolo_lock_wait_ms), 1),
+        "plate_ms": round(float(plate_ms), 1),
+        "track_ms": round(float(track_ms), 1),
+        "body_ms": round(float(body_ms), 1),
+        "ocr_ms": round(float(ocr_ms), 1),
+        "total_ms": round(float(total_ms), 1),
+        "fps": round(float(fps), 1),
+    }
 
 
 
@@ -740,8 +781,11 @@ def save_parking_record(det, source_img=None, source_img_path=None):
 def _save_parking_record_internal(det, source_img=None, source_img_path=None):
     global LATEST_RECORDS, LAST_RECORDED_PLATES, LAST_RECORDED_TRACK_IDS
 
+    if det.get("status") == "UNREADABLE" or det.get("ocr_status") == "UNREADABLE":
+        return None
+
     plate_text = det.get("license_plate")
-    if not plate_text or plate_text in ["TIDAK_TERBACA", "UNKNOWN", ""]:
+    if not plate_text or plate_text in ["TIDAK_TERBACA", "UNKNOWN", "UNREADABLE", ""]:
         return None
 
     if not isinstance(plate_text, str):
@@ -2543,7 +2587,7 @@ def classify_vehicle_indonesian(image, bbox, initial_vtype, v_conf, has_bus_det=
 
     # Dapatkan prediksi body style model
     with body_infer_lock:
-        bs_res = body_style_model.predict(crop, imgsz=192, verbose=False)[0]
+        bs_res = body_style_model.predict(crop, imgsz=body_infer_imgsz(), verbose=False)[0]
     probs = {bs_res.names[i]: float(bs_res.probs.data[i]) for i in range(len(bs_res.names))}
 
     p_conv = probs.get('Convertible', 0.0)
@@ -3148,11 +3192,11 @@ timestamp={self.first_good_ocr_time:.3f}""")
                     return "CONFIRMED"
                 else:
                     print(f"[LOST INTEREST] Kandidat '{best_cln}' TIDAK memenuhi syarat (count={best_count}, conf={best_conf:.2f}) -> Dibuang tanpa masuk riwayat!")
-                    self.status = "DISCARDED"
-                    return "DISCARDED"
+                    self.status = "UNREADABLE" if unreadable_status_enabled() else "DISCARDED"
+                    return self.status
             else:
-                self.status = "DISCARDED"
-                return "DISCARDED"
+                self.status = "UNREADABLE" if unreadable_status_enabled() else "DISCARDED"
+                return self.status
 
         return self.status
 
@@ -3320,6 +3364,7 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
                 "vehicle_ms": v_ms,
                 "plate_ms": p_ms,
                 "ocr_ms": o_ms,
+                "body_ms": 0.0,
                 "total_ms": total_proc_ms
             }
         }
@@ -3725,22 +3770,42 @@ class VehicleConfirmationManager:
                     det["candidate_matches"] = 1
                     det["plate_detected"] = bool(det.get("plate_bbox") or det.get("plate_detected"))
 
-                    # SINGLE PHOTO FAST PATH: Langsung konfirmasi kendaraan & plat nomor di mode upload foto
+                    # SINGLE PHOTO: konfirmasi hanya jika struktur plat valid dan conf melewati gerbang history.
+                    # Selain itu status UNREADABLE (ANPR_UNREADABLE=0 mengembalikan konfirmasi lama).
                     now_ts = time.time()
-                    det["status"] = "CONFIRMED"
-                    det["ocr_status"] = "CONFIRMED" if (p_text and len(p_clean) >= 2) else "ANALYZING"
-                    det["consistency"] = 1.0
-                    det["is_newly_confirmed"] = True
-                    det["confirmation_time"] = now_ts
-                    det["analyzing_frame_count"] = 3
-                    det["analyzing_max_frames"] = 3
-                    if trk:
-                        trk.status = "CONFIRMED"
-                        trk.is_locked = True
-                        trk.confirmed_data = det.copy()
-                        if det.get("plate_bbox"):
-                            trk.last_plate_bbox = det.get("plate_bbox")
-                    print(f"""[CONFIRMATION]
+                    can_confirm = bool(is_valid_struct and p_conf >= SINGLE_PHOTO_CONFIRM_CONF)
+                    if unreadable_status_enabled() and not can_confirm:
+                        det["status"] = "UNREADABLE"
+                        det["ocr_status"] = "UNREADABLE"
+                        det["consistency"] = 0.0
+                        det["is_newly_confirmed"] = False
+                        det["confirmation_time"] = None
+                        det["ocr_candidate"] = p_text or None
+                        if trk:
+                            trk.status = "UNREADABLE"
+                            trk.is_locked = True
+                            trk.confirmed_data = None
+                        print(f"""[UNREADABLE]
+track={tid}
+plate="{p_clean}"
+ocr_conf={p_conf:.2f}
+valid_structure={bool(is_valid_struct)}
+reason=SINGLE_PHOTO_NOT_CONFIRMABLE""")
+                    else:
+                        det["status"] = "CONFIRMED"
+                        det["ocr_status"] = "CONFIRMED" if (p_text and len(p_clean) >= 2) else "ANALYZING"
+                        det["consistency"] = 1.0
+                        det["is_newly_confirmed"] = True
+                        det["confirmation_time"] = now_ts
+                        det["analyzing_frame_count"] = 3
+                        det["analyzing_max_frames"] = 3
+                        if trk:
+                            trk.status = "CONFIRMED"
+                            trk.is_locked = True
+                            trk.confirmed_data = det.copy()
+                            if det.get("plate_bbox"):
+                                trk.last_plate_bbox = det.get("plate_bbox")
+                        print(f"""[CONFIRMATION]
 track={tid}
 plate="{p_clean}"
 reason=SINGLE_PHOTO_FAST_PATH (conf={p_conf:.2f})
@@ -3798,7 +3863,7 @@ time_from_good_ocr_to_confirmation_ms=0.0""")
                 det["track_confidence"] = round(track.track_confidence, 2)
 
                 if track.lost_interest:
-                    det["status"] = track.status if track.status in ("DISCARDED", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
+                    det["status"] = track.status if track.status in ("DISCARDED", "UNREADABLE", "CONFIRMED", "HISTORY_SAVED") else "LOST_INTEREST"
                     det["ocr_status"] = "LOST_INTEREST" if det["status"] == "LOST_INTEREST" else det["status"]
                     det["is_newly_confirmed"] = False
                     if track.confirmed_data and not track.history_saved:
@@ -4049,6 +4114,7 @@ def _async_body_task(track_id, full_img, bbox, initial_vtype, v_conf, has_bus_de
             "body_style": body_style,
             "body_style_confidence": conf_rounded,
             "body_pending": False,
+            "body_ms": round(body_duration_ms, 1),
             "timestamp": time.time()
         })
     except Exception as e:
@@ -5116,35 +5182,57 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                         "raw_count": 0
                     })
 
-                # Tahap Klasifikasi Bodi: Pada mode foto statis langsung jalankan secara sinkron
-                # (Dapat di-trim via ANPR_SKIP_BODY_CLASSIFIER=1 untuk menghemat ~207ms di Raspberry Pi 4)
+                # Klasifikasi bodi. Default asinkron (ANPR_BODY_ASYNC=1) agar tidak menambah total_ms.
+                # ANPR_BODY_ASYNC=0 atau ANPR_SKIP_BODY_CLASSIFIER=1 mengembalikan jalur lama / melewati bodi.
                 vehicle_type = initial_vtype
                 body_style = None
                 body_style_conf = None
                 body_pending = False
 
                 if initial_vtype != "motorcycle" and os.environ.get("ANPR_SKIP_BODY_CLASSIFIER", "0") != "1":
-                    _t_b0 = time.perf_counter()
-                    v_type_b, b_style_b, b_conf_b = classify_vehicle_indonesian(
-                        img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
-                    )
-                    _dt_b0 = time.perf_counter() - _t_b0
-                    t_body_total += _dt_b0
-                    body_style = b_style_b
-                    body_style_conf = b_conf_b
-                    if v_type_b:
-                        vehicle_type = v_type_b
-                    existing_trk.cached_body_style = body_style
-                    existing_trk.cached_body_conf = body_style_conf
-                    if _dbg_timing:
-                        _dbg_stages.append({
-                            "stage": "body_type",
-                            "model": "models/body_type/best.pt",
-                            "imgsz": 192,
-                            "ms": _dt_b0 * 1000.0,
-                            "det_count": 1 if body_style else 0,
-                            "raw_count": 1 if body_style else 0
-                        })
+                    if body_async_on_photo():
+                        existing_trk.pending_body_data = {
+                            "full_img": img.copy(),
+                            "bbox": [x1, y1, x2, y2],
+                            "initial_vtype": initial_vtype,
+                            "v_conf": v_conf,
+                            "has_bus_det": has_bus_det,
+                            "body_hints": body_hints,
+                            "frame_id": frame_id,
+                            "capture_timestamp": capture_timestamp,
+                        }
+                        body_pending = True
+                        if _dbg_timing:
+                            _dbg_stages.append({
+                                "stage": "body_type",
+                                "model": "models/body_type/best.pt (async)",
+                                "imgsz": body_infer_imgsz(),
+                                "ms": 0.0,
+                                "det_count": 0,
+                                "raw_count": 0
+                            })
+                    else:
+                        _t_b0 = time.perf_counter()
+                        v_type_b, b_style_b, b_conf_b = classify_vehicle_indonesian(
+                            img, [x1, y1, x2, y2], initial_vtype, v_conf, has_bus_det=has_bus_det, body_hints=body_hints
+                        )
+                        _dt_b0 = time.perf_counter() - _t_b0
+                        t_body_total += _dt_b0
+                        body_style = b_style_b
+                        body_style_conf = b_conf_b
+                        if v_type_b:
+                            vehicle_type = v_type_b
+                        existing_trk.cached_body_style = body_style
+                        existing_trk.cached_body_conf = body_style_conf
+                        if _dbg_timing:
+                            _dbg_stages.append({
+                                "stage": "body_type",
+                                "model": "models/body_type/best.pt",
+                                "imgsz": body_infer_imgsz(),
+                                "ms": _dt_b0 * 1000.0,
+                                "det_count": 1 if body_style else 0,
+                                "raw_count": 1 if body_style else 0
+                            })
 
                 effective_plate_conf = ocr_conf if (plate_text and ocr_conf > 0) else (plate_conf_val or 0.0)
                 if abs_plate_bbox is not None:
@@ -5156,7 +5244,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     "vehicle_type": vehicle_type,
                     "body_style": body_style,
                     "body_style_confidence": body_style_conf,
-                    "body_pending": False,
+                    "body_pending": body_pending,
                     "license_plate": plate_text,
                     "ocr_method": ocr_method,
                     "vehicle_confidence": round(v_conf, 3),
@@ -5177,6 +5265,13 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     t_track_0 = time.time()
     _t_trk0 = time.perf_counter() if _dbg_timing else 0.0
     results_out = confirmation_manager.update(results_out, is_stream=is_stream)
+    if not is_stream and body_async_on_photo():
+        for det in results_out:
+            trk = confirmation_manager.tracks.get(det.get("track_id"))
+            if trk is not None and getattr(trk, "pending_body_data", None):
+                trigger_deferred_body_task(trk)
+                det["body_pending"] = True
+                det["body_style"] = trk.cached_body_style
     t_track = time.time() - t_track_0
     if _dbg_timing:
         _dbg_stages.append({
@@ -5233,17 +5328,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         "result_image": data_uri,
         "annotated_image": data_uri,
         "raw_base64_image": raw_b64,
-        "perf_breakdown": {
-            "yolo_ms": round(t_yolo * 1000, 1),
-            "yolo_infer_ms": round(pure_infer_ms, 1),
-            "yolo_lock_wait_ms": round(lock_wait_ms, 1),
-            "plate_ms": round(t_plate_total * 1000, 1),
-            "track_ms": round(t_track * 1000, 1),
-            "body_ms": round(t_body_total * 1000, 1),
-            "ocr_ms": round(t_ocr_total * 1000, 1),
-            "total_ms": round(t_total * 1000, 1),
-            "fps": round(fps, 1)
-        }
+        "perf_breakdown": build_perf_breakdown(
+            t_yolo * 1000, t_plate_total * 1000, t_track * 1000, t_body_total * 1000,
+            t_ocr_total * 1000, t_total * 1000, fps, pure_infer_ms, lock_wait_ms
+        )
     }
     if _dbg_timing:
         ret_dict["_debug_timing_stages"] = _dbg_stages

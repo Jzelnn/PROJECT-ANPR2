@@ -437,6 +437,78 @@ class TestAnprInvariants(unittest.TestCase):
         A.set_pure_arm_mode(A.should_enable_pure_arm())
         self.assertTrue(tested_any)
 
+    def test_09_unreadable_blocks_history_and_can_be_disabled(self):
+        """Plat tidak terkonfirmasi menjadi UNREADABLE dan tidak masuk history. ANPR_UNREADABLE=0 mengembalikan CONFIRMED."""
+        old = os.environ.get("ANPR_UNREADABLE")
+        try:
+            os.environ["ANPR_UNREADABLE"] = "1"
+            junk = {
+                "track_id": 91001,
+                "license_plate": "A",
+                "plate_confidence": 0.95,
+                "ocr_confidence": 0.95,
+                "vehicle_type": "car",
+                "vehicle_confidence": 0.90,
+                "bbox": [10, 10, 200, 160],
+            }
+            out = A.confirmation_manager.update([junk], is_stream=False)
+            self.assertEqual(out[0]["status"], "UNREADABLE")
+            self.assertEqual(out[0]["ocr_status"], "UNREADABLE")
+            self.assertFalse(out[0]["is_newly_confirmed"])
+            self.assertIsNone(A.save_parking_record(out[0]))
+
+            good = {
+                "track_id": 91002,
+                "license_plate": "B 1542 DOL",
+                "plate_confidence": 0.91,
+                "ocr_confidence": 0.91,
+                "vehicle_type": "car",
+                "vehicle_confidence": 0.90,
+                "bbox": [10, 10, 200, 160],
+            }
+            A.LAST_RECORDED_PLATES.pop("B1542DOL", None)
+            A.LAST_RECORDED_TRACK_IDS.pop(91002, None)
+            out_ok = A.confirmation_manager.update([good], is_stream=False)
+            self.assertEqual(out_ok[0]["status"], "CONFIRMED")
+            self.assertTrue(out_ok[0]["is_newly_confirmed"])
+
+            os.environ["ANPR_UNREADABLE"] = "0"
+            legacy = dict(junk)
+            legacy["track_id"] = 91003
+            out_off = A.confirmation_manager.update([legacy], is_stream=False)
+            self.assertEqual(out_off[0]["status"], "CONFIRMED")
+            self.assertTrue(out_off[0]["is_newly_confirmed"])
+            self.assertIsNone(A.save_parking_record(out_off[0]))
+        finally:
+            if old is None:
+                os.environ.pop("ANPR_UNREADABLE", None)
+            else:
+                os.environ["ANPR_UNREADABLE"] = old
+
+    def test_10_latency_schema_and_body_imgsz(self):
+        """Key vehicle_ms tetap ada. ANPR_BODY_IMGSZ hanya mengubah ukuran, default 192."""
+        perf = A.build_perf_breakdown(10, 20, 1, 0, 30, 61, 16.4, 9, 1)
+        for key in ("vehicle_ms", "yolo_ms", "plate_ms", "ocr_ms", "body_ms", "total_ms"):
+            self.assertIn(key, perf)
+        self.assertEqual(perf["vehicle_ms"], perf["yolo_ms"])
+        self.assertEqual(perf["body_ms"], 0.0)
+
+        old = os.environ.get("ANPR_BODY_IMGSZ")
+        try:
+            os.environ.pop("ANPR_BODY_IMGSZ", None)
+            self.assertEqual(A.body_infer_imgsz(), 192)
+            os.environ["ANPR_BODY_IMGSZ"] = "224"
+            self.assertEqual(A.body_infer_imgsz(), 224)
+            self.assertTrue(A.body_async_on_photo())
+            os.environ["ANPR_BODY_ASYNC"] = "0"
+            self.assertFalse(A.body_async_on_photo())
+        finally:
+            os.environ.pop("ANPR_BODY_ASYNC", None)
+            if old is None:
+                os.environ.pop("ANPR_BODY_IMGSZ", None)
+            else:
+                os.environ["ANPR_BODY_IMGSZ"] = old
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

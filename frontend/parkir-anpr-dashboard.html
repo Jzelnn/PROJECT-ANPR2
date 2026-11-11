@@ -2474,6 +2474,7 @@ function updateResultCard(det, detMs){
   }
 
   const isConfirmed = det.confirmation_status === 'CONFIRMED' || det.confirmation_status === 'HISTORY_SAVED' || det.status === 'CONFIRMED' || det.status === 'HISTORY_SAVED';
+  const isUnreadable = !isConfirmed && (det.status === 'UNREADABLE' || det.ocr_status === 'UNREADABLE');
   const isConfirming = det.confirmation_status === 'CONFIRMING' || det.candidate_stage === 'GOOD_CANDIDATE';
 
   if (tagStatus){
@@ -2491,6 +2492,11 @@ function updateResultCard(det, detMs){
       tagStatus.style.borderColor = '#fde68a';
       const maxF = det.analyzing_max_frames || 3;
       tagStatus.textContent = `CONFIRMING (${det.analyzing_frame_count || 2}/${maxF})`;
+    } else if (isUnreadable) {
+      tagStatus.style.background = '#fee2e2';
+      tagStatus.style.color = '#991b1b';
+      tagStatus.style.borderColor = '#fecaca';
+      tagStatus.textContent = 'UNREADABLE';
     } else {
       tagStatus.style.background = '#eff6ff';
       tagStatus.style.color = '#1d4ed8';
@@ -2503,7 +2509,9 @@ function updateResultCard(det, detMs){
   const plateText = det.ocr_text || det.license_plate;
   let plateDisplay = plateText;
   if (!plateDisplay) {
-    if (isConfirmed) {
+    if (isUnreadable) {
+      plateDisplay = 'UNREADABLE';
+    } else if (isConfirmed) {
       plateDisplay = 'Unreadable';
     } else if (det.plate_bbox || det.plate_detected) {
       plateDisplay = 'Reading plate...';
@@ -2609,7 +2617,7 @@ function updateTelemetry(det){
       telemOcrStat.className = 'telem-val active-green';
     } else if (stat === 'GOOD_CANDIDATE' || stat === 'CONFIRMING') {
       telemOcrStat.className = 'telem-val warn-amber';
-    } else if (stat === 'DISCARDED') {
+    } else if (stat === 'DISCARDED' || stat === 'UNREADABLE') {
       telemOcrStat.className = 'telem-val danger-red';
     } else {
       telemOcrStat.className = 'telem-val slate-dim';
