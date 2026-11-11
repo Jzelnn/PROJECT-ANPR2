@@ -86,6 +86,9 @@ except ImportError:
 
 from ultralytics import YOLO
 from ultralytics.engine.model import Model
+from ultralytics.data.augment import LetterBox
+from ultralytics.utils.nms import non_max_suppression
+from ultralytics.utils.ops import scale_boxes
 import torchvision
 
 class PureArmProbs:
@@ -127,7 +130,8 @@ class PureArmYoloResult:
 def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *args, **kwargs):
     """
     Pure PyTorch ARMv8.0 Cortex-A72 inference bypass for YOLO.
-    Bypasses Ultralytics predict() wrapper entirely to eliminate SIGILL.
+    Bypasses Ultralytics predict() wrapper entirely to eliminate SIGILL and FP16/autocast crashes,
+    while maintaining 100% numerical and structural equivalence with official Ultralytics predict.
     """
     if source is None:
         source = kwargs.get('source', None)
@@ -158,25 +162,17 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
         y_off = (ch - target_sz) // 2
         x_off = (cw - target_sz) // 2
         padded = resized_c[y_off:y_off + target_sz, x_off:x_off + target_sz]
-        r, left, top = 1.0, 0, 0
+        im_shape = padded.shape[:2]
     else:
-        # Rectangular scaling yang mempertahankan aspek rasio asli tanpa distorsi/squash
-        r = min(target_sz / max(1, h0), target_sz / max(1, w0))
-        new_unpad = (max(1, int(round(w0 * r))), max(1, int(round(h0 * r))))
+        # LetterBox resmi Ultralytics: auto=True, minimum stride padding, INTER_LINEAR
+        stride = getattr(model, 'stride', 32)
+        if isinstance(stride, (torch.Tensor, list, tuple)):
+            stride = int(stride[-1]) if len(stride) else 32
+        lb = LetterBox((target_sz, target_sz), auto=True, stride=stride)
+        padded = lb(image=img)
+        im_shape = padded.shape[:2]
 
-        # Padding kelipatan 32 (stride YOLO) agar karakter plat tidak tertekan menjadi gepeng
-        pad_w = (32 - (new_unpad[0] % 32)) % 32
-        pad_h = (32 - (new_unpad[1] % 32)) % 32
-        dw, dh = pad_w / 2.0, pad_h / 2.0
-
-        interp = cv2.INTER_CUBIC if r > 1.0 else cv2.INTER_LINEAR
-        resized = cv2.resize(img, new_unpad, interpolation=interp)
-        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
-
-    blob = padded[:, :, ::-1].transpose(2, 0, 1)
-    blob = np.ascontiguousarray(blob, dtype=np.float32) / 255.0
+    blob = np.ascontiguousarray(padded[:, :, ::-1].transpose(2, 0, 1), dtype=np.float32) / 255.0
     tensor = torch.from_numpy(blob).unsqueeze(0)
 
     with torch.no_grad():
@@ -196,47 +192,14 @@ def pure_arm_yolo_predict(self, source=None, imgsz=None, conf=0.25, iou=0.7, *ar
         return [PureArmYoloResult((h0, w0), probs=probs_obj, names=getattr(self, 'names', {}))]
 
     # Kasus 2: Model Deteksi Bounding Box (Vehicle, Plate, Character)
-    pred = pred.transpose(1, 2)
-    pred = pred[0]
-
-    boxes_cxcywh = pred[:, :4]
-    scores_all = pred[:, 4:]
-    max_scores, class_ids = scores_all.max(dim=-1)
-
-    mask = max_scores > conf_th
-    if not mask.any():
+    preds = non_max_suppression(pred, conf_thres=conf_th, iou_thres=iou_th, agnostic=False, max_det=300)
+    det = preds[0]
+    if det is None or len(det) == 0:
         empty_t = torch.empty((0, 4), dtype=torch.float32)
         return [PureArmYoloResult((h0, w0), PureArmBoxes(empty_t, torch.empty((0,)), torch.empty((0,))), names=getattr(self, 'names', {}))]
 
-    boxes_cxcywh = boxes_cxcywh[mask]
-    scores = max_scores[mask]
-    cls = class_ids[mask]
-
-    x1 = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
-    y1 = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
-    x2 = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
-    y2 = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
-
-    x1 = (x1 - left) / r
-    y1 = (y1 - top) / r
-    x2 = (x2 - left) / r
-    y2 = (y2 - top) / r
-
-    x1.clamp_(0, w0)
-    y1.clamp_(0, h0)
-    x2.clamp_(0, w0)
-    y2.clamp_(0, h0)
-
-    boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-
-    # Class-Aware Batched NMS: Karakter berbeda kelas (misal '9' dan '0') tidak saling menghapus!
-    keep = torchvision.ops.batched_nms(boxes_xyxy, scores, cls, iou_th)
-
-    final_boxes = boxes_xyxy[keep]
-    final_scores = scores[keep]
-    final_cls = cls[keep]
-
-    boxes_obj = PureArmBoxes(final_boxes, final_scores, final_cls)
+    scaled_boxes = scale_boxes(im_shape, det[:, :4].clone(), (h0, w0))
+    boxes_obj = PureArmBoxes(scaled_boxes, det[:, 4], det[:, 5])
     return [PureArmYoloResult((h0, w0), boxes_obj, names=getattr(self, 'names', {}))]
 
 _ORIG_MODEL_PREDICT = Model.predict

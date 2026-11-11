@@ -47,8 +47,12 @@ fi
 if [ -z "$ANPR_API_TOKEN" ] && [ "${ANPR_AUTH_DISABLED:-0}" != "1" ]; then
     ANPR_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))' 2>/dev/null || date +%s)"
     export ANPR_API_TOKEN
+    # Simpan token ke file lokal dengan izin terbatas (chmod 600) agar aman
+    echo "$ANPR_API_TOKEN" > .anpr_token
+    chmod 600 .anpr_token 2>/dev/null || true
     echo "========================================================"
-    echo "[SECURITY] ANPR_API_TOKEN otomatis dibuat untuk sesi ini."
+    echo "[SECURITY] ANPR_API_TOKEN otomatis dibuat dan disimpan ke .anpr_token (chmod 600)."
+    echo "           Prefix token aktif: ${ANPR_API_TOKEN:0:6}***"
     echo "           Salin token dari file .env atau set ANPR_API_TOKEN milik Anda."
     echo "========================================================"
 fi

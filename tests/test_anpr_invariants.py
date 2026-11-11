@@ -351,6 +351,92 @@ class TestAnprInvariants(unittest.TestCase):
         self.assertFalse(A.should_enable_pure_arm("linux", "x86_64", ""))
         self.assertTrue(A.should_enable_pure_arm("win32", "AMD64", "1"))
 
+    def test_08_pure_arm_and_official_predict_equivalence(self):
+        """
+        Uji kesetaraan numerik & struktural pure_arm_yolo_predict vs predict resmi Ultralytics:
+        - Jumlah deteksi sama
+        - IoU bounding box > 0.95
+        - Selisih confidence < 0.02
+        Diuji pada crop kendaraan, crop plat nomor, dan model karakter.
+        """
+        def _calc_iou(b1, b2):
+            xA, yA = max(b1[0], b2[0]), max(b1[1], b2[1])
+            xB, yB = min(b1[2], b2[2]), min(b1[3], b2[3])
+            inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+            a1 = max(1e-6, (b1[2] - b1[0]) * (b1[3] - b1[1]))
+            a2 = max(1e-6, (b2[2] - b2[0]) * (b2[3] - b2[1]))
+            return inter / float(a1 + a2 - inter)
+
+        # Uji pada beberapa foto uji nyata di test/images
+        test_imgs = [
+            os.path.join(ROOT, "test", "images", "New folder", "New folder", "IN_WSMPM1883119253389.png"),
+            os.path.join(ROOT, "test", "images", "New folder", "New folder", "OUT_WSMPM1883118474851.png"),
+            os.path.join(ROOT, "test", "images", "WhatsApp Image 2026-09-04 at 16.47.50.jpeg"),
+        ]
+        tested_any = False
+        for img_path in test_imgs:
+            if not os.path.isfile(img_path):
+                continue
+            img = A.cv2.imread(img_path)
+            if img is None:
+                continue
+            tested_any = True
+
+            # 1. Evaluasi Vehicle Model
+            A.set_pure_arm_mode(False)
+            v_off = A.vehicle_model(img, imgsz=384, conf=0.35, verbose=False)
+            A.set_pure_arm_mode(True)
+            v_arm = A.vehicle_model(img, imgsz=384, conf=0.35, verbose=False)
+
+            self.assertEqual(len(v_off[0].boxes), len(v_arm[0].boxes))
+            for b_o, b_a in zip(v_off[0].boxes, v_arm[0].boxes):
+                self.assertEqual(int(b_o.cls[0]), int(b_a.cls[0]))
+                self.assertLessEqual(abs(float(b_o.conf[0]) - float(b_a.conf[0])), 0.02)
+                iou = _calc_iou([float(x) for x in b_o.xyxy[0]], [float(x) for x in b_a.xyxy[0]])
+                self.assertGreaterEqual(iou, 0.95)
+
+            # 2. Evaluasi Plate Model pada crop kendaraan
+            if len(v_off[0].boxes) > 0:
+                vbox = [int(v) for v in v_off[0].boxes[0].xyxy[0]]
+                v_crop = img[vbox[1]:vbox[3], vbox[0]:vbox[2]]
+            else:
+                v_crop = img
+
+            A.set_pure_arm_mode(False)
+            p_off = A.plate_detector(v_crop, imgsz=320, conf=0.12, verbose=False)
+            A.set_pure_arm_mode(True)
+            p_arm = A.plate_detector(v_crop, imgsz=320, conf=0.12, verbose=False)
+
+            self.assertEqual(len(p_off[0].boxes), len(p_arm[0].boxes))
+            for b_o, b_a in zip(p_off[0].boxes, p_arm[0].boxes):
+                self.assertEqual(int(b_o.cls[0]), int(b_a.cls[0]))
+                self.assertLessEqual(abs(float(b_o.conf[0]) - float(b_a.conf[0])), 0.02)
+                iou = _calc_iou([float(x) for x in b_o.xyxy[0]], [float(x) for x in b_a.xyxy[0]])
+                self.assertGreaterEqual(iou, 0.95)
+
+            # 3. Evaluasi Char Model pada crop plat nomor
+            if len(p_off[0].boxes) > 0:
+                pbox = [int(v) for v in p_off[0].boxes[0].xyxy[0]]
+                p_crop = v_crop[pbox[1]:pbox[3], pbox[0]:pbox[2]]
+            else:
+                p_crop = v_crop
+
+            A.set_pure_arm_mode(False)
+            c_off = A.char_model(p_crop, imgsz=384, conf=0.10, iou=0.45, verbose=False)
+            A.set_pure_arm_mode(True)
+            c_arm = A.char_model(p_crop, imgsz=384, conf=0.10, iou=0.45, verbose=False)
+
+            self.assertEqual(len(c_off[0].boxes), len(c_arm[0].boxes))
+            for b_o, b_a in zip(c_off[0].boxes, c_arm[0].boxes):
+                self.assertEqual(int(b_o.cls[0]), int(b_a.cls[0]))
+                self.assertLessEqual(abs(float(b_o.conf[0]) - float(b_a.conf[0])), 0.02)
+                iou = _calc_iou([float(x) for x in b_o.xyxy[0]], [float(x) for x in b_a.xyxy[0]])
+                self.assertGreaterEqual(iou, 0.95)
+
+        # Kembalikan mode pure_arm ke deteksi platform
+        A.set_pure_arm_mode(A.should_enable_pure_arm())
+        self.assertTrue(tested_any)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
