@@ -4579,7 +4579,10 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         if plate_crop.size > 0 and crop_w >= min_crop_w and crop_h >= min_crop_h and (plate_conf_val is None or plate_conf_val >= 0.25):
                             gray_crop = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
                             sharpness = float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
-                            if sharpness >= 25.0 and getattr(track, 'ocr_attempt_count', 0) < 5:
+                            ocr_cnt = getattr(track, 'ocr_attempt_count', 0)
+                            # Instant Trigger: Frame 1 langsung diproses OCR tanpa menunggu kendaraan berhenti
+                            is_sharp_enough = (ocr_cnt == 0) or (sharpness >= 15.0)
+                            if is_sharp_enough and ocr_cnt < 5:
                                 crop_q = compute_crop_quality(plate_crop, plate_conf_val)
                                 if not track.ocr_pending:
                                     track.ocr_attempt_count = getattr(track, 'ocr_attempt_count', 0) + 1
@@ -5177,12 +5180,17 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
                     if not is_alignment_only:
                         # Pre-confirmation: normal active plate detection + OCR pipeline
-                        # Throttled in stream mode (at most 1 check per 3 frames or >= 0.18s) to prevent queue backlog
+                        # Instant trigger on first detection in ROI (plate_attempt_count == 0),
+                        # then throttled (at most 1 check per 2 frames or >= 0.14s) to prevent queue backlog
                         if is_stream:
-                            frames_since = (frame_id - getattr(existing_trk, 'last_plate_check_frame_id', 0)) if frame_id is not None else 99
-                            time_since = now_plate - getattr(existing_trk, 'last_plate_check_time', 0.0)
-                            if frames_since >= 3 or time_since >= 0.18:
+                            attempt_cnt = getattr(existing_trk, 'plate_attempt_count', 0)
+                            if attempt_cnt == 0:
                                 should_detect_plate = True
+                            else:
+                                frames_since = (frame_id - getattr(existing_trk, 'last_plate_check_frame_id', 0)) if frame_id is not None else 99
+                                time_since = now_plate - getattr(existing_trk, 'last_plate_check_time', 0.0)
+                                if frames_since >= 2 or time_since >= 0.14:
+                                    should_detect_plate = True
                         else:
                             should_detect_plate = True
                     else:
