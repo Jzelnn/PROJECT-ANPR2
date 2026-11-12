@@ -26,6 +26,7 @@ tools/eval/ground_truth.local.csv
 
 # Bobot model (besar). File yang sudah dilacak git tetap dilacak.
 models/**/*.pt
+models/**/*.onnx
 
 # Dataset training & data uji (besar)
 datasets/*/*

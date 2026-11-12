@@ -531,6 +531,28 @@ class TestAnprInvariants(unittest.TestCase):
         self.assertTrue(A.prefer_rapid_reading("B 1234 AB", 0.80, True, "B 1234 ABC", 0.40, True))
         os.environ.pop("ANPR_OCR_LONGER_WINS", None)
 
+    def test_12_cct_decode_and_can_be_disabled(self):
+        """cct-xs membuang pad dan bisa dimatikan tanpa menyentuh model."""
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+        rows = []
+        for ch in "B12":
+            v = np.zeros(len(alphabet), dtype=np.float32)
+            v[alphabet.index(ch)] = 1.0
+            rows.append(v)
+        for _ in range(7):
+            v = np.zeros(len(alphabet), dtype=np.float32)
+            v[alphabet.index("_")] = 1.0
+            rows.append(v)
+        text, conf = A.decode_cct_output(np.stack(rows), alphabet, "_")
+        self.assertEqual(text, "B12")
+        self.assertAlmostEqual(conf, 1.0)
+        self.assertTrue(A.fast_plate_enabled())
+        os.environ["ANPR_FAST_PLATE"] = "0"
+        try:
+            self.assertFalse(A.fast_plate_enabled())
+        finally:
+            os.environ.pop("ANPR_FAST_PLATE", None)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

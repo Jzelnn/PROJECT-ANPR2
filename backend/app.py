@@ -33,9 +33,20 @@ import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, Counter
-import requests
-from requests.auth import HTTPDigestAuth, HTTPBasicAuth
+try:
+    import requests
+    from requests.auth import HTTPDigestAuth, HTTPBasicAuth
+    _ReqConnError = requests.exceptions.ConnectionError
+    _ReqTimeout = requests.exceptions.Timeout
+except ImportError:
+    requests = None
+    HTTPDigestAuth = None
+    HTTPBasicAuth = None
+    _ReqConnError = Exception
+    _ReqTimeout = Exception
+
 import json
+import urllib.request
 from urllib.parse import urlparse
 import numpy as np
 import cv2
@@ -2349,6 +2360,141 @@ def plate_number_row(plate_crop, vehicle_type=None, ratio=None):
     return plate_crop[0:cut, :]
 
 
+def fast_plate_enabled():
+    """cct-xs (fast-plate-ocr) ikut membaca plat. ANPR_FAST_PLATE=0 mematikan mesin ini."""
+    return os.environ.get("ANPR_FAST_PLATE", "1") != "0"
+
+
+def cct_row_ratio(vehicle_type=None):
+    """Pengenal satu baris. Mobil memakai 74% atas agar baris pajak tidak ikut terbaca. Motor tetap penuh."""
+    motor = str(vehicle_type or "").strip().lower() in ("motorcycle", "motor", "sepeda motor", "motorbike")
+    key = "ANPR_CCT_ROW_RATIO_MOTOR" if motor else "ANPR_CCT_ROW_RATIO"
+    default = "1" if motor else "0.74"
+    try:
+        ratio = float(os.environ.get(key, default))
+    except (TypeError, ValueError):
+        ratio = float(default)
+    return min(1.0, max(0.45, ratio))
+
+
+def decode_cct_output(plate_probs, alphabet, pad_char="_"):
+    """Argmax per slot. Output model sudah softmax. Pad di ekor dibuang."""
+    probs = np.asarray(plate_probs, dtype=np.float32)
+    if probs.ndim == 3:
+        probs = probs[0]
+    idx = np.argmax(probs, axis=-1)
+    chars = []
+    confs = []
+    for i, cls in enumerate(idx.tolist()):
+        cls = int(cls)
+        chars.append(alphabet[cls] if 0 <= cls < len(alphabet) else "")
+        confs.append(float(probs[i, cls]))
+    text = "".join(chars).rstrip(pad_char)
+    if not text:
+        return "", 0.0
+    return text, float(np.mean(confs[:len(text)]))
+
+
+_cct_session = None
+_cct_meta = None
+_cct_failed = False
+_cct_lock = threading.Lock()
+_CCT_ONNX_URL = "https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/cct_xs_v2_global.onnx"
+_CCT_YAML_URL = "https://github.com/ankandrew/cnn-ocr-lp/releases/download/arg-plates/cct_xs_v2_global_plate_config.yaml"
+
+
+def _cct_paths():
+    folder = os.path.join(config.MODELS_DIR, "ocr")
+    return (
+        os.path.join(folder, "cct_xs_v2_global.onnx"),
+        os.path.join(folder, "cct_xs_v2_global_plate_config.yaml"),
+    )
+
+
+def _ensure_cct_file(path, url):
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    print(f"[CCT_OCR] mengunduh {os.path.basename(path)}", flush=True)
+    urllib.request.urlretrieve(url, tmp)
+    os.replace(tmp, path)
+
+
+def _parse_cct_yaml(path):
+    cfg = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            key, val = line.split(":", 1)
+            val = val.strip().strip("'\"")
+            if val:
+                cfg[key.strip()] = val
+    alphabet = cfg.get("alphabet") or "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+    return {
+        "alphabet": alphabet,
+        "pad_char": (cfg.get("pad_char") or "_")[:1],
+        "img_height": int(cfg.get("img_height") or 64),
+        "img_width": int(cfg.get("img_width") or 128),
+        "color": (cfg.get("image_color_mode") or "rgb").lower(),
+    }
+
+
+def cct_read_plate(plate_crop):
+    """
+    Pengenal plat ONNX cct-xs-v2 (fast-plate-ocr), CPU saja.
+    Paket Python-nya butuh 3.10+, jadi bobot dijalankan lewat onnxruntime yang sudah ada.
+    """
+    global _cct_session, _cct_meta, _cct_failed
+    if _cct_failed or plate_crop is None or getattr(plate_crop, "size", 0) == 0:
+        return "", 0.0
+    try:
+        with _cct_lock:
+            if _cct_session is None:
+                import onnxruntime as ort
+                onnx_path, yaml_path = _cct_paths()
+                _ensure_cct_file(yaml_path, _CCT_YAML_URL)
+                _ensure_cct_file(onnx_path, _CCT_ONNX_URL)
+                meta = _parse_cct_yaml(yaml_path)
+                so = ort.SessionOptions()
+                try:
+                    n_threads = max(1, int(os.environ.get("OMP_NUM_THREADS", "1")))
+                except (TypeError, ValueError):
+                    n_threads = 1
+                so.intra_op_num_threads = n_threads
+                so.inter_op_num_threads = 1
+                _cct_session = ort.InferenceSession(
+                    onnx_path, sess_options=so, providers=["CPUExecutionProvider"]
+                )
+                _cct_meta = meta
+                _cct_meta["input"] = _cct_session.get_inputs()[0].name
+                print("[CCT_OCR] cct-xs-v2 siap (ONNX Runtime CPU).", flush=True)
+            meta = _cct_meta
+            img = plate_crop
+            if meta["color"] == "rgb":
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.shape[2] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                else:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            else:
+                if img.ndim == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            resized = cv2.resize(img, (meta["img_width"], meta["img_height"]), interpolation=cv2.INTER_LINEAR)
+            if resized.ndim == 2:
+                resized = resized[:, :, None]
+            batch = np.expand_dims(resized.astype(np.uint8), axis=0)
+            plate = _cct_session.run(["plate"], {meta["input"]: batch})[0]
+            return decode_cct_output(plate, meta["alphabet"], meta["pad_char"])
+    except Exception as e:
+        _cct_failed = True
+        print(f"[CCT_OCR] error: {e}", flush=True)
+        return "", 0.0
+
+
 def prefer_rapid_reading(c_fused, c_conf, c_valid, r_fused, r_conf, r_valid):
     """
     RapidOCR menggantikan model karakter hanya bila hasilnya valid dan lebih yakin,
@@ -2369,8 +2515,10 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
     """
     Pembacaan plat nomor Hybrid teroptimasi untuk Raspberry Pi Cortex-A72:
     1) Pass 1: Pure PyTorch Character Model YOLO (imgsz=384) pada crop asli.
-    2) Pass 2: RapidOCR (PP-OCRv4 via C++ ONNX Runtime) + Cross-Model Fusion (char_raw + rapid_raw).
-    3) Pass 3 (Hanya bila belum valid): 1 varian perbaikan citra (rectified / CLAHE).
+    2) Pass 2: cct-xs-v2 (fast-plate-ocr, ONNX) pada baris nomor polisi.
+    3) Pass 3: RapidOCR (PP-OCRv4 via C++ ONNX Runtime) bila pemenang belum sangat yakin.
+    4) Pass 4 (Hanya bila belum valid): 1 varian perbaikan citra (rectified / CLAHE).
+    ANPR_FAST_PLATE=0 melewati cct-xs.
     """
     t_ens_start = time.time()
     if plate_crop is None or getattr(plate_crop, "size", 0) == 0 or plate_crop.shape[0] < 8 or plate_crop.shape[1] < 8:
@@ -2399,26 +2547,55 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
 
-    # 2. RapidOCR hanya dilewati bila model karakter sudah valid dan sangat yakin.
-    # Ambang lama 0.52 membuat bacaan sedang (mis. 0.53) memblokir mesin kedua.
+    # Ambang lama 0.52 membuat bacaan sedang (mis. 0.53) memblokir mesin berikutnya.
     # ANPR_CHAR_SKIP_RAPID=0.52 mengembalikan ambang lama.
     try:
         skip_rapid_at = float(os.environ.get("ANPR_CHAR_SKIP_RAPID", "0.85"))
     except (TypeError, ValueError):
         skip_rapid_at = 0.85
-    if not (c_valid and c_conf >= skip_rapid_at):
+
+    winner_fused = c_fused if c_valid else ""
+    winner_conf = c_conf if c_raw else 0.0
+    winner_valid = c_valid
+
+    # 2. cct-xs pada baris nomor. Murah di CPU. ANPR_FAST_PLATE=0 mematikannya.
+    if fast_plate_enabled() and not (winner_valid and winner_conf >= skip_rapid_at):
+        t_cct = time.perf_counter()
+        cct_row = plate_number_row(plate_crop, ratio=cct_row_ratio(vehicle_type))
+        cct_raw, cct_conf = cct_read_plate(cct_row)
+        cct_ms = (time.perf_counter() - t_cct) * 1000.0
+        if cct_raw:
+            cct_fused = refine_indonesian_plate("", cct_raw, [cct_raw]) or ""
+            cct_valid = bool(cct_fused) and is_valid_indonesian_plate_structure(cct_fused)[0]
+            print(
+                f"[CCT_OCR] raw='{cct_raw}' conf={cct_conf:.2f} fused='{cct_fused}' valid={cct_valid} ms={cct_ms:.1f}",
+                flush=True,
+            )
+            if prefer_rapid_reading(winner_fused, winner_conf, winner_valid, cct_fused, cct_conf, cct_valid):
+                final_formatted = verify_and_fix_plate_digits(raw_plate_crop, cct_fused, vehicle_type=vehicle_type) or cct_fused
+                best_conf = cct_conf
+                method_used = "hybrid_char_cct" if c_raw else "cct_xs"
+                winner_fused, winner_conf, winner_valid = cct_fused, cct_conf, True
+                c_valid = True
+
+    # 3. RapidOCR. Pemenang saat ini (karakter atau cct-xs) yang sudah sangat yakin melewati mesin ini.
+    if not (winner_valid and winner_conf >= skip_rapid_at):
         r_text, r_conf, r_all_texts = rapidocr_read_plate(
-            plate_crop, return_all=True, allow_full_det=not c_valid
+            plate_crop, return_all=True, allow_full_det=not winner_valid
         )
         if r_text or r_all_texts:
             # Gabungkan (fuse) char_raw dari YOLO dengan r_text/r_all_texts dari RapidOCR PP-OCR
             r_fused = refine_indonesian_plate(c_raw, r_text, r_all_texts) or refine_indonesian_plate("", r_text, r_all_texts) or ""
             r_valid = bool(r_fused) and is_valid_indonesian_plate_structure(r_fused)[0]
             print(f"[RAPID_OCR] raw='{r_text}' all={r_all_texts} conf={r_conf:.2f} fused='{r_fused}' valid={r_valid} (char valid={c_valid})", flush=True)
-            if prefer_rapid_reading(c_fused, c_conf, c_valid, r_fused, r_conf, r_valid):
+            if prefer_rapid_reading(winner_fused, winner_conf, winner_valid, r_fused, r_conf, r_valid):
                 final_formatted = verify_and_fix_plate_digits(raw_plate_crop, r_fused, vehicle_type=vehicle_type) or r_fused
-                best_conf = max(c_conf, r_conf) if c_raw else r_conf
-                method_used = "hybrid_char_rapidocr" if c_raw else "rapidocr_onnx"
+                best_conf = r_conf
+                if method_used in ("hybrid_char_cct", "cct_xs"):
+                    method_used = "hybrid_cct_rapidocr"
+                else:
+                    method_used = "hybrid_char_rapidocr" if c_raw else "rapidocr_onnx"
+                winner_valid = True
                 c_valid = True
             elif not final_formatted and (r_fused or r_text):
                 final_formatted = r_fused or r_text
@@ -6634,11 +6811,11 @@ def rpi_capture():
 
         return jsonify(result)
 
-    except requests.exceptions.ConnectionError:
+    except _ReqConnError:
         return jsonify({
             "error": f"Tidak dapat terhubung ke Raspberry Pi di {rpi_url}. Pastikan Raspberry Pi sudah menyala dan terhubung ke jaringan WiFi yang sama."
         }), 503
-    except requests.exceptions.Timeout:
+    except _ReqTimeout:
         return jsonify({
             "error": f"Waktu koneksi ke Raspberry Pi di {rpi_url} habis (Timeout)."
         }), 504
