@@ -3,14 +3,14 @@
 # Skrip Menjalankan ANPR Parking System di Linux / Raspberry Pi
 # ========================================================
 export OPENBLAS_CORETYPE=ARMV8
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 export USE_XNNPACK=0
 export TORCH_DISABLE_XNNPACK=1
-export TORCH_NUM_THREADS="${TORCH_NUM_THREADS:-2}"
-export ANPR_TORCH_THREADS="${ANPR_TORCH_THREADS:-2}"
-export OPENCV_NUM_THREADS="${OPENCV_NUM_THREADS:-2}"
+export TORCH_NUM_THREADS=1
+export ANPR_TORCH_THREADS=1
+export OPENCV_NUM_THREADS=1
 export SKIP_WARMUP=1
 export DISABLE_PADDLE=1
 
