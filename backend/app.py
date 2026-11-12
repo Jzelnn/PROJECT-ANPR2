@@ -2549,12 +2549,12 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
         c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
         final_formatted = c_fixed or c_fused or c_raw
 
-    # Ambang lama 0.52 membuat bacaan sedang (mis. 0.53) memblokir mesin berikutnya.
-    # ANPR_CHAR_SKIP_RAPID=0.52 mengembalikan ambang lama.
+    # Ambang 0.75: jika model karakter atau Fast-Plate sudah valid dengan confidence >= 0.75,
+    # lewati RapidOCR agar pemrosesan tidak membengkak ke 1.5s+ di Raspberry Pi 4.
     try:
-        skip_rapid_at = float(os.environ.get("ANPR_CHAR_SKIP_RAPID", "0.85"))
+        skip_rapid_at = float(os.environ.get("ANPR_CHAR_SKIP_RAPID", "0.75"))
     except (TypeError, ValueError):
-        skip_rapid_at = 0.85
+        skip_rapid_at = 0.75
 
     winner_fused = c_fused if c_valid else ""
     winner_conf = c_conf if c_raw else 0.0
