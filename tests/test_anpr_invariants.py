@@ -553,6 +553,42 @@ class TestAnprInvariants(unittest.TestCase):
         finally:
             os.environ.pop("ANPR_FAST_PLATE", None)
 
+    def test_13_reject_oversized_vehicle_hallucinations_and_aspect_anomaly(self):
+        """Pastikan bounding box raksasa artefak plafon/seluruh frame dan rasio ekstrem ditolak."""
+        img_w, img_h = 1024, 543
+
+        # 1. Mobil normal di area ROI -> Wajib diterima
+        normal_car = [202, 64, 575, 403]
+        inside, overlap = A.is_vehicle_inside_roi(
+            normal_car[0], normal_car[1], normal_car[2], normal_car[3], img_w, img_h
+        )
+        self.assertTrue(inside, "Mobil normal di ROI harus diterima")
+        self.assertGreater(overlap, 0.0)
+
+        # 2. Artefak raksasa mencakup 95% lebar dan 99% tinggi frame -> Wajib ditolak
+        giant_box = [34, 0, 1011, 542]
+        inside, overlap = A.is_vehicle_inside_roi(
+            giant_box[0], giant_box[1], giant_box[2], giant_box[3], img_w, img_h
+        )
+        self.assertFalse(inside, "Kotak raksasa seluruh frame wajib ditolak")
+        self.assertEqual(overlap, 0.0)
+
+        # 3. Artefak pipih memanjang ekstrem (aspect ratio > 2.8) -> Wajib ditolak
+        wide_artifact = [50, 200, 950, 300]
+        inside, overlap = A.is_vehicle_inside_roi(
+            wide_artifact[0], wide_artifact[1], wide_artifact[2], wide_artifact[3], img_w, img_h
+        )
+        self.assertFalse(inside, "Kotak rasio lebar ekstrem wajib ditolak")
+        self.assertEqual(overlap, 0.0)
+
+        # 4. Artefak plafon atas -> Wajib ditolak
+        ceiling_artifact = [200, 5, 600, 40]
+        inside, overlap = A.is_vehicle_inside_roi(
+            ceiling_artifact[0], ceiling_artifact[1], ceiling_artifact[2], ceiling_artifact[3], img_w, img_h
+        )
+        self.assertFalse(inside, "Kotak plafon atas wajib ditolak")
+        self.assertEqual(overlap, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

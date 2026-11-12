@@ -8,7 +8,7 @@ import platform
 _MACHINE_ARCH = platform.machine().lower()
 IS_ARM_CPU = _MACHINE_ARCH in ("aarch64", "arm64") or _MACHINE_ARCH.startswith("arm")
 IS_LINUX_ARM64 = (sys.platform == "linux" and _MACHINE_ARCH in ("aarch64", "arm64"))
-_DEFAULT_CPU_THREADS = "1" if IS_ARM_CPU else str(min(4, max(2, (os.cpu_count() or 4) // 2)))
+_DEFAULT_CPU_THREADS = str(min(4, max(2, (os.cpu_count() or 4) // 2)))
 _CONFIGURED_THREADS = os.environ.get("ANPR_TORCH_THREADS") or os.environ.get("TORCH_NUM_THREADS") or _DEFAULT_CPU_THREADS
 
 if IS_ARM_CPU:
@@ -425,11 +425,13 @@ def is_vehicle_inside_roi(x1, y1, x2, y2, img_w, img_h, roi=None):
     bw = max(1.0, float(x2 - x1))
     bh = max(1.0, float(y2 - y1))
     aspect_wh = bw / bh
+    w_ratio = bw / float(max(1, img_w))
+    h_ratio = bh / float(max(1, img_h))
 
     # 1. Tolak false-positive latar belakang/plafon/artefak anomali:
     #    - Posisi menggantung di plafon atas di luar paruh atas ROI
-    #    - Kotak artifak ekstrem yang mencakup hampir seluruh frame (> 95% lebar) dengan rasio lebar abnormal (> 2.8)
-    if (bw / float(max(1, img_w))) > 0.95 and aspect_wh > 2.8:
+    #    - Kotak artifak ekstrem yang mencakup hampir seluruh frame atau rasio fisik abnormal
+    if (w_ratio > 0.80 and h_ratio > 0.65) or w_ratio > 0.88 or h_ratio > 0.90 or aspect_wh > 2.8:
         return False, 0.0
     if y1 <= max(8.0, img_h * 0.02) and y2 < (ry1 + roi_h * 0.30):
         return False, 0.0
@@ -1357,7 +1359,7 @@ else:
     warmup_res = warmup_models()
 
 if not HAS_CUDA:
-    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", "1")))
+    torch.set_num_threads(int(os.environ.get("ANPR_TORCH_THREADS", _CONFIGURED_THREADS)))
 
 STARTUP_STATUS = {
     "ready": True,
@@ -2996,8 +2998,8 @@ def get_front_of_camera_score(cand, plates, img_w, img_h, is_in_roi=False):
     center_dist = abs(norm_cx - 0.5)
     x_score = max(0.0, 1.0 - (center_dist * 1.6))
 
-    # Skor ukuran (semakin dekat semakin besar)
-    size_score = min(2.0, area_ratio * 6.0)
+    # Skor ukuran (semakin dekat semakin besar, dibatasi agar tidak menguntungkan artefak raksasa)
+    size_score = min(2.0, area_ratio * 4.0) if area_ratio <= 0.65 else 0.5
 
     # Cek apakah menaungi plat nomor
     has_plate = any(
@@ -4958,6 +4960,21 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
         if bw < 40 or bh < 40 or (area / float(max(1, iw * ih))) < 0.015:
             continue
 
+        w_ratio = bw / float(max(1, iw))
+        h_ratio = bh / float(max(1, ih))
+        aspect = bw / float(max(1, bh))
+
+        # Rejection of oversized / hallucinated background boxes:
+        # Kendaraan gerbang parkir wajar tidak mencakup > 80% lebar DAN > 65% tinggi frame,
+        # serta tidak melebihi 88% lebar layar atau 90% tinggi layar.
+        if (w_ratio > 0.80 and h_ratio > 0.65) or w_ratio > 0.88 or h_ratio > 0.90:
+            continue
+
+        # Physical vehicle aspect ratio sanity check:
+        # Mobil / motor tidak memiliki rasio lebar:tinggi > 2.8 (anomali YOLO menangkap plafon/lantai)
+        if vehicle_type in ("car", "motorcycle") and aspect > 2.8:
+            continue
+
         if v_conf < threshold:
             # Toleransi adaptif untuk mobil hitam / kondisi malam (0.30 <= v_conf < threshold):
             # Diizinkan jika kondisi ROI gelap ATAU bodi kendaraan berwarna gelap/hitam (box_brightness < 82) dengan proporsi fisik mobil normal.
@@ -5029,7 +5046,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 inside, overlap = is_vehicle_inside_roi(c["x1"], c["y1"], c["x2"], c["y2"], iw, ih)
                 c["_inside_roi"] = True
                 c["_roi_overlap"] = overlap if inside else 1.0
-                c["front_score"] = float(c["area"]) + float(c["y2"]) * 10.0
+                norm_area = min(0.60, float(c["area"]) / float(max(1, iw * ih)))
+                norm_y2 = float(c["y2"]) / float(max(1, ih))
+                c["front_score"] = (norm_area * 500.0) + (norm_y2 * 1000.0) + (500.0 if inside else 0.0)
                 scored_candidates.append(c)
 
         # Prioritaskan kendaraan di dalam ROI yang belum terkonfirmasi (mobil antre baru), lalu yang paling depan
@@ -5072,13 +5091,15 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                 px1, py1, px2, py2 = map(int, pbox.xyxy[0].tolist())
                 pw = max(1, px2 - px1)
                 ph = max(1, py2 - py1)
+                p_aspect = pw / float(ph)
+                fb_vtype = "motorcycle" if p_aspect < 2.1 else "car"
                 vx1 = max(0, px1 - int(pw * 1.5))
                 vy1 = max(0, py1 - int(ph * 4.0))
                 vx2 = min(iw, px2 + int(pw * 1.5))
                 vy2 = min(ih, py2 + int(ph * 1.5))
                 candidates.append({
                     "track_id": None,
-                    "vehicle_type": "car",
+                    "vehicle_type": fb_vtype,
                     "v_conf": 0.75,
                     "x1": vx1,
                     "y1": vy1,
