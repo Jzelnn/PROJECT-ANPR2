@@ -6526,7 +6526,9 @@ def stream_capture():
         frame = camera_stream_manager.get_latest_frame()
         t0 = time.time()
         result = run_anpr(frame, is_stream=True)
-        result["detection_time_sec"] = round(time.time() - t0, 3)
+        ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
+        ai_total_ms = int(round(ai_total_sec * 1000))
+        result["detection_time_sec"] = ai_total_sec
         if result.get("detections"):
             primary_det = result["detections"][0]
             if primary_det.get("is_newly_confirmed"):
@@ -6538,7 +6540,7 @@ def stream_capture():
         return jsonify(result)
 
     if not stream_url:
-        return jsonify({"error": "stream_url wajib diisi"}), 400
+        stream_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
 
     is_isapi = "/isapi/" in stream_url.lower() or stream_url.lower().endswith("/picture")
     is_rtsp = stream_url.lower().startswith(("rtsp://", "rtsps://"))
@@ -6901,6 +6903,11 @@ if __name__ == "__main__":
                         subprocess.call(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
+
+    cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
+    if os.environ.get("ANPR_AUTO_START_CCTV", "1") == "1" and cctv_url:
+        print(f"[STARTUP] Menghubungkan otomatis ke CCTV: {_redact_url(cctv_url)}", flush=True)
+        threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
 
     print("\n=======================================================")
     print(f"🚀 Server ANPR jalan di http://{bind_host}:{target_port}")

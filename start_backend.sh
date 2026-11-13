@@ -38,6 +38,8 @@ fi
 # - ANPR_CORS_ORIGINS   : Daftar origin CORS & WebSocket yang diizinkan (kosong = same-origin saja)
 export ANPR_BIND_HOST="${ANPR_BIND_HOST:-0.0.0.0}"
 export ANPR_COOKIE_SECURE="${ANPR_COOKIE_SECURE:-0}"
+export ANPR_CCTV_STREAM_URL="${ANPR_CCTV_STREAM_URL:-rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101}"
+export ANPR_AUTO_START_CCTV="${ANPR_AUTO_START_CCTV:-1}"
 
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
