@@ -945,7 +945,10 @@ def _save_parking_record_internal(det, source_img=None, source_img_path=None):
         "id": int(now_epoch * 1000) % 1000000,
         "track_id": track_id,
         "timestamp": timestamp_str,
-        "license_plate": plate_text,
+        "license_plate": format_license_plate(plate_text),
+        "license_plate_compact": re.sub(r'\s+', '', plate_text) if '-' not in plate_text else plate_text,
+        "license_plate_spaced": format_license_plate(plate_text, compact=False),
+        "plate_number": format_license_plate(plate_text),
         "vehicle_type": det.get("vehicle_type"),
         "vehicle_confidence": veh_conf,
         "body_style": resolved_body_style,
@@ -1553,6 +1556,34 @@ def is_tax_date(text):
     return False
 
 
+def format_license_plate(plate_text, compact=None):
+    """
+    Format string plat nomor sesuai preferensi sistem (dengan spasi atau tanpa spasi):
+    - compact=True (atau ANPR_COMPACT_PLATE=1 / ANPR_PLATE_SPACE=0): 'B1786CIC'
+    - compact=False (atau default ANPR_COMPACT_PLATE=0): 'B 1786 CIC'
+    - Plat militer/dinas (e.g. '523-07') tetap mempertahankan strip.
+    """
+    if not plate_text or plate_text in ("TIDAK_TERBACA", "UNKNOWN", "UNREADABLE", "-"):
+        return plate_text
+    plate_str = str(plate_text).strip().upper()
+    if '-' in plate_str:
+        return plate_str
+
+    if compact is None:
+        compact = os.environ.get("ANPR_COMPACT_PLATE", "0").strip().lower() in ("1", "true", "yes") or \
+                  os.environ.get("ANPR_PLATE_SPACE", "1").strip().lower() in ("0", "false", "no")
+
+    clean = re.sub(r'[^A-Z0-9]', '', plate_str)
+    m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
+    if m:
+        pfx, dig, sfx = m.groups()
+        return f"{pfx}{dig}{sfx}" if compact else f"{pfx} {dig} {sfx}"
+
+    if compact:
+        return clean
+    return plate_str
+
+
 def is_valid_indonesian_plate_structure(plate_str):
     """
     Memvalidasi apakah string OCR memenuhi struktur plat nomor Indonesia atau format dinas/militer.
@@ -1954,7 +1985,7 @@ def _extract_plate_digit_cells(plate_crop):
         return [], 0.0
 
 
-def verify_and_fix_plate_digits(plate_crop, parsed_plate, vehicle_type=None, all_candidate_plates=None):
+def verify_and_fix_plate_digits(plate_crop, parsed_plate, vehicle_type=None, all_candidate_plates=None, compact=None):
     """
     Verifikasi geometri piksel dan aturan alokasi nomor polisi Korlantas Polri
     untuk mengoreksi disambiguasi digit pada plat miring/bergerak:
@@ -1966,7 +1997,12 @@ def verify_and_fix_plate_digits(plate_crop, parsed_plate, vehicle_type=None, all
         return parsed_plate
     parts = parsed_plate.split()
     if len(parts) != 3:
-        return parsed_plate
+        clean = re.sub(r'[^A-Z0-9]', '', str(parsed_plate).upper())
+        m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
+        if m:
+            parts = [m.group(1), m.group(2), m.group(3)]
+        else:
+            return format_license_plate(parsed_plate, compact=compact)
 
     pref, digits, suff = parts[0], parts[1], parts[2]
     if not digits.isdigit():
@@ -2043,7 +2079,7 @@ def verify_and_fix_plate_digits(plate_crop, parsed_plate, vehicle_type=None, all
     elif suff == 'WXO' and ''.join(d_list) == '1893':
         suff = 'HXO'
 
-    return f"{pref} {''.join(d_list)} {suff}"
+    return format_license_plate(f"{pref} {''.join(d_list)} {suff}", compact=compact)
 
 
 def read_plate_with_paddleocr(plate_crop, allow_multipass=False, should_skip_fallbacks=None):
@@ -2141,7 +2177,7 @@ def read_plate_with_paddleocr(plate_crop, allow_multipass=False, should_skip_fal
     return non_date_items[0][0], non_date_items[0][1], all_raw_texts
 
 
-def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
+def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None, compact=None):
     """
     Menyelaraskan hasil pembacaan plat nomor sesuai regulasi Korlantas Polri Indonesia:
     1. Kode Wilayah (Prefix): 1-2 Huruf (dicocokkan dengan SAMSAT_PREFIXES)
@@ -2321,12 +2357,12 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None):
                 if len(p_parts) == 3 and len(c_parts) == 3 and p_parts[0] == c_parts[0] and p_parts[1] == c_parts[1]:
                     # 1. Jika seri akhir PaddleOCR terpotong 1 huruf di tepi kanan (misal 'BJ' vs 'BJB'), lengkapi dari Character Model!
                     if len(c_parts[2]) > len(p_parts[2]) and c_parts[2].startswith(p_parts[2]):
-                        return f"{p_parts[0]} {p_parts[1]} {c_parts[2]}"
+                        return format_license_plate(f"{p_parts[0]} {p_parts[1]} {c_parts[2]}", compact=compact)
                     # 2. Jika huruf terakhir PaddleOCR adalah N/W/H sedangkan Character Model membaca M (misal PBN/PBW/PEH vs PBM), gunakan seri akhir Character Model!
                     if len(p_parts[2]) == len(c_parts[2]) >= 2:
                         if p_parts[2][-1] in ('N', 'W', 'H') and c_parts[2][-1] == 'M' and p_parts[2][0] == c_parts[2][0]:
-                            return f"{p_parts[0]} {p_parts[1]} {c_parts[2]}"
-                return parsed
+                            return format_license_plate(f"{p_parts[0]} {p_parts[1]} {c_parts[2]}", compact=compact)
+                return format_license_plate(parsed, compact=compact)
 
     return ""
 
@@ -3363,7 +3399,7 @@ timestamp={self.first_good_ocr_time:.3f}""")
             best_cln = self._select_best_candidate()
             if best_cln:
                 self.best_candidate = best_cln
-                self.best_candidate_display = self.candidate_best_obs[best_cln]["text"]
+                self.best_candidate_display = format_license_plate(self.candidate_best_obs[best_cln]["text"])
                 self.best_candidate_conf = self.candidate_best_obs[best_cln]["conf"]
 
             if p_clean == self.consecutive_plate:
@@ -3585,6 +3621,7 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
         conf_rounded = round(stable_conf, 3)
         p_v_conf = getattr(self, 'pending_body_data', {}).get("v_conf") if getattr(self, 'pending_body_data', None) else None
         best_v_conf = round(float(p_v_conf or best_f.get("v_conf") or self.track_confidence or (self.frames[-1].get("v_conf") if self.frames else 0.0)), 3)
+        disp_plate = format_license_plate(stable_plate)
         self.confirmed_data = {
             "track_id": self.track_id,
             "vehicle_type": best_type,
@@ -3592,7 +3629,10 @@ time_from_good_ocr_to_confirmation_ms={dt_from_good:.1f}""")
             "body_style": best_style,
             "body_style_confidence": round(avg_style_conf, 3) if avg_style_conf else None,
             "body_pending": bool(self.body_pending and not best_style),
-            "license_plate": stable_plate,
+            "license_plate": disp_plate,
+            "license_plate_compact": re.sub(r'\s+', '', disp_plate) if '-' not in disp_plate else disp_plate,
+            "license_plate_spaced": format_license_plate(disp_plate, compact=False),
+            "plate_number": disp_plate,
             "confidence": conf_rounded,
             "ocr_confidence": conf_rounded,
             "plate_confidence": conf_rounded,
@@ -5249,7 +5289,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     "vehicle_type": vehicle_type,
                     "body_style": body_style,
                     "body_style_confidence": round(body_style_conf, 3) if body_style_conf else None,
-                    "license_plate": plate_text,
+                    "license_plate": format_license_plate(plate_text),
+                    "license_plate_compact": re.sub(r'\s+', '', plate_text) if (plate_text and '-' not in plate_text) else plate_text,
+                    "license_plate_spaced": format_license_plate(plate_text, compact=False) if plate_text else plate_text,
+                    "plate_number": format_license_plate(plate_text),
                     "ocr_method": ocr_method,
                     "vehicle_confidence": round(v_conf, 3),
                     "plate_confidence": round(effective_plate_conf, 3) if effective_plate_conf else None,
@@ -5490,7 +5533,10 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     "body_style": body_style,
                     "body_style_confidence": body_style_conf,
                     "body_pending": body_pending,
-                    "license_plate": plate_text,
+                    "license_plate": format_license_plate(plate_text),
+                    "license_plate_compact": re.sub(r'\s+', '', plate_text) if (plate_text and '-' not in plate_text) else plate_text,
+                    "license_plate_spaced": format_license_plate(plate_text, compact=False) if plate_text else plate_text,
+                    "plate_number": format_license_plate(plate_text),
                     "ocr_method": ocr_method,
                     "vehicle_confidence": round(v_conf, 3),
                     "plate_confidence": round(effective_plate_conf, 3) if effective_plate_conf else None,

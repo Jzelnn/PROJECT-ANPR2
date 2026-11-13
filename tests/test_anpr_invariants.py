@@ -553,6 +553,33 @@ class TestAnprInvariants(unittest.TestCase):
         finally:
             os.environ.pop("ANPR_FAST_PLATE", None)
 
+    def test_13_plate_format_spacing_and_compact(self):
+        """Format plat nomor mendukung opsi gabung tanpa spasi (B1786CIC) dan spasi standar (B 1786 CIC)."""
+        # 1. Format helper
+        self.assertEqual(A.format_license_plate("B 1786 CIC", compact=True), "B1786CIC")
+        self.assertEqual(A.format_license_plate("B1786CIC", compact=False), "B 1786 CIC")
+        self.assertEqual(A.format_license_plate("523-07", compact=True), "523-07")
+        self.assertEqual(A.format_license_plate("523-07", compact=False), "523-07")
+
+        # 2. Refine Indonesian Plate dengan opsi compact
+        self.assertEqual(A.refine_indonesian_plate("B1786CIC", compact=True), "B1786CIC")
+        self.assertEqual(A.refine_indonesian_plate("B1786CIC", compact=False), "B 1786 CIC")
+
+        # 3. Via Environment Variable ANPR_COMPACT_PLATE
+        os.environ["ANPR_COMPACT_PLATE"] = "1"
+        try:
+            self.assertEqual(A.format_license_plate("B 1786 CIC"), "B1786CIC")
+            self.assertEqual(A.refine_indonesian_plate("B 1786 CIC"), "B1786CIC")
+        finally:
+            os.environ.pop("ANPR_COMPACT_PLATE", None)
+
+        os.environ["ANPR_COMPACT_PLATE"] = "0"
+        try:
+            self.assertEqual(A.format_license_plate("B1786CIC"), "B 1786 CIC")
+            self.assertEqual(A.refine_indonesian_plate("B1786CIC"), "B 1786 CIC")
+        finally:
+            os.environ.pop("ANPR_COMPACT_PLATE", None)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

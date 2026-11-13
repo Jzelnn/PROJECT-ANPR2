@@ -40,6 +40,8 @@ export ANPR_BIND_HOST="${ANPR_BIND_HOST:-0.0.0.0}"
 export ANPR_COOKIE_SECURE="${ANPR_COOKIE_SECURE:-0}"
 export ANPR_CCTV_STREAM_URL="${ANPR_CCTV_STREAM_URL:-rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101}"
 export ANPR_AUTO_START_CCTV="${ANPR_AUTO_START_CCTV:-1}"
+# Format Plat Nomor: 1 = Gabung tanpa spasi (misal B1786CIC), 0 = Pakai spasi (misal B 1786 CIC)
+export ANPR_COMPACT_PLATE="${ANPR_COMPACT_PLATE:-1}"
 
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
