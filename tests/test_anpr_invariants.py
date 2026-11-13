@@ -580,6 +580,53 @@ class TestAnprInvariants(unittest.TestCase):
         finally:
             os.environ.pop("ANPR_COMPACT_PLATE", None)
 
+    def test_14_alpr_kit_v29_contract_endpoints(self):
+        """Pastikan 4 endpoint standar ALPR Kit v2.9 aktif dan merespon dengan benar."""
+        client = A.app.test_client()
+
+        # 1. /get_plate (POST & GET)
+        dummy_rec = {
+            "id": 123456,
+            "license_plate": "B 1786 CIC",
+            "vehicle_type": "car",
+            "body_style": "mpv",
+            "confidence": 0.93,
+            "timestamp": "2026-11-13 18:00:00",
+            "snapshot_url": "/captures/test_snapshot.jpg"
+        }
+        A.LATEST_RECORDS.appendleft(dummy_rec)
+
+        res_post = client.post("/get_plate", json={})
+        self.assertEqual(res_post.status_code, 200)
+        data_post = res_post.get_json()
+        self.assertEqual(data_post.get("status"), "success")
+        self.assertIn("license_plate", data_post)
+
+        res_get = client.get("/get_plate")
+        self.assertEqual(res_get.status_code, 200)
+
+        # 2. /get_image (POST & GET)
+        test_img_path = os.path.join(A.CAPTURES_DIR, "test_dummy_image.jpg")
+        dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+        A.cv2.imwrite(test_img_path, dummy_img)
+        try:
+            res_img = client.post("/get_image", json={"image_path": test_img_path})
+            self.assertEqual(res_img.status_code, 200)
+            self.assertEqual(res_img.mimetype, "image/jpeg")
+            res_img.close()
+
+            # 3. /delete_image (DELETE & POST)
+            res_del = client.delete("/delete_image", json={"image_paths": [test_img_path]})
+            self.assertEqual(res_del.status_code, 200)
+            data_del = res_del.get_json()
+            self.assertEqual(data_del.get("status"), "success")
+            self.assertFalse(os.path.exists(test_img_path))
+        finally:
+            if os.path.exists(test_img_path):
+                os.remove(test_img_path)
+            if len(A.LATEST_RECORDS) > 0 and A.LATEST_RECORDS[0].get("id") == 123456:
+                A.LATEST_RECORDS.popleft()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

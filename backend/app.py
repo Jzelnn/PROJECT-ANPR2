@@ -6729,6 +6729,203 @@ def stream_capture():
         return jsonify({"error": str(e)}), 500
 
 
+# ========================================================
+# ALPR KIT V2.9 STANDARD ENDPOINTS (COMPATIBILITY CONTRACT)
+# ========================================================
+
+@app.route("/capture_image", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/capture_image", methods=["GET", "POST", "OPTIONS"])
+def alpr_kit_capture_image():
+    """
+    ALPR Kit Standard Endpoint: Trigger foto & baca plat nomor seketika.
+    Mengambil frame terbaru dari stream CCTV, menjalankan deteksi ANPR,
+    menyimpan snapshot, dan mengembalikan data plat & image_path.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+
+    frame = None
+    if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
+        frame = camera_stream_manager.get_latest_frame()
+    else:
+        cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
+        try:
+            vcap = cv2.VideoCapture(cctv_url)
+            if vcap.isOpened():
+                ok, frm = vcap.read()
+                if ok and frm is not None:
+                    frame = frm
+            vcap.release()
+        except Exception as e_cctv:
+            print(f"[WARN] Fallback capture error: {e_cctv}")
+
+    if frame is None:
+        return jsonify({"status": "error", "message": "Kamera tidak dapat diakses / belum terhubung"}), 503
+
+    # Jika client meminta raw image bytes langsung (Accept: image/* atau ?raw=1)
+    accept_hdr = request.headers.get("Accept", "").lower()
+    if ("image" in accept_hdr and "application/json" not in accept_hdr) or request.args.get("raw") == "1":
+        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if ret:
+            return Response(buf.tobytes(), mimetype="image/jpeg")
+
+    t0 = time.time()
+    result = run_anpr(frame, is_stream=True)
+    ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
+    result["detection_time_sec"] = ai_total_sec
+
+    primary_det = result["detections"][0] if result.get("detections") else {}
+    plate_text = primary_det.get("license_plate") or ""
+    v_type = primary_det.get("vehicle_type") or "car"
+    b_style = primary_det.get("body_style") or ""
+    conf = primary_det.get("plate_confidence") or primary_det.get("confidence") or 0.0
+
+    if primary_det.get("is_newly_confirmed"):
+        rec = save_parking_record(primary_det, source_img=frame)
+        primary_det["record"] = rec
+
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+    safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_text) if plate_text else "UNKNOWN"
+    snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
+    snap_path = os.path.join(CAPTURES_DIR, snap_filename)
+    try:
+        ann_img = draw_annotations_on_image(frame.copy(), primary_det, interest_area=INTEREST_AREA) if primary_det else frame
+        cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    except Exception:
+        pass
+
+    return jsonify({
+        "status": "success",
+        "image_path": snap_path,
+        "image_url": f"/captures/{snap_filename}",
+        "license_plate": plate_text,
+        "plate_number": plate_text,
+        "license_plate_compact": re.sub(r'\s+', '', plate_text) if '-' not in plate_text else plate_text,
+        "license_plate_spaced": format_license_plate(plate_text, compact=False),
+        "vehicle_type": v_type,
+        "body_style": b_style,
+        "confidence": conf,
+        "detection_time_sec": ai_total_sec,
+        "detections": result.get("detections", [])
+    })
+
+
+@app.route("/get_plate", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/get_plate", methods=["GET", "POST", "OPTIONS"])
+def alpr_kit_get_plate():
+    """
+    ALPR Kit Standard Endpoint: Mengambil data hasil baca plat nomor.
+    Bisa mengambil data kendaraan terakhir yang terdeteksi, atau mentrigger scan jika dipanggil.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+
+    latest_rec = LATEST_RECORDS[0] if len(LATEST_RECORDS) > 0 else None
+    if latest_rec:
+        plate_str = latest_rec.get("license_plate", "")
+        img_name = latest_rec.get("snapshot_url", "").split("/")[-1] if latest_rec.get("snapshot_url") else ""
+        abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
+        return jsonify({
+            "status": "success",
+            "license_plate": plate_str,
+            "plate_number": plate_str,
+            "license_plate_compact": re.sub(r'\s+', '', plate_str) if '-' not in plate_str else plate_str,
+            "license_plate_spaced": format_license_plate(plate_str, compact=False),
+            "vehicle_type": latest_rec.get("vehicle_type", "car"),
+            "body_style": latest_rec.get("body_style", ""),
+            "confidence": latest_rec.get("confidence", 0.0),
+            "timestamp": latest_rec.get("timestamp", ""),
+            "image_path": abs_img_path,
+            "image_url": latest_rec.get("snapshot_url", ""),
+            "record": latest_rec
+        })
+
+    # Jika belum ada record tersimpan di memory, lakukan capture langsung dari CCTV
+    return alpr_kit_capture_image()
+
+
+@app.route("/get_image", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/get_image", methods=["GET", "POST", "OPTIONS"])
+def alpr_kit_get_image():
+    """
+    ALPR Kit Standard Endpoint: Mengambil/mengunduh file foto kendaraan.
+    Menerima body JSON: {"image_path": "/path/to/image.jpg"}
+    atau query string: ?image_path=...
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+
+    data = request.get_json(silent=True) or {}
+    img_path = data.get("image_path") or request.args.get("image_path") or ""
+
+    target_file = None
+    if img_path:
+        if os.path.exists(img_path) and os.path.isfile(img_path):
+            target_file = img_path
+        else:
+            bname = os.path.basename(img_path)
+            candidate = os.path.join(CAPTURES_DIR, bname)
+            if os.path.exists(candidate) and os.path.isfile(candidate):
+                target_file = candidate
+
+    if not target_file:
+        cand_latest = os.path.join(CAPTURES_DIR, "latest_result.jpg")
+        if os.path.exists(cand_latest):
+            target_file = cand_latest
+
+    if target_file and os.path.exists(target_file):
+        return send_file(target_file, mimetype="image/jpeg")
+
+    return jsonify({"error": "File gambar tidak ditemukan", "image_path": img_path}), 404
+
+
+@app.route("/delete_image", methods=["POST", "DELETE", "OPTIONS"])
+@app.route("/api/delete_image", methods=["POST", "DELETE", "OPTIONS"])
+def alpr_kit_delete_image():
+    """
+    ALPR Kit Standard Endpoint: Menghapus file foto snapshot tertentu di Raspi.
+    Menerima body JSON: {"image_paths": ["/path/to/file1.jpg", "file2.jpg"]}
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+
+    data = request.get_json(silent=True) or {}
+    paths = data.get("image_paths", [])
+    if isinstance(paths, str):
+        paths = [paths]
+
+    deleted = []
+    failed = []
+
+    for p in paths:
+        target = None
+        if os.path.exists(p) and os.path.isfile(p):
+            target = p
+        else:
+            bname = os.path.basename(p)
+            cand = os.path.join(CAPTURES_DIR, bname)
+            if os.path.exists(cand) and os.path.isfile(cand):
+                target = cand
+
+        if target:
+            try:
+                os.remove(target)
+                deleted.append(p)
+            except Exception as e:
+                failed.append({"path": p, "error": str(e)})
+        else:
+            failed.append({"path": p, "error": "File tidak ditemukan"})
+
+    return jsonify({
+        "status": "success",
+        "deleted_count": len(deleted),
+        "deleted": deleted,
+        "failed": failed,
+        "message": f"{len(deleted)} file berhasil dihapus"
+    })
+
+
 @app.route("/api/rpi/ping", methods=["GET"])
 def rpi_ping():
     """Memeriksa status koneksi ke ALPR Kit di Raspberry Pi."""
