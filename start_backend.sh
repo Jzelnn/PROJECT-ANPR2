@@ -43,8 +43,15 @@ if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
-# Siapkan ANPR_API_TOKEN otomatis jika belum disetel dan ANPR_AUTH_DISABLED != 1
-if [ -z "$ANPR_API_TOKEN" ] && [ "${ANPR_AUTH_DISABLED:-0}" != "1" ]; then
+# Pengaturan Autentikasi:
+if [ "${ANPR_AUTH_DISABLED:-0}" = "1" ]; then
+    export ANPR_API_TOKEN=""
+    rm -f .anpr_token 2>/dev/null || true
+    echo "========================================================"
+    echo "[AUTH] ANPR_AUTH_DISABLED=1 aktif: Server berjalan BEBAS TOKEN (No Auth)."
+    echo "       Semua endpoint REST API & WebSocket dapat diakses tanpa token."
+    echo "========================================================"
+elif [ -z "$ANPR_API_TOKEN" ]; then
     ANPR_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))' 2>/dev/null || date +%s)"
     export ANPR_API_TOKEN
     # Simpan token ke file lokal dengan izin terbatas (chmod 600) agar aman

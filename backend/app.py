@@ -5608,6 +5608,8 @@ sock = Sock(app)
 
 
 def _get_configured_api_token():
+    if _is_auth_disabled():
+        return ""
     return os.environ.get("ANPR_API_TOKEN", "").strip()
 
 
