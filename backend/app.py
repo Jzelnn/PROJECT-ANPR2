@@ -6744,20 +6744,35 @@ def alpr_kit_capture_image():
     if request.method == "OPTIONS":
         return "", 200
 
+    data = request.get_json(silent=True) or {}
+    stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
+
     frame = None
-    if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
-        frame = camera_stream_manager.get_latest_frame()
-    else:
-        cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
+    if stream_url_param:
         try:
-            vcap = cv2.VideoCapture(cctv_url)
+            vcap = cv2.VideoCapture(stream_url_param)
             if vcap.isOpened():
                 ok, frm = vcap.read()
                 if ok and frm is not None:
                     frame = frm
             vcap.release()
-        except Exception as e_cctv:
-            print(f"[WARN] Fallback capture error: {e_cctv}")
+        except Exception as e_s:
+            print(f"[WARN] Client stream_url capture error: {e_s}")
+
+    if frame is None:
+        if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
+            frame = camera_stream_manager.get_latest_frame()
+        else:
+            cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
+            try:
+                vcap = cv2.VideoCapture(cctv_url)
+                if vcap.isOpened():
+                    ok, frm = vcap.read()
+                    if ok and frm is not None:
+                        frame = frm
+                vcap.release()
+            except Exception as e_cctv:
+                print(f"[WARN] Fallback capture error: {e_cctv}")
 
     if frame is None:
         return jsonify({"status": "error", "message": "Kamera tidak dapat diakses / belum terhubung"}), 503
@@ -6820,6 +6835,11 @@ def alpr_kit_get_plate():
     """
     if request.method == "OPTIONS":
         return "", 200
+
+    data = request.get_json(silent=True) or {}
+    stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
+    if stream_url_param or request.args.get("capture") == "1":
+        return alpr_kit_capture_image()
 
     latest_rec = LATEST_RECORDS[0] if len(LATEST_RECORDS) > 0 else None
     if latest_rec:
