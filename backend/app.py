@@ -340,15 +340,15 @@ CONFIRM_CONF_THRESH = 0.80
 # Bounding box tegak lurus (non-slanted rectangle) [x_min, y_min, x_max, y_max] (0.0 s/d 1.0).
 # ============================================================
 DEFAULT_INTEREST_AREA = {
-    "x_min": float(os.environ.get("ANPR_ROI_XMIN", 0.24)),
-    "y_min": float(os.environ.get("ANPR_ROI_YMIN", 0.20)),
-    "x_max": float(os.environ.get("ANPR_ROI_XMAX", 0.58)),
-    "y_max": float(os.environ.get("ANPR_ROI_YMAX", 0.80)),
+    "x_min": float(os.environ.get("ANPR_ROI_XMIN", 0.18)),
+    "y_min": float(os.environ.get("ANPR_ROI_YMIN", 0.12)),
+    "x_max": float(os.environ.get("ANPR_ROI_XMAX", 0.82)),
+    "y_max": float(os.environ.get("ANPR_ROI_YMAX", 0.88)),
     "points": [
-        [0.24, 0.20],
-        [0.58, 0.20],
-        [0.58, 0.80],
-        [0.24, 0.80]
+        [0.18, 0.12],
+        [0.82, 0.12],
+        [0.82, 0.88],
+        [0.18, 0.88]
     ]
 }
 INTEREST_AREA = dict(DEFAULT_INTEREST_AREA)
@@ -6586,7 +6586,7 @@ def stream_capture():
         return jsonify(result)
 
     if not stream_url:
-        stream_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
+        stream_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
 
     is_isapi = "/isapi/" in stream_url.lower() or stream_url.lower().endswith("/picture")
     is_rtsp = stream_url.lower().startswith(("rtsp://", "rtsps://"))
@@ -6763,7 +6763,7 @@ def alpr_kit_capture_image():
         if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
             frame = camera_stream_manager.get_latest_frame()
         else:
-            cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
+            cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
             try:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
                 vcap = cv2.VideoCapture(cctv_url, cv2.CAP_FFMPEG)
@@ -7175,7 +7175,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
+    cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
     if os.environ.get("ANPR_AUTO_START_CCTV", "1") == "1" and cctv_url:
         print(f"[STARTUP] Menghubungkan otomatis ke CCTV: {_redact_url(cctv_url)}", flush=True)
         threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
