@@ -6765,12 +6765,20 @@ def alpr_kit_capture_image():
         else:
             cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
             try:
-                vcap = cv2.VideoCapture(cctv_url)
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+                vcap = cv2.VideoCapture(cctv_url, cv2.CAP_FFMPEG)
                 if vcap.isOpened():
-                    ok, frm = vcap.read()
-                    if ok and frm is not None:
-                        frame = frm
+                    # Warm-up / flush initial empty buffer (frame pertama RTSP sebelum I-frame sering berupa blank/hitam)
+                    for _ in range(12):
+                        ok, frm = vcap.read()
+                        if ok and frm is not None and getattr(frm, "size", 0) > 0:
+                            frame = frm
+                            if float(frm.mean()) > 3.0:
+                                break
                 vcap.release()
+                # Jika background stream belum berjalan, picu start otomatis agar frame berikutnya instan (<50ms)
+                if not camera_stream_manager.running:
+                    threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
             except Exception as e_cctv:
                 print(f"[WARN] Fallback capture error: {e_cctv}")
 
