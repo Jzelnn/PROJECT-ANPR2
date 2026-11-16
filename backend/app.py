@@ -6586,7 +6586,7 @@ def stream_capture():
         return jsonify(result)
 
     if not stream_url:
-        stream_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
+        stream_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
 
     is_isapi = "/isapi/" in stream_url.lower() or stream_url.lower().endswith("/picture")
     is_rtsp = stream_url.lower().startswith(("rtsp://", "rtsps://"))
@@ -7167,7 +7167,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
+    cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/102"
     if os.environ.get("ANPR_AUTO_START_CCTV", "1") == "1" and cctv_url:
         print(f"[STARTUP] Menghubungkan otomatis ke CCTV: {_redact_url(cctv_url)}", flush=True)
         threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
