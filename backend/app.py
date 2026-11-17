@@ -6794,7 +6794,7 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
         "response": {
             "code": 200,
             "message": "SUCCESS",
-            "version": "ALPR 1.0"
+            "version": "ALPR 2.8"
         }
     }
 
@@ -7070,7 +7070,7 @@ def alpr_kit_delete_image():
         "response": {
             "code": 200,
             "message": "SUCCESS",
-            "version": "ALPR 1.0"
+            "version": "ALPR 2.8"
         }
     })
 
