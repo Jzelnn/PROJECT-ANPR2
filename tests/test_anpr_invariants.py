@@ -599,8 +599,6 @@ class TestAnprInvariants(unittest.TestCase):
         res_post = client.post("/get_plate", json={})
         self.assertEqual(res_post.status_code, 200)
         data_post = res_post.get_json()
-        self.assertEqual(data_post.get("status"), "success")
-        self.assertIn("license_plate", data_post)
         # Parkour Rust client src/service.rs compatibility assertions:
         self.assertEqual(data_post.get("response", {}).get("code"), 200)
         self.assertEqual(data_post.get("response", {}).get("message"), "SUCCESS")
@@ -626,7 +624,6 @@ class TestAnprInvariants(unittest.TestCase):
             res_del = client.delete("/delete_image", json={"image_paths": [test_img_path]})
             self.assertEqual(res_del.status_code, 200)
             data_del = res_del.get_json()
-            self.assertEqual(data_del.get("status"), "success")
             self.assertEqual(data_del.get("response", {}).get("code"), 200)
             self.assertEqual(data_del.get("response", {}).get("version"), "ALPR 2.9")
             self.assertIn("data", data_del)

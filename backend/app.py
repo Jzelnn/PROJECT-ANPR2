@@ -6783,29 +6783,14 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
             "timestamp": now_ms
         }
 
-    res = {
+    return {
         "data": data_block,
         "response": {
             "code": 200,
             "message": "SUCCESS",
             "version": "ALPR 2.9"
-        },
-        # Backwards compatibility top-level fields:
-        "status": "success",
-        "license_plate": compact_p,
-        "plate_number": compact_p,
-        "license_plate_compact": compact_p,
-        "license_plate_spaced": format_license_plate(compact_p, compact=False),
-        "vehicle_type": v_type or "car",
-        "body_style": b_style or "",
-        "confidence": conf if conf is not None else 0.0,
-        "image_path": abs_img_path,
-        "image_url": f"/captures/{os.path.basename(abs_img_path)}" if abs_img_path else "",
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
     }
-    if detections is not None:
-        res["detections"] = detections
-    return res
 
 
 @app.route("/capture_image", methods=["GET", "POST", "OPTIONS"])
@@ -6900,10 +6885,8 @@ def alpr_kit_capture_image():
         v_type=v_type,
         b_style=b_style,
         duration_ms=int(ai_total_sec * 1000),
-        is_capture=True,
-        detections=result.get("detections", [])
+        is_capture=True
     )
-    payload["detection_time_sec"] = ai_total_sec
     return jsonify(payload)
 
 
@@ -6940,7 +6923,6 @@ def alpr_kit_get_plate():
             duration_ms=dur,
             is_capture=False
         )
-        payload["record"] = latest_rec
         return jsonify(payload)
 
     # Jika belum ada record tersimpan di memory, lakukan capture langsung dari CCTV
@@ -7027,12 +7009,7 @@ def alpr_kit_delete_image():
             "code": 200,
             "message": "SUCCESS",
             "version": "ALPR 2.9"
-        },
-        "status": "success",
-        "deleted_count": len(deleted),
-        "deleted": deleted,
-        "failed": failed,
-        "message": f"{len(deleted)} file berhasil dihapus"
+        }
     })
 
 
