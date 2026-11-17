@@ -34,6 +34,8 @@ class TestAnprInvariants(unittest.TestCase):
         self.assertEqual(A.refine_indonesian_plate("B1542DOL"), "B 1542 DOL")
         self.assertEqual(A.refine_indonesian_plate("84745SRT"), "B 4745 SRT")
         self.assertTrue(A.is_valid_indonesian_plate_structure("B 1542 DOL")[0])
+        self.assertTrue(A.is_valid_indonesian_plate_structure("B 1585")[0])
+        self.assertEqual(A.refine_indonesian_plate("B1585"), "B 1585")
         self.assertTrue(A.is_valid_indonesian_plate_structure("523-07")[0])
         self.assertFalse(A.is_valid_indonesian_plate_structure("")[0])
         self.assertFalse(A.is_valid_indonesian_plate_structure("07 28")[0])

@@ -1585,6 +1585,11 @@ def format_license_plate(plate_text, compact=None):
         pfx, dig, sfx = m.groups()
         return f"{pfx}{dig}{sfx}" if compact else f"{pfx} {dig} {sfx}"
 
+    m2 = re.match(r'^([A-Z]{1,2})(\d{1,4})$', clean)
+    if m2:
+        pfx, dig = m2.groups()
+        return f"{pfx}{dig}" if compact else f"{pfx} {dig}"
+
     if compact:
         return clean
     return plate_str
@@ -1593,6 +1598,7 @@ def format_license_plate(plate_text, compact=None):
 def is_valid_indonesian_plate_structure(plate_str):
     """
     Memvalidasi apakah string OCR memenuhi struktur plat nomor Indonesia atau format dinas/militer.
+    Mendukung toleransi plat tanpa seri akhir (misal B 1585) jika berawalan kode Samsat resmi dan >= 4 karakter.
     Returns: (is_valid: bool, plate_type: str or None)
     """
     if not plate_str or plate_str in ["TIDAK_TERBACA", "UNKNOWN", ""]:
@@ -1609,17 +1615,25 @@ def is_valid_indonesian_plate_structure(plate_str):
         return False, None
 
     clean = re.sub(r'[^A-Z0-9]', '', plate_str.upper())
-    # Plat standar sipil Indonesia minimal 4 karakter (e.g. B 1 A, B 12 AB, B 1234 ABC)
+    # Plat standar sipil Indonesia minimal 4 karakter (e.g. B 1 A, B 12 AB, B 1234 ABC, B 1585)
     if len(clean) < 4:
         return False, None
 
-    # Format sipil Indonesia: 1-2 huruf kode wilayah (wajib terdaftar di Samsat), 1-4 angka nomor polisi, 1-3 huruf seri akhir
+    # Format sipil Indonesia standar: 1-2 huruf kode wilayah (wajib terdaftar di Samsat), 1-4 angka nomor polisi, 1-3 huruf seri akhir
     # PERKAP POLRI NO. 5 TAHUN 2012: Nomor registrasi dimulai dari 1 s/d 9999 (TIDAK PERNAH diawali angka 0!)
     m = re.match(r'^([A-Z]{1,2})(\d{1,4})([A-Z]{1,3})$', clean)
     if m:
         prefix, digits, suffix = m.groups()
         if prefix in SAMSAT_PREFIXES and not digits.startswith('0'):
             return True, "standard"
+
+    # Format toleransi: Plat dengan kode Samsat resmi + 1-4 angka tanpa seri akhir (misal 'B 1585')
+    m2 = re.match(r'^([A-Z]{1,2})(\d{1,4})$', clean)
+    if m2:
+        prefix, digits = m2.groups()
+        if prefix in SAMSAT_PREFIXES and not digits.startswith('0'):
+            return True, "standard"
+
     return False, None
 
 
@@ -2261,8 +2275,16 @@ def refine_indonesian_plate(char_raw, paddle_raw="", all_paddle_texts=None, comp
                     if n < 2 or n > 7:
                         continue
 
-                    for d_len in range(max(1, n - 3), min(5, n)):
+                    for d_len in range(max(1, n - 3), min(5, n) + 1):
                         s_len = n - d_len
+                        if s_len == 0:
+                            d_raw = rem[:d_len]
+                            d_mapped = ''.join([digit_map.get(ch, ch) for ch in d_raw])
+                            if d_mapped.isdigit() and not d_mapped.startswith('0') and 1 <= len(d_mapped) <= 4:
+                                p_pen = sum(1 for ch in p_sub if not ch.isalpha())
+                                penalty = p_pen + sum(1 for ch in d_raw if not ch.isdigit()) + 0.3
+                                scored_candidates.append((penalty, 3, f"{p_cand} {d_mapped}"))
+                            continue
                         if not (1 <= s_len <= 3):
                             continue
                         d_raw = rem[:d_len]
