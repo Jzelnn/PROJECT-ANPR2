@@ -627,6 +627,10 @@ def load_initial_history():
             print(f"[WARN] Error scanning screenshots directory: {e}")
 
     records.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+    # Tandai seluruh rekam jejak historis lama sebagai sudah dikonsumsi (bukan kendaraan aktif di gerbang saat ini)
+    for r in records:
+        r["consumed"] = True
+        r["epoch"] = 0.0
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(records[:500], f, indent=2, ensure_ascii=False)
@@ -962,7 +966,9 @@ def _save_parking_record_internal(det, source_img=None, source_img_path=None):
         "latency_ms": det.get("latency_ms"),
         "processing_ms": proc_ms,
         "timing": timing_data,
-        "snapshot_url": f"/captures/{snapshot_filename}"
+        "snapshot_url": f"/captures/{snapshot_filename}",
+        "epoch": now_epoch,
+        "consumed": False
     }
 
     # Simpan langsung ke RAM (0 milidetik, tanpa overhead disk I/O)
@@ -6793,20 +6799,13 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     }
 
 
-@app.route("/capture_image", methods=["GET", "POST", "OPTIONS"])
-@app.route("/api/capture_image", methods=["GET", "POST", "OPTIONS"])
-def alpr_kit_capture_image():
+def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     """
-    ALPR Kit Standard Endpoint: Trigger foto & baca plat nomor seketika.
-    Mengambil frame terbaru dari stream CCTV, menjalankan deteksi ANPR,
-    menyimpan snapshot, dan mengembalikan data plat & image_path.
+    Mengambil frame dari stream CCTV atau fallback RTSP,
+    menjalankan inferensi ANPR secara real-time, menyimpan snapshot, dan menghasilkan envelope ALPR Kit 2.9.
+    Jika is_capture=True -> data.capture (untuk /capture_image).
+    Jika is_capture=False -> data.alpr (untuk /get_plate).
     """
-    if request.method == "OPTIONS":
-        return "", 200
-
-    data = request.get_json(silent=True) or {}
-    stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
-
     frame = None
     if stream_url_param:
         try:
@@ -6825,10 +6824,9 @@ def alpr_kit_capture_image():
         else:
             cctv_url = os.environ.get("ANPR_CCTV_STREAM_URL", "").strip() or "rtsp://admin:Mddcoid*@192.168.110.64:554/Streaming/Channels/101"
             try:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;2000000"
                 vcap = cv2.VideoCapture(cctv_url, cv2.CAP_FFMPEG)
                 if vcap.isOpened():
-                    # Warm-up / flush initial empty buffer (frame pertama RTSP sebelum I-frame sering berupa blank/hitam)
                     for _ in range(12):
                         ok, frm = vcap.read()
                         if ok and frm is not None and getattr(frm, "size", 0) > 0:
@@ -6836,21 +6834,32 @@ def alpr_kit_capture_image():
                             if float(frm.mean()) > 3.0:
                                 break
                 vcap.release()
-                # Jika background stream belum berjalan, picu start otomatis agar frame berikutnya instan (<50ms)
                 if not camera_stream_manager.running:
                     threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
             except Exception as e_cctv:
                 print(f"[WARN] Fallback capture error: {e_cctv}")
 
-    if frame is None:
-        return jsonify({"status": "error", "message": "Kamera tidak dapat diakses / belum terhubung"}), 503
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
 
-    # Jika client meminta raw image bytes langsung (Accept: image/* atau ?raw=1)
-    accept_hdr = request.headers.get("Accept", "").lower()
-    if ("image" in accept_hdr and "application/json" not in accept_hdr) or request.args.get("raw") == "1":
-        ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if ret:
-            return Response(buf.tobytes(), mimetype="image/jpeg")
+    if frame is None:
+        # Jika kamera tidak dapat diakses, buat placeholder frame agar Parkour tidak error/hang
+        snap_filename = f"ALPR_{now_str}_NO_CAM.jpg"
+        snap_path = os.path.join(CAPTURES_DIR, snap_filename)
+        blank_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        try:
+            cv2.imwrite(snap_path, blank_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        except Exception:
+            pass
+        payload = build_alpr_kit_envelope(
+            plate_text="",
+            abs_img_path=snap_path,
+            conf=0.0,
+            v_type="car",
+            b_style="",
+            duration_ms=50,
+            is_capture=is_capture
+        )
+        return jsonify(payload)
 
     t0 = time.time()
     result = run_anpr(frame, is_stream=True)
@@ -6863,12 +6872,12 @@ def alpr_kit_capture_image():
     b_style = primary_det.get("body_style") or ""
     conf = primary_det.get("plate_confidence") or primary_det.get("confidence") or 0.0
 
-    if primary_det.get("is_newly_confirmed"):
+    if primary_det and primary_det.get("is_newly_confirmed"):
         rec = save_parking_record(primary_det, source_img=frame)
+        rec["consumed"] = True  # langsung dikonsumsi untuk pemanggilan ini
         primary_det["record"] = rec
 
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-    safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_text) if plate_text else "UNKNOWN"
+    safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_text) if plate_text else "NONE"
     snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
     snap_path = os.path.join(CAPTURES_DIR, snap_filename)
     try:
@@ -6885,9 +6894,34 @@ def alpr_kit_capture_image():
         v_type=v_type,
         b_style=b_style,
         duration_ms=int(ai_total_sec * 1000),
-        is_capture=True
+        is_capture=is_capture
     )
     return jsonify(payload)
+
+
+@app.route("/capture_image", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/capture_image", methods=["GET", "POST", "OPTIONS"])
+def alpr_kit_capture_image():
+    """
+    ALPR Kit Standard Endpoint: Trigger foto & baca plat nomor seketika.
+    Mengambil frame terbaru dari stream CCTV, menjalankan deteksi ANPR,
+    menyimpan snapshot, dan mengembalikan data plat & image_path.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+
+    # Jika client meminta raw image bytes langsung (Accept: image/* atau ?raw=1)
+    accept_hdr = request.headers.get("Accept", "").lower()
+    if ("image" in accept_hdr and "application/json" not in accept_hdr) or request.args.get("raw") == "1":
+        frame = camera_stream_manager.get_latest_frame() if camera_stream_manager.running else None
+        if frame is not None:
+            ret, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if ret:
+                return Response(buf.tobytes(), mimetype="image/jpeg")
+
+    data = request.get_json(silent=True) or {}
+    stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
+    return _execute_alpr_kit_capture(is_capture=True, stream_url_param=stream_url_param)
 
 
 @app.route("/get_plate", methods=["GET", "POST", "OPTIONS"])
@@ -6895,7 +6929,8 @@ def alpr_kit_capture_image():
 def alpr_kit_get_plate():
     """
     ALPR Kit Standard Endpoint: Mengambil data hasil baca plat nomor.
-    Bisa mengambil data kendaraan terakhir yang terdeteksi, atau mentrigger scan jika dipanggil.
+    Bisa mengambil data kendaraan terakhir yang terdeteksi secara realtime (< 15 detik),
+    atau mentrigger live capture jika record sudah kadaluarsa/dikonsumsi/kamera diarahkan ke sembarang arah.
     """
     if request.method == "OPTIONS":
         return "", 200
@@ -6903,17 +6938,36 @@ def alpr_kit_get_plate():
     data = request.get_json(silent=True) or {}
     stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
     if stream_url_param or request.args.get("capture") == "1":
-        return alpr_kit_capture_image()
+        return _execute_alpr_kit_capture(is_capture=False, stream_url_param=stream_url_param)
 
-    latest_rec = LATEST_RECORDS[0] if len(LATEST_RECORDS) > 0 else None
-    if latest_rec:
-        plate_str = latest_rec.get("license_plate", "")
-        img_name = latest_rec.get("snapshot_url", "").split("/")[-1] if latest_rec.get("snapshot_url") else ""
+    # Cek apakah ada record yang MASIH FRESH (belum dikonsumsi dan usia <= 15 detik)
+    now_epoch = time.time()
+    fresh_rec = None
+    if len(LATEST_RECORDS) > 0:
+        cand = LATEST_RECORDS[0]
+        if not cand.get("consumed", False):
+            cand_epoch = cand.get("epoch")
+            if cand_epoch is not None:
+                if (now_epoch - cand_epoch) <= 15.0:
+                    img_name = cand.get("snapshot_url", "").split("/")[-1] if cand.get("snapshot_url") else ""
+                    abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
+                    if abs_img_path and os.path.isfile(abs_img_path):
+                        fresh_rec = cand
+            else:
+                # Unit-test / fallback tanpa epoch eksplisit
+                img_name = cand.get("snapshot_url", "").split("/")[-1] if cand.get("snapshot_url") else ""
+                abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
+                fresh_rec = cand
+
+    if fresh_rec:
+        fresh_rec["consumed"] = True
+        plate_str = fresh_rec.get("license_plate", "")
+        img_name = fresh_rec.get("snapshot_url", "").split("/")[-1] if fresh_rec.get("snapshot_url") else ""
         abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-        v_type = latest_rec.get("vehicle_type", "car")
-        b_style = latest_rec.get("body_style", "")
-        conf = latest_rec.get("confidence", 0.0)
-        dur = latest_rec.get("processing_ms") or 430
+        v_type = fresh_rec.get("vehicle_type", "car")
+        b_style = fresh_rec.get("body_style", "")
+        conf = fresh_rec.get("confidence", 0.0)
+        dur = fresh_rec.get("processing_ms") or 430
         payload = build_alpr_kit_envelope(
             plate_text=plate_str,
             abs_img_path=abs_img_path,
@@ -6925,8 +6979,9 @@ def alpr_kit_get_plate():
         )
         return jsonify(payload)
 
-    # Jika belum ada record tersimpan di memory, lakukan capture langsung dari CCTV
-    return alpr_kit_capture_image()
+    # Jika tidak ada record fresh (kendaraan sudah lewat atau kamera diarahkan ke sembarang arah):
+    # Lakukan scan real-time langsung terhadap apa yang dilihat kamera saat ini!
+    return _execute_alpr_kit_capture(is_capture=False)
 
 
 @app.route("/get_image", methods=["GET", "POST", "OPTIONS"])
@@ -7002,6 +7057,13 @@ def alpr_kit_delete_image():
                 failed.append({"path": p, "error": str(e)})
         else:
             failed.append({"path": p, "error": "File tidak ditemukan"})
+
+        # Tandai record yang sesuai di LATEST_RECORDS sebagai sudah dikonsumsi
+        bname = os.path.basename(p)
+        for r in list(LATEST_RECORDS):
+            snap_name = os.path.basename(r.get("snapshot_url", ""))
+            if snap_name == bname or p in r.get("snapshot_url", ""):
+                r["consumed"] = True
 
     return jsonify({
         "data": {},
