@@ -6733,6 +6733,81 @@ def stream_capture():
 # ALPR KIT V2.9 STANDARD ENDPOINTS (COMPATIBILITY CONTRACT)
 # ========================================================
 
+def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_style="", duration_ms=430, is_capture=False, detections=None):
+    """
+    Membangun payload envelope JSON yang 100% kompatibel dengan ALPR Kit v2.9
+    sesuai spesifikasi klien Parkour (Rust src/service.rs).
+    Menjamin response.code = 200, data.alpr, data.timestamp, serta field top-level tetap utuh.
+    """
+    now_ms = int(time.time() * 1000)
+    compact_p = re.sub(r'[^A-Za-z0-9]', '', plate_text) if plate_text else ""
+    plate_conf_pct = round(float(conf) * 100.0, 2) if conf else 99.0
+
+    plate_item = {
+        "car": {
+            "confidence": plate_conf_pct,
+            "warpedBox": [271.0, 186.0, 720.0, 186.0, 720.0, 511.0, 271.0, 511.0]
+        },
+        "confidences": [plate_conf_pct] * max(1, len(compact_p)),
+        "text": compact_p,
+        "warpedBox": [541.0, 419.0, 646.0, 419.0, 646.0, 481.0, 541.0, 481.0]
+    }
+
+    alpr_detail = {
+        "duration": int(duration_ms),
+        "frame_id": int(time.time()) % 1000000,
+        "plates": [plate_item] if compact_p else []
+    }
+
+    alpr_record = {
+        "additional": {},
+        "alpr": alpr_detail,
+        "alpr_file": abs_img_path if compact_p else "",
+        "cap_file": abs_img_path,
+        "image_file": abs_img_path,
+        "level": 255,
+        "match_plate": compact_p,
+        "num_cars": 1 if compact_p else 0,
+        "num_plates": 1 if compact_p else 0,
+        "timestamp": now_ms
+    }
+
+    if is_capture:
+        data_block = {
+            "capture": alpr_record,
+            "timestamp": now_ms
+        }
+    else:
+        data_block = {
+            "alpr": [alpr_record],
+            "timestamp": now_ms
+        }
+
+    res = {
+        "data": data_block,
+        "response": {
+            "code": 200,
+            "message": "SUCCESS",
+            "version": "ALPR 2.9"
+        },
+        # Backwards compatibility top-level fields:
+        "status": "success",
+        "license_plate": compact_p,
+        "plate_number": compact_p,
+        "license_plate_compact": compact_p,
+        "license_plate_spaced": format_license_plate(compact_p, compact=False),
+        "vehicle_type": v_type or "car",
+        "body_style": b_style or "",
+        "confidence": conf if conf is not None else 0.0,
+        "image_path": abs_img_path,
+        "image_url": f"/captures/{os.path.basename(abs_img_path)}" if abs_img_path else "",
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    if detections is not None:
+        res["detections"] = detections
+    return res
+
+
 @app.route("/capture_image", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/capture_image", methods=["GET", "POST", "OPTIONS"])
 def alpr_kit_capture_image():
@@ -6818,20 +6893,18 @@ def alpr_kit_capture_image():
     except Exception:
         pass
 
-    return jsonify({
-        "status": "success",
-        "image_path": snap_path,
-        "image_url": f"/captures/{snap_filename}",
-        "license_plate": plate_text,
-        "plate_number": plate_text,
-        "license_plate_compact": re.sub(r'\s+', '', plate_text) if '-' not in plate_text else plate_text,
-        "license_plate_spaced": format_license_plate(plate_text, compact=False),
-        "vehicle_type": v_type,
-        "body_style": b_style,
-        "confidence": conf,
-        "detection_time_sec": ai_total_sec,
-        "detections": result.get("detections", [])
-    })
+    payload = build_alpr_kit_envelope(
+        plate_text=plate_text,
+        abs_img_path=snap_path,
+        conf=conf,
+        v_type=v_type,
+        b_style=b_style,
+        duration_ms=int(ai_total_sec * 1000),
+        is_capture=True,
+        detections=result.get("detections", [])
+    )
+    payload["detection_time_sec"] = ai_total_sec
+    return jsonify(payload)
 
 
 @app.route("/get_plate", methods=["GET", "POST", "OPTIONS"])
@@ -6854,20 +6927,21 @@ def alpr_kit_get_plate():
         plate_str = latest_rec.get("license_plate", "")
         img_name = latest_rec.get("snapshot_url", "").split("/")[-1] if latest_rec.get("snapshot_url") else ""
         abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-        return jsonify({
-            "status": "success",
-            "license_plate": plate_str,
-            "plate_number": plate_str,
-            "license_plate_compact": re.sub(r'\s+', '', plate_str) if '-' not in plate_str else plate_str,
-            "license_plate_spaced": format_license_plate(plate_str, compact=False),
-            "vehicle_type": latest_rec.get("vehicle_type", "car"),
-            "body_style": latest_rec.get("body_style", ""),
-            "confidence": latest_rec.get("confidence", 0.0),
-            "timestamp": latest_rec.get("timestamp", ""),
-            "image_path": abs_img_path,
-            "image_url": latest_rec.get("snapshot_url", ""),
-            "record": latest_rec
-        })
+        v_type = latest_rec.get("vehicle_type", "car")
+        b_style = latest_rec.get("body_style", "")
+        conf = latest_rec.get("confidence", 0.0)
+        dur = latest_rec.get("processing_ms") or 430
+        payload = build_alpr_kit_envelope(
+            plate_text=plate_str,
+            abs_img_path=abs_img_path,
+            conf=conf,
+            v_type=v_type,
+            b_style=b_style,
+            duration_ms=dur,
+            is_capture=False
+        )
+        payload["record"] = latest_rec
+        return jsonify(payload)
 
     # Jika belum ada record tersimpan di memory, lakukan capture langsung dari CCTV
     return alpr_kit_capture_image()
@@ -6948,6 +7022,12 @@ def alpr_kit_delete_image():
             failed.append({"path": p, "error": "File tidak ditemukan"})
 
     return jsonify({
+        "data": {},
+        "response": {
+            "code": 200,
+            "message": "SUCCESS",
+            "version": "ALPR 2.9"
+        },
         "status": "success",
         "deleted_count": len(deleted),
         "deleted": deleted,

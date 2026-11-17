@@ -601,9 +601,16 @@ class TestAnprInvariants(unittest.TestCase):
         data_post = res_post.get_json()
         self.assertEqual(data_post.get("status"), "success")
         self.assertIn("license_plate", data_post)
+        # Parkour Rust client src/service.rs compatibility assertions:
+        self.assertEqual(data_post.get("response", {}).get("code"), 200)
+        self.assertEqual(data_post.get("response", {}).get("message"), "SUCCESS")
+        self.assertEqual(data_post.get("response", {}).get("version"), "ALPR 2.9")
+        self.assertIn("alpr", data_post.get("data", {}))
+        self.assertEqual(data_post["data"]["alpr"][0]["alpr"]["plates"][0]["text"], "B1786CIC")
 
         res_get = client.get("/get_plate")
         self.assertEqual(res_get.status_code, 200)
+        self.assertEqual(res_get.get_json().get("response", {}).get("code"), 200)
 
         # 2. /get_image (POST & GET)
         test_img_path = os.path.join(A.CAPTURES_DIR, "test_dummy_image.jpg")
@@ -620,6 +627,9 @@ class TestAnprInvariants(unittest.TestCase):
             self.assertEqual(res_del.status_code, 200)
             data_del = res_del.get_json()
             self.assertEqual(data_del.get("status"), "success")
+            self.assertEqual(data_del.get("response", {}).get("code"), 200)
+            self.assertEqual(data_del.get("response", {}).get("version"), "ALPR 2.9")
+            self.assertIn("data", data_del)
             self.assertFalse(os.path.exists(test_img_path))
         finally:
             if os.path.exists(test_img_path):
