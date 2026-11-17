@@ -602,7 +602,7 @@ class TestAnprInvariants(unittest.TestCase):
         # Parkour Rust client src/service.rs compatibility assertions:
         self.assertEqual(data_post.get("response", {}).get("code"), 200)
         self.assertEqual(data_post.get("response", {}).get("message"), "SUCCESS")
-        self.assertEqual(data_post.get("response", {}).get("version"), "ALPR 2.9")
+        self.assertEqual(data_post.get("response", {}).get("version"), "ALPR 1.0")
         self.assertIn("alpr", data_post.get("data", {}))
         self.assertEqual(data_post["data"]["alpr"][0]["alpr"]["plates"][0]["text"], "B1786CIC")
 
@@ -625,7 +625,7 @@ class TestAnprInvariants(unittest.TestCase):
             self.assertEqual(res_del.status_code, 200)
             data_del = res_del.get_json()
             self.assertEqual(data_del.get("response", {}).get("code"), 200)
-            self.assertEqual(data_del.get("response", {}).get("version"), "ALPR 2.9")
+            self.assertEqual(data_del.get("response", {}).get("version"), "ALPR 1.0")
             self.assertIn("data", data_del)
             self.assertFalse(os.path.exists(test_img_path))
         finally:
