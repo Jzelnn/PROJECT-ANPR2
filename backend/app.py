@@ -1203,8 +1203,14 @@ class CameraStreamManager:
                 frame_count = 0
                 fps_timer = now
 
-            # Resize proporsional untuk tampilan web (ringan, jernih, dan sangat mulus)
+            # Optimasi Resolusi Optimal (Auto-720p 1280x720 untuk latensi rendah di Raspberry Pi)
             h, w = frame.shape[:2]
+            if w > 1280:
+                target_h_720 = int(round(h * (1280.0 / w)))
+                frame = cv2.resize(frame, (1280, target_h_720), interpolation=cv2.INTER_LINEAR)
+                h, w = frame.shape[:2]
+
+            # Resize proporsional untuk tampilan web (ringan, jernih, dan sangat mulus)
             target_w = 960
             target_h = int(h * (target_w / float(w)))
             small_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
@@ -6882,6 +6888,12 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             is_capture=is_capture
         )
         return jsonify(payload)
+
+    # Auto-Downscale ke 720p (1280x720) jika frame > 1280px untuk optimasi latensi rendah di Raspberry Pi
+    if frame is not None and frame.shape[1] > 1280:
+        h, w = frame.shape[:2]
+        target_h_720 = int(round(h * (1280.0 / w)))
+        frame = cv2.resize(frame, (1280, target_h_720), interpolation=cv2.INTER_LINEAR)
 
     t0 = time.time()
     result = run_anpr(frame, is_stream=True)
