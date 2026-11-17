@@ -6920,7 +6920,9 @@ def alpr_kit_delete_image():
 
     data = request.get_json(silent=True) or {}
     paths = data.get("image_paths", [])
-    if isinstance(paths, str):
+    if not paths and "image_path" in data:
+        paths = [data["image_path"]]
+    elif isinstance(paths, str):
         paths = [paths]
 
     deleted = []
