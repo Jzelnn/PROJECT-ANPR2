@@ -316,7 +316,7 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 # ============================================================
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 384))           # 384 for fast CPU detection (< 150ms)
 VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 384))  # 384 for fast real-time stream vehicle detection (~160ms on CPU)
-VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.35))
+VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.48))
 VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.28))
 MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.25))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.15))
@@ -5117,7 +5117,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
 
         scored_candidates.sort(key=_cand_sort_key)
 
-        if single_vehicle_mode and not is_stream:
+        if single_vehicle_mode:
             candidates = [scored_candidates[0]] if scored_candidates else []
         else:
             candidates = scored_candidates
@@ -6388,7 +6388,7 @@ def detect_current():
         return jsonify({"error": "Belum ada frame video di memory. Pastikan kamera CCTV sudah terhubung dan aktif."}), 400
 
     t0 = time.time()
-    result = run_anpr(frame, is_stream=True)
+    result = run_anpr(frame, is_stream=False)
     ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
     ai_total_ms = int(round(ai_total_sec * 1000))
     result["detection_time_sec"] = ai_total_sec
@@ -6605,7 +6605,7 @@ def stream_capture():
     if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
         frame = camera_stream_manager.get_latest_frame()
         t0 = time.time()
-        result = run_anpr(frame, is_stream=True)
+        result = run_anpr(frame, is_stream=False)
         ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
         ai_total_ms = int(round(ai_total_sec * 1000))
         result["detection_time_sec"] = ai_total_sec
@@ -6896,7 +6896,7 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         frame = cv2.resize(frame, (1280, target_h_720), interpolation=cv2.INTER_LINEAR)
 
     t0 = time.time()
-    result = run_anpr(frame, is_stream=True)
+    result = run_anpr(frame, is_stream=False)
     ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
     result["detection_time_sec"] = ai_total_sec
 
