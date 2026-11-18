@@ -8,7 +8,7 @@ import platform
 _MACHINE_ARCH = platform.machine().lower()
 IS_ARM_CPU = _MACHINE_ARCH in ("aarch64", "arm64") or _MACHINE_ARCH.startswith("arm")
 IS_LINUX_ARM64 = (sys.platform == "linux" and _MACHINE_ARCH in ("aarch64", "arm64"))
-_DEFAULT_CPU_THREADS = "1" if IS_ARM_CPU else str(min(4, max(2, (os.cpu_count() or 4) // 2)))
+_DEFAULT_CPU_THREADS = "3" if IS_ARM_CPU else str(min(4, max(2, (os.cpu_count() or 4) // 2)))
 _CONFIGURED_THREADS = os.environ.get("ANPR_TORCH_THREADS") or os.environ.get("TORCH_NUM_THREADS") or _DEFAULT_CPU_THREADS
 
 if IS_ARM_CPU:
@@ -317,8 +317,8 @@ os.makedirs(DEBUG_CROPS_DIR, exist_ok=True)
 IMG_SIZE = int(os.environ.get("ANPR_IMG_SIZE", 384))           # 384 for fast CPU detection (< 150ms)
 VEHICLE_STREAM_IMGSZ = int(os.environ.get("ANPR_VEHICLE_STREAM_IMGSZ", 384))  # 384 for fast real-time stream vehicle detection (~160ms on CPU)
 VEHICLE_CONF_THRESH = float(os.environ.get("ANPR_VEHICLE_CONF", 0.48))
-VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.28))
-MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.25))
+VEHICLE_TRACK_CONTINUE_CONF = float(os.environ.get("ANPR_VEHICLE_CONTINUE_CONF", 0.38))
+MOTORCYCLE_CONF_THRESH = float(os.environ.get("ANPR_MOTOR_CONF", 0.38))
 PLATE_CONF_THRESH = float(os.environ.get("ANPR_PLATE_CONF", 0.15))
 IOU_THRESH = float(os.environ.get("ANPR_IOU_THRESH", 0.35))
 FRAME_SKIP = int(os.environ.get("ANPR_FRAME_SKIP", 1))         # Process 1 of every N frames (1 = all, 2 = half)
@@ -2487,8 +2487,18 @@ def _ensure_cct_file(path, url):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".part"
     print(f"[CCT_OCR] mengunduh {os.path.basename(path)}", flush=True)
-    urllib.request.urlretrieve(url, tmp)
-    os.replace(tmp, path)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=0.5) as resp, open(tmp, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        os.replace(tmp, path)
+    except Exception as e_dl:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        raise e_dl
 
 
 def _parse_cct_yaml(path):
@@ -4525,7 +4535,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                     score = p_conf * y_factor
                     valid_crops.append((abs_box, p_conf, score))
 
-            if not valid_crops and not alignment_only and (attempt_count % 3 == 0):
+            if not valid_crops and not alignment_only and DEEP_PLATE_FALLBACK and (attempt_count % 3 == 0):
                 with plate_infer_lock:
                     pdet_legacy = plate_model_legacy.predict(padded_crop, conf=min(PLATE_INFER_CONF, 0.12), imgsz=PLATE_INFER_IMGSZ, device=DEVICE, verbose=False)[0]
                 for b in pdet_legacy.boxes:
@@ -4547,7 +4557,7 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                         valid_crops.append((abs_box, p_conf, score))
 
             # Fallback B: Contrast Enhancement (CLAHE) for dark/shadowed vehicles (throttled in stream mode)
-            if not valid_crops and not alignment_only and (attempt_count % 3 == 0) and padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
+            if not valid_crops and not alignment_only and DEEP_PLATE_FALLBACK and (attempt_count % 3 == 0) and padded_crop is not None and getattr(padded_crop, 'size', 0) > 0:
                 try:
                     lab = cv2.cvtColor(padded_crop, cv2.COLOR_BGR2LAB)
                     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -4578,10 +4588,9 @@ def _async_plate_task(track_id, vehicle_crop, v_bbox, full_img, iw, ih, submit_t
                 except Exception:
                     pass
 
-        # 2. Fallback: Full Frame / ROI Plate Detection only if crop is very small
+        # 2. Fallback: Full Frame / ROI Plate Detection only if crop is very small and deep fallback active
         need_full_fallback = (
-            padded_crop is None or getattr(padded_crop, 'size', 0) == 0 or
-            vw < 120 or vh < 120
+            DEEP_PLATE_FALLBACK and (padded_crop is None or getattr(padded_crop, 'size', 0) == 0 or vw < 120 or vh < 120)
         )
         if not valid_crops and not alignment_only and need_full_fallback and full_img is not None and getattr(full_img, 'size', 0) > 0:
             with plate_infer_lock:
@@ -5249,7 +5258,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     if should_detect_plate:
                         with confirmation_manager.lock:
                             can_submit_plate_now = (
-                                not existing_trk.plate_pending and not existing_trk.ocr_pending
+                                not existing_trk.plate_pending and
+                                not existing_trk.ocr_pending and
+                                (getattr(plate_executor, '_work_queue', None) is None or plate_executor._work_queue.qsize() == 0)
                             )
                             if can_submit_plate_now:
                                 existing_trk.plate_pending = True
@@ -7009,6 +7020,55 @@ def alpr_kit_get_plate():
             v_type=v_type,
             b_style=b_style,
             duration_ms=dur,
+            is_capture=False
+        )
+        return jsonify(payload)
+
+    # Cek apakah ada kendaraan yang SEDANG AKTIF di depan kamera dengan plat terkonfirmasi (real-time stream sync)
+    active_cand = None
+    if 'confirmation_manager' in globals():
+        with confirmation_manager.lock:
+            for t_id, trk in confirmation_manager.tracks.items():
+                if trk.lost_interest or trk.discarded:
+                    continue
+                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
+                    active_cand = trk
+                    break
+
+    if active_cand is not None:
+        plate_str = active_cand.best_candidate_display
+        v_type = active_cand.cached_vtype or active_cand.initial_vtype or "car"
+        b_style = active_cand.cached_body_style or ""
+        conf = active_cand.best_candidate_conf or 0.85
+
+        frame = camera_stream_manager.get_latest_frame() if camera_stream_manager.running else None
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+        safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_str) if plate_str else "LIVE"
+        snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
+        snap_path = os.path.join(CAPTURES_DIR, snap_filename)
+        if frame is not None:
+            try:
+                active_det = {
+                    "license_plate": plate_str,
+                    "plate_confidence": conf,
+                    "vehicle_type": v_type,
+                    "body_style": b_style,
+                    "bbox": active_cand.last_bbox,
+                    "plate_bbox": active_cand.last_plate_bbox
+                }
+                ann_img = draw_annotations_on_image(frame.copy(), active_det, interest_area=INTEREST_AREA)
+                cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            except Exception:
+                pass
+
+        payload = build_alpr_kit_envelope(
+            plate_text=plate_str,
+            abs_img_path=snap_path,
+            conf=conf,
+            v_type=v_type,
+            b_style=b_style,
+            duration_ms=45,
             is_capture=False
         )
         return jsonify(payload)
