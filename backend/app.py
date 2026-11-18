@@ -4810,15 +4810,8 @@ def _async_ocr_task(job_id, track_id, crop, crop_q, full_img, submit_time, frame
                 (getattr(track, 'lifecycle_state', '') == 'EXITING' and getattr(track, 'frames_missing', 0) > 3)
             )
             if is_dead:
-                is_valid_struct, _ = is_valid_indonesian_plate_structure(text)
-                if is_valid_struct and conf >= 0.65 and track and not track.history_saved:
-                    print(f"[OCR_RESCUE] Track {track_id} di-rescue karena hasil OCR valid '{text}' (conf={conf:.2f})!", flush=True)
-                    track.lifecycle_state = "ACTIVE"
-                    track.lost_interest = False
-                    is_dead = False
-                else:
-                    print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
-                    return
+                print(f"[STALE_RESULT_DISCARDED]\ntrack_id={track_id}\nframe_id={frame_id}\nreason=TRACK_INACTIVE", flush=True)
+                return
             track.ocr_infer_ms = ocr_duration_ms
             prev_status = track.status
             update_info = track.add_ocr_result(job_id, text, conf, crop_q, ocr_method=method)
@@ -6792,7 +6785,7 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     }
 
     alpr_detail = {
-        "duration": int(duration_ms) if duration_ms and duration_ms < 2000 else 431,
+        "duration": max(1, int(duration_ms)) if duration_ms is not None else 45,
         "frame_id": int(time.time() * 1000) % 1000000,
         "plates": [plate_item] if compact_p else []
     }
@@ -6842,9 +6835,9 @@ LAST_ALPR_RESPONSE_IMAGE = {"path": ""}
 
 def _find_live_track(now_epoch=None):
     """
-    Mengembalikan track kendaraan yang BENAR-BENAR terlihat di frame kamera saat ini, atau None.
-    Track yang sedang keluar (EXITING), hilang dari frame, lost interest, dibuang, atau tidak terlihat
-    lebih dari LIVE_TRACK_MAX_AGE_SEC tidak dihitung -> tidak ada fallback ke kendaraan sebelumnya.
+    Mengembalikan track kendaraan yang BENAR-BENAR terlihat di frame kamera saat ini, belum dikonsumsi (K4),
+    atau None. Track yang sedang keluar (EXITING), hilang dari frame (frames_missing > 0), sudah dikonsumsi,
+    lost interest, dibuang, atau tidak terlihat > LIVE_TRACK_MAX_AGE_SEC tidak dihitung.
     """
     if 'confirmation_manager' not in globals():
         return None
@@ -6853,11 +6846,13 @@ def _find_live_track(now_epoch=None):
     best = None
     with confirmation_manager.lock:
         for _tid, trk in confirmation_manager.tracks.items():
+            if getattr(trk, "consumed", False):
+                continue
             if trk.lost_interest or trk.status in ("DISCARDED", "UNREADABLE", "LOST"):
                 continue
             if getattr(trk, "lifecycle_state", "") != "ACTIVE":
                 continue
-            if getattr(trk, "frames_missing", 0) > 1:
+            if getattr(trk, "frames_missing", 0) > 0:
                 continue
             if getattr(trk, "inside_interest_area", True) is False:
                 continue
@@ -6878,11 +6873,13 @@ def _has_pending_live_vehicle(now_epoch=None):
         now_epoch = time.time()
     with confirmation_manager.lock:
         for _tid, trk in confirmation_manager.tracks.items():
+            if getattr(trk, "consumed", False):
+                continue
             if trk.lost_interest or trk.status in ("DISCARDED", "UNREADABLE", "LOST"):
                 continue
             if getattr(trk, "lifecycle_state", "") != "ACTIVE":
                 continue
-            if getattr(trk, "frames_missing", 0) > 1:
+            if getattr(trk, "frames_missing", 0) > 0:
                 continue
             if getattr(trk, "inside_interest_area", True) is False:
                 continue
@@ -6949,6 +6946,18 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         if frame is None:
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
+        # K4: Tandai track aktif & seluruh track/record berplat sama sebagai consumed agar tidak pernah keluar 2x
+        with confirmation_manager.lock:
+            active_cand.consumed = True
+            active_cand.last_snap_filename = snap_filename
+            for _t in confirmation_manager.tracks.values():
+                if _t.best_candidate_display and re.sub(r'[^A-Za-z0-9]', '', _t.best_candidate_display).upper() == safe_p.upper():
+                    _t.consumed = True
+        for r in list(LATEST_RECORDS):
+            r_clean = re.sub(r'[^A-Za-z0-9]', '', str(r.get("license_plate") or "")).upper()
+            if r_clean and r_clean == safe_p.upper():
+                r["consumed"] = True
+
         try:
             active_det = {
                 "license_plate": plate_str,
@@ -6967,13 +6976,14 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             except Exception:
                 pass
 
+        dur_live_ms = max(1, int(round((time.time() - t_req_start) * 1000)))
         payload = build_alpr_kit_envelope(
             plate_text=plate_str,
             abs_img_path=snap_path,
             conf=conf,
             v_type=v_type,
             b_style=b_style,
-            duration_ms=45,
+            duration_ms=dur_live_ms,
             is_capture=is_capture
         )
         _remember_alpr_response_image(snap_path)
@@ -7080,8 +7090,15 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
 
     if primary_det and primary_det.get("is_newly_confirmed"):
         rec = save_parking_record(primary_det, source_img=frame)
-        rec["consumed"] = True  # langsung dikonsumsi untuk pemanggilan ini
+        if rec:
+            rec["consumed"] = True  # langsung dikonsumsi untuk pemanggilan ini
         primary_det["record"] = rec
+
+    if primary_det and primary_det.get("track_id") is not None and 'confirmation_manager' in globals():
+        with confirmation_manager.lock:
+            trk_c = confirmation_manager.tracks.get(primary_det.get("track_id"))
+            if trk_c:
+                trk_c.consumed = True
 
     safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_text) if plate_text else "NONE"
     snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
@@ -7106,7 +7123,10 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         duration_ms=int(ai_total_sec * 1000),
         is_capture=is_capture
     )
-    _remember_alpr_response_image(snap_path)
+    # K6: Hanya simpan sebagai pasangan foto terakhir jika request selesai sebelum batas timeout klien (default 2.0s)
+    client_timeout_limit = float(os.environ.get("ANPR_CLIENT_TIMEOUT_SEC", 2.0))
+    if (time.time() - t_req_start) < client_timeout_limit:
+        _remember_alpr_response_image(snap_path)
     return jsonify(payload)
 
 
@@ -7260,11 +7280,20 @@ def alpr_kit_delete_image():
         else:
             failed.append({"path": p, "error": "File tidak ditemukan"})
 
-        # Tandai record yang sesuai di LATEST_RECORDS sebagai sudah dikonsumsi
+        # Tandai record yang sesuai di LATEST_RECORDS & track di confirmation_manager sebagai sudah dikonsumsi (K4)
         for r in list(LATEST_RECORDS):
             snap_name = os.path.basename(r.get("snapshot_url", "").replace("\\", "/"))
             if snap_name == bname or bname in r.get("snapshot_url", ""):
                 r["consumed"] = True
+        if 'confirmation_manager' in globals():
+            with confirmation_manager.lock:
+                for _t in confirmation_manager.tracks.values():
+                    t_snap = getattr(_t, "last_snap_filename", "")
+                    t_plate = re.sub(r'[^A-Za-z0-9]', '', _t.best_candidate_display or "")
+                    if (t_snap and t_snap == bname) or (t_plate and t_plate in bname):
+                        _t.consumed = True
+        if os.path.basename(str(LAST_ALPR_RESPONSE_IMAGE.get("path") or "").replace("\\", "/")) == bname:
+            LAST_ALPR_RESPONSE_IMAGE["path"] = ""
 
     return jsonify({
         "data": {},

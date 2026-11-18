@@ -717,6 +717,24 @@ class TestAnprInvariants(unittest.TestCase):
                 self.assertLess(elapsed_ms, 500.0)
                 rec_fast = res_fast.get_json()["data"]["alpr"][0]
                 self.assertEqual(rec_fast["alpr"]["plates"], [])
+
+                # K4: Setelah track live dikonsumsi 1x oleh /get_plate, request kedua (< 1.5s) TIDAK BOLEH mengembalikannya lagi!
+                trk_k4 = A.VehicleTrack(900099, None)
+                trk_k4.lifecycle_state = "ACTIVE"
+                trk_k4.inside_interest_area = True
+                trk_k4.status = "CONFIRMED"
+                trk_k4.frames_missing = 0
+                trk_k4.best_candidate_display = "B 2858 TII"
+                trk_k4.best_candidate_conf = 0.96
+                trk_k4.last_seen = A.time.time()
+                A.confirmation_manager.tracks[900099] = trk_k4
+                try:
+                    r_first = client.get("/get_plate").get_json()["data"]["alpr"][0]
+                    self.assertEqual(r_first["alpr"]["plates"][0]["text"], "B2858TII")
+                    r_second = client.get("/get_plate").get_json()["data"]["alpr"][0]
+                    self.assertEqual(r_second["alpr"]["plates"], [])
+                finally:
+                    A.confirmation_manager.tracks.pop(900099, None)
             finally:
                 A.stream_inference_worker.running = orig_w_run
                 A.stream_inference_worker.last_payload = orig_w_pay
