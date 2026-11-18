@@ -6810,6 +6810,11 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
         "alpr_file": abs_img_path if compact_p else "",
         "cap_file": abs_img_path,
         "image_file": abs_img_path,
+        "image_path": abs_img_path,
+        "license_plate": plate_text,
+        "plate": compact_p,
+        "vehicle_type": v_type,
+        "body_style": b_style,
         "level": 255,
         "match_plate": compact_p,
         "num_cars": 1 if compact_p else 0,
@@ -6820,11 +6825,13 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     if is_capture:
         data_block = {
             "capture": alpr_record,
+            "alpr": [alpr_record],
             "timestamp": now_ms
         }
     else:
         data_block = {
             "alpr": [alpr_record],
+            "capture": alpr_record,
             "timestamp": now_ms
         }
 
@@ -6988,26 +6995,27 @@ def alpr_kit_get_plate():
     # Cek apakah ada record yang MASIH FRESH (belum dikonsumsi dan usia <= 15 detik)
     now_epoch = time.time()
     fresh_rec = None
-    if len(LATEST_RECORDS) > 0:
-        cand = LATEST_RECORDS[0]
+    for cand in list(LATEST_RECORDS)[:10]:
         if not cand.get("consumed", False):
             cand_epoch = cand.get("epoch")
             if cand_epoch is not None:
                 if (now_epoch - cand_epoch) <= 15.0:
-                    img_name = cand.get("snapshot_url", "").split("/")[-1] if cand.get("snapshot_url") else ""
+                    img_name = cand.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if cand.get("snapshot_url") else ""
                     abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
                     if abs_img_path and os.path.isfile(abs_img_path):
                         fresh_rec = cand
+                        break
             else:
                 # Unit-test / fallback tanpa epoch eksplisit
-                img_name = cand.get("snapshot_url", "").split("/")[-1] if cand.get("snapshot_url") else ""
+                img_name = cand.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if cand.get("snapshot_url") else ""
                 abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
                 fresh_rec = cand
+                break
 
     if fresh_rec:
         fresh_rec["consumed"] = True
         plate_str = fresh_rec.get("license_plate", "")
-        img_name = fresh_rec.get("snapshot_url", "").split("/")[-1] if fresh_rec.get("snapshot_url") else ""
+        img_name = fresh_rec.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if fresh_rec.get("snapshot_url") else ""
         abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
         v_type = fresh_rec.get("vehicle_type", "car")
         b_style = fresh_rec.get("body_style", "")
@@ -7029,10 +7037,11 @@ def alpr_kit_get_plate():
     if 'confirmation_manager' in globals():
         with confirmation_manager.lock:
             for t_id, trk in confirmation_manager.tracks.items():
-                if trk.lost_interest or trk.discarded:
+                if trk.lost_interest or trk.discarded or getattr(trk, "consumed", False):
                     continue
                 if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
                     active_cand = trk
+                    trk.consumed = True
                     break
 
     if active_cand is not None:
@@ -7046,21 +7055,23 @@ def alpr_kit_get_plate():
         safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_str) if plate_str else "LIVE"
         snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
         snap_path = os.path.join(CAPTURES_DIR, snap_filename)
-        if frame is not None:
-            try:
-                active_det = {
-                    "license_plate": plate_str,
-                    "plate_confidence": conf,
-                    "vehicle_type": v_type,
-                    "body_style": b_style,
-                    "bbox": active_cand.last_bbox,
-                    "plate_bbox": active_cand.last_plate_bbox
-                }
-                ann_img = draw_annotations_on_image(frame.copy(), active_det, interest_area=INTEREST_AREA)
-                cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            except Exception:
-                pass
+        if frame is None:
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        try:
+            active_det = {
+                "license_plate": plate_str,
+                "plate_confidence": conf,
+                "vehicle_type": v_type,
+                "body_style": b_style,
+                "bbox": active_cand.last_bbox,
+                "plate_bbox": active_cand.last_plate_bbox
+            }
+            ann_img = draw_annotations_on_image(frame.copy(), active_det, interest_area=INTEREST_AREA)
+            cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        except Exception:
+            pass
 
         payload = build_alpr_kit_envelope(
             plate_text=plate_str,
@@ -7083,21 +7094,28 @@ def alpr_kit_get_plate():
 def alpr_kit_get_image():
     """
     ALPR Kit Standard Endpoint: Mengambil/mengunduh file foto kendaraan.
-    Menerima body JSON: {"image_path": "/path/to/image.jpg"}
+    Menerima body JSON: {"image_path": "/path/to/image.jpg"} atau {"image_file": ...}
     atau query string: ?image_path=...
     """
     if request.method == "OPTIONS":
         return "", 200
 
     data = request.get_json(silent=True) or {}
-    img_path = data.get("image_path") or request.args.get("image_path") or ""
+    img_path = (
+        data.get("image_path") or data.get("image_file") or data.get("cap_file") or data.get("alpr_file") or
+        request.args.get("image_path") or request.args.get("image_file") or
+        (request.form.get("image_path") if request.form else "") or ""
+    )
 
     target_file = None
     if img_path:
-        if os.path.exists(img_path) and os.path.isfile(img_path):
+        clean_p = str(img_path).replace("\\", "/").rstrip("/")
+        if os.path.exists(clean_p) and os.path.isfile(clean_p):
+            target_file = clean_p
+        elif os.path.exists(img_path) and os.path.isfile(img_path):
             target_file = img_path
         else:
-            bname = os.path.basename(img_path)
+            bname = clean_p.split("/")[-1]
             candidate = os.path.join(CAPTURES_DIR, bname)
             if os.path.exists(candidate) and os.path.isfile(candidate):
                 target_file = candidate
@@ -7110,6 +7128,12 @@ def alpr_kit_get_image():
     if target_file and os.path.exists(target_file):
         return send_file(target_file, mimetype="image/jpeg")
 
+    # Fallback blank JPEG bila file belum/tidak ada di disk agar klien decoder Parkour tidak crash
+    blank_fallback = np.zeros((240, 320, 3), dtype=np.uint8)
+    ret, buf = cv2.imencode(".jpg", blank_fallback, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    if ret:
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+
     return jsonify({"error": "File gambar tidak ditemukan", "image_path": img_path}), 404
 
 
@@ -7118,15 +7142,17 @@ def alpr_kit_get_image():
 def alpr_kit_delete_image():
     """
     ALPR Kit Standard Endpoint: Menghapus file foto snapshot tertentu di Raspi.
-    Menerima body JSON: {"image_paths": ["/path/to/file1.jpg", "file2.jpg"]}
+    Menerima body JSON: {"image_paths": ["/path/to/file1.jpg", "file2.jpg"]} atau {"image_path": ...}
     """
     if request.method == "OPTIONS":
         return "", 200
 
     data = request.get_json(silent=True) or {}
-    paths = data.get("image_paths", [])
-    if not paths and "image_path" in data:
-        paths = [data["image_path"]]
+    paths = data.get("image_paths") or data.get("image_files") or []
+    if not paths and ("image_path" in data or "image_file" in data):
+        paths = [data.get("image_path") or data.get("image_file")]
+    elif not paths and request.args.get("image_path"):
+        paths = [request.args.get("image_path")]
     elif isinstance(paths, str):
         paths = [paths]
 
@@ -7134,11 +7160,21 @@ def alpr_kit_delete_image():
     failed = []
 
     for p in paths:
+        if not p:
+            continue
+        clean_p = str(p).replace("\\", "/").rstrip("/")
+        bname = clean_p.split("/")[-1]
+
+        # Jangan hapus latest_result.jpg (dipakai preview monitor live)
+        if bname == "latest_result.jpg":
+            continue
+
         target = None
-        if os.path.exists(p) and os.path.isfile(p):
+        if os.path.exists(clean_p) and os.path.isfile(clean_p):
+            target = clean_p
+        elif os.path.exists(p) and os.path.isfile(p):
             target = p
         else:
-            bname = os.path.basename(p)
             cand = os.path.join(CAPTURES_DIR, bname)
             if os.path.exists(cand) and os.path.isfile(cand):
                 target = cand
@@ -7153,14 +7189,16 @@ def alpr_kit_delete_image():
             failed.append({"path": p, "error": "File tidak ditemukan"})
 
         # Tandai record yang sesuai di LATEST_RECORDS sebagai sudah dikonsumsi
-        bname = os.path.basename(p)
         for r in list(LATEST_RECORDS):
-            snap_name = os.path.basename(r.get("snapshot_url", ""))
-            if snap_name == bname or p in r.get("snapshot_url", ""):
+            snap_name = os.path.basename(r.get("snapshot_url", "").replace("\\", "/"))
+            if snap_name == bname or bname in r.get("snapshot_url", ""):
                 r["consumed"] = True
 
     return jsonify({
-        "data": {},
+        "data": {
+            "deleted": deleted,
+            "failed": failed
+        },
         "response": {
             "code": 200,
             "message": "SUCCESS",
