@@ -6830,6 +6830,49 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     }
 
 
+# Batas umur track "live": kendaraan dianggap masih di depan kamera hanya jika terlihat di frame stream
+# dalam N detik terakhir. Di luar itu ALPR TIDAK boleh mengembalikan plat lama ke Parkour.
+LIVE_TRACK_MAX_AGE_SEC = float(os.environ.get("ANPR_LIVE_TRACK_MAX_AGE", 1.5))
+
+# Pasangan foto dari respon /get_plate / /capture_image terakhir, agar /get_image & /delete_image
+# tanpa path (perilaku Parkour legacy) selalu menyajikan foto yang SAMA dengan plat yang baru dikirim.
+LAST_ALPR_RESPONSE_IMAGE = {"path": ""}
+
+
+def _find_live_track(now_epoch=None):
+    """
+    Mengembalikan track kendaraan yang BENAR-BENAR terlihat di frame kamera saat ini, atau None.
+    Track yang sedang keluar (EXITING), hilang dari frame, lost interest, dibuang, atau tidak terlihat
+    lebih dari LIVE_TRACK_MAX_AGE_SEC tidak dihitung -> tidak ada fallback ke kendaraan sebelumnya.
+    """
+    if 'confirmation_manager' not in globals():
+        return None
+    if now_epoch is None:
+        now_epoch = time.time()
+    best = None
+    with confirmation_manager.lock:
+        for _tid, trk in confirmation_manager.tracks.items():
+            if trk.lost_interest or trk.status in ("DISCARDED", "UNREADABLE", "LOST"):
+                continue
+            if getattr(trk, "lifecycle_state", "") != "ACTIVE":
+                continue
+            if getattr(trk, "frames_missing", 0) > 1:
+                continue
+            if getattr(trk, "inside_interest_area", True) is False:
+                continue
+            if not trk.best_candidate_display:
+                continue
+            if (now_epoch - trk.last_seen) > LIVE_TRACK_MAX_AGE_SEC:
+                continue
+            if best is None or trk.last_seen > best.last_seen:
+                best = trk
+    return best
+
+
+def _remember_alpr_response_image(path):
+    LAST_ALPR_RESPONSE_IMAGE["path"] = path or ""
+
+
 def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     """
     Mengambil frame dari stream CCTV atau fallback RTSP,
@@ -6843,14 +6886,8 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     # Jalur Super-Cepat: Jika ada kendaraan aktif di depan kamera yang sudah terkonfirmasi di background stream,
     # kembalikan hasil aktif seketika (< 50ms) tanpa perlu cold scan 4.5s di CPU!
     active_cand = None
-    if not stream_url_param and 'confirmation_manager' in globals() and camera_stream_manager.running:
-        with confirmation_manager.lock:
-            for t_id, trk in confirmation_manager.tracks.items():
-                if trk.lost_interest or trk.status == "DISCARDED":
-                    continue
-                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
-                    active_cand = trk
-                    break
+    if not stream_url_param and camera_stream_manager.running:
+        active_cand = _find_live_track(now_epoch)
 
     if active_cand is not None:
         plate_str = active_cand.best_candidate_display
@@ -6892,6 +6929,7 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             duration_ms=45,
             is_capture=is_capture
         )
+        _remember_alpr_response_image(snap_path)
         return jsonify(payload)
 
     frame = None
@@ -6948,6 +6986,7 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             duration_ms=50,
             is_capture=is_capture
         )
+        _remember_alpr_response_image(snap_path)
         return jsonify(payload)
 
     # Auto-Downscale ke 720p (1280x720) jika frame > 1280px untuk optimasi latensi rendah di Raspberry Pi
@@ -6995,6 +7034,7 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         duration_ms=int(ai_total_sec * 1000),
         is_capture=is_capture
     )
+    _remember_alpr_response_image(snap_path)
     return jsonify(payload)
 
 
@@ -7039,126 +7079,23 @@ def _is_safe_capture_path(file_path):
 @app.route("/api/get_plate", methods=["GET", "POST", "OPTIONS"])
 def alpr_kit_get_plate():
     """
-    ALPR Kit Standard Endpoint: Mengambil data hasil baca plat nomor.
-    Prioritas Utama:
-    1. Kendaraan yang SEDANG AKTIF di depan kamera detik ini (Real-time live track).
-       Ini menjamin apa yang tampil di monitor CCTV/dashboard = yang dicetak tiket Parkour.
-    2. Record sangat fresh dari stream (<= 3.0 detik, bukan cache basi).
-    3. Jika tidak ada kendaraan di depan kamera (mis. kamera ke tembok / kosong), lakukan
-       instant capture & scan detik ini (mengembalikan plat kosong, bukan mobil lama).
+    ALPR Kit Standard Endpoint: Mengambil data hasil baca plat nomor DETIK INI.
+    - Kendaraan benar-benar terlihat di frame stream (track live <= ANPR_LIVE_TRACK_MAX_AGE) -> platnya.
+    - Selain itu -> scan frame kamera saat ini apa adanya (plat kosong bila tidak ada kendaraan).
+    Tidak pernah mengembalikan plat kendaraan sebelumnya dari cache/riwayat.
     """
     if request.method == "OPTIONS":
         return "", 200
 
-    now_epoch = time.time()
     data = request.get_json(silent=True) or {}
     stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
     if stream_url_param or request.args.get("capture") == "1":
         return _execute_alpr_kit_capture(is_capture=False, stream_url_param=stream_url_param)
 
-    # PRIORITAS 1: KENDARAAN AKTIF DI DEPAN KAMERA (Live Real-time Track Sync)
-    active_cand = None
-    if 'confirmation_manager' in globals():
-        with confirmation_manager.lock:
-            for t_id, trk in confirmation_manager.tracks.items():
-                if trk.lost_interest or trk.status == "DISCARDED":
-                    continue
-                # Kendaraan benar-benar masih terlihat di depan kamera detik ini (<= 4.0s)
-                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
-                    active_cand = trk
-                    trk.consumed = True
-                    break
-
-    if active_cand is not None:
-        plate_str = active_cand.best_candidate_display
-        v_type = active_cand.cached_vtype or getattr(active_cand, "initial_vtype", None) or "car"
-        b_style = active_cand.cached_body_style or ""
-        conf = active_cand.best_candidate_conf or 0.85
-
-        frame = camera_stream_manager.get_latest_frame() if camera_stream_manager.running else None
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-        safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_str) if plate_str else "LIVE"
-        snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
-        snap_path = os.path.join(CAPTURES_DIR, snap_filename)
-        if frame is None:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-
-        try:
-            active_det = {
-                "license_plate": plate_str,
-                "plate_confidence": conf,
-                "vehicle_type": v_type,
-                "body_style": b_style,
-                "bbox": active_cand.last_bbox,
-                "plate_bbox": active_cand.last_plate_bbox
-            }
-            ann_img = draw_annotations_on_image(frame.copy(), active_det, interest_area=INTEREST_AREA)
-            cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        except Exception:
-            try:
-                cv2.imwrite(snap_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            except Exception:
-                pass
-
-        # Tandai seluruh record lama berplat ini di LATEST_RECORDS agar tidak dipakai ulang
-        for r in list(LATEST_RECORDS):
-            if r.get("license_plate") == plate_str:
-                r["consumed"] = True
-
-        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
-            age_ms = int(round((now_epoch - active_cand.last_seen) * 1000))
-            print(f"[AUDIT_P1] reason=active_track track_id={active_cand.track_id} frame_age_ms={age_ms} result_age_sec={age_ms/1000.0:.2f} plate={plate_str}", flush=True)
-
-        payload = build_alpr_kit_envelope(
-            plate_text=plate_str,
-            abs_img_path=snap_path,
-            conf=conf,
-            v_type=v_type,
-            b_style=b_style,
-            duration_ms=45,
-            is_capture=False
-        )
-        return jsonify(payload)
-
-    # PRIORITAS 2: RECORD BARU SAJA TERTANGKAP DARI STREAM (maksimal <= 3.0 detik, BUKAN cache basi!)
-    fresh_rec = None
-    for cand in list(LATEST_RECORDS)[:5]:
-        if not cand.get("consumed", False):
-            cand_epoch = cand.get("epoch")
-            if cand_epoch is not None and cand_epoch > 0:
-                if (now_epoch - cand_epoch) > 3.0:
-                    continue
-            img_name = os.path.basename(str(cand.get("snapshot_url", "")).replace("\\", "/"))
-            abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-            fresh_rec = cand
-            break
-
-    if fresh_rec:
-        fresh_rec["consumed"] = True
-        plate_str = fresh_rec.get("license_plate", "")
-        img_name = os.path.basename(str(fresh_rec.get("snapshot_url", "")).replace("\\", "/"))
-        abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-        v_type = fresh_rec.get("vehicle_type", "car")
-        b_style = fresh_rec.get("body_style", "")
-        conf = fresh_rec.get("confidence", 0.0)
-        dur = fresh_rec.get("processing_ms") or 350
-        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
-            age_ms = int(round((now_epoch - (fresh_rec.get("epoch") or now_epoch)) * 1000))
-            print(f"[AUDIT_P1] reason=cache_history record_id={fresh_rec.get('id')} track_id={fresh_rec.get('track_id')} frame_age_ms={age_ms} result_age_sec={age_ms/1000.0:.2f} plate={plate_str}", flush=True)
-
-        payload = build_alpr_kit_envelope(
-            plate_text=plate_str,
-            abs_img_path=abs_img_path,
-            conf=conf,
-            v_type=v_type,
-            b_style=b_style,
-            duration_ms=dur,
-            is_capture=False
-        )
-        return jsonify(payload)
-
-    # PRIORITAS 3: Tidak ada kendaraan aktif dan tidak ada record baru: Lakukan instant capture detik ini!
+    # Sinkron ALPR <-> Parkour: /get_plate SELALU mencerminkan kondisi kamera DETIK INI.
+    # 1. Jika ada kendaraan yang benar-benar terlihat di frame stream (track live) -> kirim platnya.
+    # 2. Jika tidak ada -> scan frame kamera saat ini apa adanya (kosong bila memang kosong).
+    # TIDAK ADA fallback ke record/riwayat kendaraan sebelumnya.
     return _execute_alpr_kit_capture(is_capture=False)
 
 
@@ -7192,10 +7129,12 @@ def alpr_kit_get_image():
                 if _is_safe_capture_path(candidate):
                     target_file = candidate
 
-    if not target_file:
-        cand_latest = os.path.join(CAPTURES_DIR, "latest_result.jpg")
-        if os.path.exists(cand_latest):
-            target_file = cand_latest
+    if not target_file and not img_path:
+        # Parkour legacy memanggil /get_image tanpa path -> sajikan foto pasangan respon /get_plate terakhir,
+        # BUKAN latest_result.jpg (bisa berisi kendaraan sebelumnya).
+        paired = LAST_ALPR_RESPONSE_IMAGE.get("path") or ""
+        if paired and _is_safe_capture_path(paired):
+            target_file = paired
 
     if target_file and os.path.exists(target_file):
         return send_file(target_file, mimetype="image/jpeg")

@@ -586,31 +586,40 @@ class TestAnprInvariants(unittest.TestCase):
         """Pastikan 4 endpoint standar ALPR Kit v2.9 aktif dan merespon dengan benar."""
         client = A.app.test_client()
 
-        # 1. /get_plate (POST & GET)
-        dummy_rec = {
-            "id": 123456,
-            "license_plate": "B 1786 CIC",
-            "vehicle_type": "car",
-            "body_style": "mpv",
-            "confidence": 0.93,
-            "timestamp": "2026-11-13 18:00:00",
-            "snapshot_url": "/captures/test_snapshot.jpg"
-        }
-        A.LATEST_RECORDS.appendleft(dummy_rec)
+        # 1. /get_plate (POST & GET) -> kendaraan LIVE di depan kamera
+        live_trk = A.VehicleTrack(987654, None)
+        live_trk.lifecycle_state = "ACTIVE"
+        live_trk.inside_interest_area = True
+        live_trk.status = "CONFIRMED"
+        live_trk.best_candidate_display = "B 1786 CIC"
+        live_trk.best_candidate_conf = 0.93
+        live_trk.last_seen = A.time.time()
+        live_trk.last_bbox = [10, 10, 90, 90]
+        A.confirmation_manager.tracks[987654] = live_trk
+        orig_running = A.camera_stream_manager.running
+        orig_get_frame = A.camera_stream_manager.get_latest_frame
+        A.camera_stream_manager.running = True
+        A.camera_stream_manager.get_latest_frame = lambda: np.zeros((100, 100, 3), dtype=np.uint8)
+        dummy_rec = {"id": 123456}
 
-        res_post = client.post("/get_plate", json={})
-        self.assertEqual(res_post.status_code, 200)
-        data_post = res_post.get_json()
-        # Parkour Rust client src/service.rs compatibility assertions:
-        self.assertEqual(data_post.get("response", {}).get("code"), 200)
-        self.assertEqual(data_post.get("response", {}).get("message"), "SUCCESS")
-        self.assertEqual(data_post.get("response", {}).get("version"), "ALPR 2.9")
-        self.assertIn("alpr", data_post.get("data", {}))
-        self.assertEqual(data_post["data"]["alpr"][0]["alpr"]["plates"][0]["text"], "B1786CIC")
+        try:
+            res_post = client.post("/get_plate", json={})
+            self.assertEqual(res_post.status_code, 200)
+            data_post = res_post.get_json()
+            # Parkour Rust client src/service.rs compatibility assertions:
+            self.assertEqual(data_post.get("response", {}).get("code"), 200)
+            self.assertEqual(data_post.get("response", {}).get("message"), "SUCCESS")
+            self.assertEqual(data_post.get("response", {}).get("version"), "ALPR 2.9")
+            self.assertIn("alpr", data_post.get("data", {}))
+            self.assertEqual(data_post["data"]["alpr"][0]["alpr"]["plates"][0]["text"], "B1786CIC")
 
-        res_get = client.get("/get_plate")
-        self.assertEqual(res_get.status_code, 200)
-        self.assertEqual(res_get.get_json().get("response", {}).get("code"), 200)
+            res_get = client.get("/get_plate")
+            self.assertEqual(res_get.status_code, 200)
+            self.assertEqual(res_get.get_json().get("response", {}).get("code"), 200)
+        finally:
+            A.confirmation_manager.tracks.pop(987654, None)
+            A.camera_stream_manager.running = orig_running
+            A.camera_stream_manager.get_latest_frame = orig_get_frame
 
         # 2. /get_image (POST & GET)
         test_img_path = os.path.join(A.CAPTURES_DIR, "test_dummy_image.jpg")
@@ -635,6 +644,73 @@ class TestAnprInvariants(unittest.TestCase):
                 os.remove(test_img_path)
             if len(A.LATEST_RECORDS) > 0 and A.LATEST_RECORDS[0].get("id") == 123456:
                 A.LATEST_RECORDS.popleft()
+
+    def test_15_get_plate_never_returns_previous_vehicle(self):
+        """Kamera kosong / kendaraan sudah pergi -> /get_plate harus kosong (apa adanya), bukan plat sebelumnya."""
+        client = A.app.test_client()
+        now = A.time.time()
+
+        # Record riwayat SANGAT baru (0.5s) yang belum dikonsumsi -> dulu dikirim ke Parkour, sekarang tidak boleh.
+        fresh_rec = {
+            "id": 222333, "license_plate": "B 2858 TII", "vehicle_type": "car", "confidence": 0.95,
+            "snapshot_url": "/captures/old_vehicle.jpg", "epoch": now - 0.5, "consumed": False
+        }
+        A.LATEST_RECORDS.appendleft(fresh_rec)
+
+        # Track kendaraan sebelumnya: masih < 4s tapi sudah EXITING / hilang dari frame / terlalu lama tidak terlihat.
+        stale_tracks = {}
+        for tid, (state, missing, age) in {
+            900001: ("EXITING", 4, 0.3),   # sudah keluar
+            900002: ("ACTIVE", 3, 0.3),    # tidak terlihat 3 frame berturut-turut
+            900003: ("ACTIVE", 0, 2.5),    # terakhir terlihat 2.5s lalu
+        }.items():
+            trk = A.VehicleTrack(tid, None)
+            trk.lifecycle_state = state
+            trk.frames_missing = missing
+            trk.best_candidate_display = "B 2858 TII"
+            trk.best_candidate_conf = 0.95
+            trk.last_seen = now - age
+            stale_tracks[tid] = trk
+            A.confirmation_manager.tracks[tid] = trk
+
+        self.assertIsNone(A._find_live_track(now))
+
+        orig_running = A.camera_stream_manager.running
+        orig_get_frame = A.camera_stream_manager.get_latest_frame
+        orig_latest = A.camera_stream_manager.latest_frame
+        orig_run_anpr = A.run_anpr
+        empty_frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        A.camera_stream_manager.running = True
+        A.camera_stream_manager.latest_frame = empty_frame
+        A.camera_stream_manager.get_latest_frame = lambda: empty_frame
+        A.run_anpr = lambda frame, **kw: {"detections": [], "detection_time_sec": 0.05}
+        try:
+            for _ in range(2):
+                res = client.get("/get_plate")
+                self.assertEqual(res.status_code, 200)
+                rec = res.get_json()["data"]["alpr"][0]
+                self.assertEqual(rec["alpr"]["plates"], [])
+                self.assertEqual(rec["num_plates"], 0)
+                self.assertNotIn("old_vehicle", rec["image_file"])
+
+            # /get_image tanpa path -> foto pasangan respon terakhir (frame kosong), bukan foto lama
+            paired = A.LAST_ALPR_RESPONSE_IMAGE["path"]
+            self.assertIn("_NONE", os.path.basename(paired))
+            res_img = client.get("/get_image")
+            self.assertEqual(res_img.status_code, 200)
+            res_img.close()
+        finally:
+            A.run_anpr = orig_run_anpr
+            A.camera_stream_manager.running = orig_running
+            A.camera_stream_manager.latest_frame = orig_latest
+            A.camera_stream_manager.get_latest_frame = orig_get_frame
+            for tid in stale_tracks:
+                A.confirmation_manager.tracks.pop(tid, None)
+            if fresh_rec in A.LATEST_RECORDS:
+                A.LATEST_RECORDS.remove(fresh_rec)
+            p = A.LAST_ALPR_RESPONSE_IMAGE.get("path")
+            if p and os.path.exists(p):
+                os.remove(p)
 
 
 if __name__ == "__main__":
