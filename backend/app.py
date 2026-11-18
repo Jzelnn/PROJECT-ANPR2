@@ -4955,7 +4955,7 @@ def generate_annotated_frame(img, detections, interest_area=None, frame_id=None,
         return None, None, None
 
 
-def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None):
+def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=None, single_vehicle_mode=True, is_stream=False, frame_id=None, capture_timestamp=None, allow_direct_plate_fallback=True):
     t_start = time.time()
     _dbg_timing = os.environ.get("ANPR_DEBUG_TIMING", "0") == "1"
     _dbg_stages = [] if _dbg_timing else None
@@ -5136,7 +5136,8 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
     # Fallback Direct Plate Detection untuk Mode Upload / Single Photo:
     # Jika model bodi kendaraan miss (misal foto sangat zoom/crop bumper atau terhalang tiang),
     # langsung cari plat nomor di seluruh gambar agar foto tetap berhasil dibaca!
-    if not is_stream and not candidates:
+    # Dinonaktifkan pada jalur gate (/get_plate & /capture_image) agar frame kosong tidak memakan > 2s (timeout Parkour).
+    if not is_stream and not candidates and allow_direct_plate_fallback:
         _t_fb_dir0 = time.perf_counter() if _dbg_timing else 0.0
         with plate_infer_lock:
             pdet_fallback = plate_detector.predict(img, conf=0.15, imgsz=IMG_SIZE, device=DEVICE, verbose=False)[0]
@@ -5480,7 +5481,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                     _t_ocr0 = time.perf_counter() if _dbg_timing else 0.0
                     ensemble_res = ensemble_plate_reading(
                         plate_crop,
-                        should_skip_fallbacks=None,
+                        should_skip_fallbacks=(lambda: (time.time() - t_start) > 1.2) if not allow_direct_plate_fallback else None,
                         vehicle_type=initial_vtype,
                         is_stream=False
                     )
@@ -6608,7 +6609,7 @@ def stream_capture():
     if camera_stream_manager.running and camera_stream_manager.latest_frame is not None:
         frame = camera_stream_manager.get_latest_frame()
         t0 = time.time()
-        result = run_anpr(frame, is_stream=False)
+        result = run_anpr(frame, is_stream=False, allow_direct_plate_fallback=False)
         ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
         ai_total_ms = int(round(ai_total_sec * 1000))
         result["detection_time_sec"] = ai_total_sec
@@ -6869,6 +6870,42 @@ def _find_live_track(now_epoch=None):
     return best
 
 
+def _has_pending_live_vehicle(now_epoch=None):
+    """True jika ada kendaraan yang sedang terlihat di kamera saat ini tetapi OCR background-nya belum selesai."""
+    if 'confirmation_manager' not in globals():
+        return False
+    if now_epoch is None:
+        now_epoch = time.time()
+    with confirmation_manager.lock:
+        for _tid, trk in confirmation_manager.tracks.items():
+            if trk.lost_interest or trk.status in ("DISCARDED", "UNREADABLE", "LOST"):
+                continue
+            if getattr(trk, "lifecycle_state", "") != "ACTIVE":
+                continue
+            if getattr(trk, "frames_missing", 0) > 1:
+                continue
+            if getattr(trk, "inside_interest_area", True) is False:
+                continue
+            if (now_epoch - trk.last_seen) > LIVE_TRACK_MAX_AGE_SEC:
+                continue
+            if not trk.best_candidate_display:
+                return True
+    return False
+
+
+def _is_stream_worker_fresh(now_epoch=None, max_age_sec=2.5):
+    """True jika StreamInferenceWorker sedang aktif memproses frame kamera secara real-time."""
+    if 'stream_inference_worker' not in globals() or not stream_inference_worker.running:
+        return False
+    last_p = stream_inference_worker.last_payload
+    if not isinstance(last_p, dict):
+        return False
+    ts = last_p.get("timestamp") or 0.0
+    if now_epoch is None:
+        now_epoch = time.time()
+    return (now_epoch - float(ts)) <= max_age_sec
+
+
 def _remember_alpr_response_image(path):
     LAST_ALPR_RESPONSE_IMAGE["path"] = path or ""
 
@@ -6879,15 +6916,25 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     menjalankan inferensi ANPR secara real-time, menyimpan snapshot, dan menghasilkan envelope ALPR Kit 2.9.
     Jika is_capture=True -> data.capture (untuk /capture_image).
     Jika is_capture=False -> data.alpr (untuk /get_plate).
+    Selalu selesai jauh di bawah timeout 2.0 detik Parkour (~45ms di jalur stream aktif).
     """
-    now_epoch = time.time()
+    t_req_start = time.time()
+    now_epoch = t_req_start
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
 
-    # Jalur Super-Cepat: Jika ada kendaraan aktif di depan kamera yang sudah terkonfirmasi di background stream,
-    # kembalikan hasil aktif seketika (< 50ms) tanpa perlu cold scan 4.5s di CPU!
+    # Jalur Super-Cepat: Jika ada kendaraan aktif di depan kamera yang sudah terbaca di background stream,
+    # kembalikan hasil aktif seketika (< 50ms) tanpa perlu cold scan di CPU!
     active_cand = None
     if not stream_url_param and camera_stream_manager.running:
         active_cand = _find_live_track(now_epoch)
+        # Jika mobil baru saja masuk (< 0.5s) dan OCR background sedang berjalan, tunggu maks 0.8s (aman < 2s timeout Parkour)
+        if active_cand is None and _has_pending_live_vehicle(now_epoch):
+            wait_deadline = time.time() + 0.80
+            while time.time() < wait_deadline:
+                time.sleep(0.025)
+                active_cand = _find_live_track(time.time())
+                if active_cand is not None:
+                    break
 
     if active_cand is not None:
         plate_str = active_cand.best_candidate_display
@@ -6989,6 +7036,31 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         _remember_alpr_response_image(snap_path)
         return jsonify(payload)
 
+    # Jika StreamInferenceWorker aktif memantau stream kamera dan tidak ada kendaraan di depan kamera saat ini,
+    # langsung kembalikan plat kosong (~45ms) tanpa menjalankan ulang run_anpr (mencegah timeout > 2s di Parkour)!
+    if not stream_url_param and _is_stream_worker_fresh(time.time()):
+        snap_filename = f"ALPR_{now_str}_NONE.jpg"
+        snap_path = os.path.join(CAPTURES_DIR, snap_filename)
+        try:
+            cv2.imwrite(snap_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        except Exception:
+            pass
+        dur_ms = max(15, int((time.time() - t_req_start) * 1000))
+        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
+            print(f"[AUDIT_P1] reason=stream_empty_fast plate='' dur_ms={dur_ms}", flush=True)
+        payload = build_alpr_kit_envelope(
+            plate_text="",
+            abs_img_path=snap_path,
+            conf=0.0,
+            v_type="car",
+            b_style="",
+            duration_ms=dur_ms,
+            is_capture=is_capture
+        )
+        _remember_alpr_response_image(snap_path)
+        return jsonify(payload)
+
     # Auto-Downscale ke 720p (1280x720) jika frame > 1280px untuk optimasi latensi rendah di Raspberry Pi
     if frame is not None and frame.shape[1] > 1280:
         h, w = frame.shape[:2]
@@ -6996,7 +7068,7 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         frame = cv2.resize(frame, (1280, target_h_720), interpolation=cv2.INTER_LINEAR)
 
     t0 = time.time()
-    result = run_anpr(frame, is_stream=False)
+    result = run_anpr(frame, is_stream=False, allow_direct_plate_fallback=False)
     ai_total_sec = result.get("detection_time_sec") if result.get("detection_time_sec") is not None else round(time.time() - t0, 3)
     result["detection_time_sec"] = ai_total_sec
 

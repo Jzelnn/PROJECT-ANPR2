@@ -699,6 +699,27 @@ class TestAnprInvariants(unittest.TestCase):
             res_img = client.get("/get_image")
             self.assertEqual(res_img.status_code, 200)
             res_img.close()
+
+            # Saat StreamInferenceWorker aktif & kamera kosong, /get_plate harus selesai < 200ms (jauh di bawah timeout 2s Parkour)
+            # tanpa memanggil ulang run_anpr dingin yang lambat.
+            orig_w_run = A.stream_inference_worker.running
+            orig_w_pay = A.stream_inference_worker.last_payload
+            A.stream_inference_worker.running = True
+            A.stream_inference_worker.last_payload = {"timestamp": A.time.time(), "detections": []}
+            def _must_not_run(*a, **kw):
+                raise AssertionError("run_anpr tidak boleh dipanggil saat stream worker sudah segar dan kamera kosong")
+            A.run_anpr = _must_not_run
+            try:
+                t0 = A.time.time()
+                res_fast = client.get("/get_plate")
+                elapsed_ms = (A.time.time() - t0) * 1000.0
+                self.assertEqual(res_fast.status_code, 200)
+                self.assertLess(elapsed_ms, 500.0)
+                rec_fast = res_fast.get_json()["data"]["alpr"][0]
+                self.assertEqual(rec_fast["alpr"]["plates"], [])
+            finally:
+                A.stream_inference_worker.running = orig_w_run
+                A.stream_inference_worker.last_payload = orig_w_pay
         finally:
             A.run_anpr = orig_run_anpr
             A.camera_stream_manager.running = orig_running
