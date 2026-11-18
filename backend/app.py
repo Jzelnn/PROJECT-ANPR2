@@ -5042,15 +5042,7 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
             continue
 
         if v_conf < threshold:
-            # Toleransi adaptif untuk mobil hitam / kondisi malam (0.30 <= v_conf < threshold):
-            # Diizinkan jika kondisi ROI gelap ATAU bodi kendaraan berwarna gelap/hitam (box_brightness < 82) dengan proporsi fisik mobil normal.
-            if v_conf >= 0.30 and y1 > int(ih * 0.04) and (0.40 <= (bw / float(max(1, bh))) <= 1.65):
-                box_sample = img[max(0, y1):min(ih, y2):6, max(0, x1):min(iw, x2):6]
-                box_brightness = float(box_sample.mean()) if box_sample.size > 0 else 128.0
-                if not (is_low_light or box_brightness < 82.0):
-                    continue
-            else:
-                continue
+            continue
 
         candidates.append({
             "track_id": track_id,
@@ -6896,6 +6888,9 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             cv2.imwrite(snap_path, blank_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         except Exception:
             pass
+        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
+            print("[AUDIT_P1] reason=fresh_capture_blank plate='' frame_age_ms=0", flush=True)
+
         payload = build_alpr_kit_envelope(
             plate_text="",
             abs_img_path=snap_path,
@@ -6939,6 +6934,10 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     except Exception:
         pass
 
+    if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
+        dur_ms = int(ai_total_sec * 1000)
+        print(f"[AUDIT_P1] reason=fresh_capture plate={plate_text} conf={conf:.2f} dur_ms={dur_ms}", flush=True)
+
     payload = build_alpr_kit_envelope(
         plate_text=plate_text,
         abs_img_path=snap_path,
@@ -6976,77 +6975,55 @@ def alpr_kit_capture_image():
     return _execute_alpr_kit_capture(is_capture=True, stream_url_param=stream_url_param)
 
 
+def _is_safe_capture_path(file_path):
+    """Memastikan path file secara aman berada di dalam folder CAPTURES_DIR untuk mencegah path traversal."""
+    if not file_path:
+        return False
+    try:
+        abs_captures = os.path.abspath(CAPTURES_DIR)
+        abs_target = os.path.abspath(str(file_path).replace("\\", "/"))
+        return os.path.commonpath([abs_captures, abs_target]) == abs_captures and os.path.isfile(abs_target)
+    except Exception:
+        return False
+
+
 @app.route("/get_plate", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/get_plate", methods=["GET", "POST", "OPTIONS"])
 def alpr_kit_get_plate():
     """
     ALPR Kit Standard Endpoint: Mengambil data hasil baca plat nomor.
-    Bisa mengambil data kendaraan terakhir yang terdeteksi secara realtime (< 15 detik),
-    atau mentrigger live capture jika record sudah kadaluarsa/dikonsumsi/kamera diarahkan ke sembarang arah.
+    Prioritas Utama:
+    1. Kendaraan yang SEDANG AKTIF di depan kamera detik ini (Real-time live track).
+       Ini menjamin apa yang tampil di monitor CCTV/dashboard = yang dicetak tiket Parkour.
+    2. Record sangat fresh dari stream (<= 3.0 detik, bukan cache basi).
+    3. Jika tidak ada kendaraan di depan kamera (mis. kamera ke tembok / kosong), lakukan
+       instant capture & scan detik ini (mengembalikan plat kosong, bukan mobil lama).
     """
     if request.method == "OPTIONS":
         return "", 200
 
+    now_epoch = time.time()
     data = request.get_json(silent=True) or {}
     stream_url_param = request.args.get("stream_url", "").strip() or data.get("stream_url", "").strip()
     if stream_url_param or request.args.get("capture") == "1":
         return _execute_alpr_kit_capture(is_capture=False, stream_url_param=stream_url_param)
 
-    # Cek apakah ada record yang MASIH FRESH (belum dikonsumsi dan usia <= 15 detik)
-    now_epoch = time.time()
-    fresh_rec = None
-    for cand in list(LATEST_RECORDS)[:10]:
-        if not cand.get("consumed", False):
-            cand_epoch = cand.get("epoch")
-            if cand_epoch is not None:
-                if (now_epoch - cand_epoch) <= 15.0:
-                    img_name = cand.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if cand.get("snapshot_url") else ""
-                    abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-                    if abs_img_path and os.path.isfile(abs_img_path):
-                        fresh_rec = cand
-                        break
-            else:
-                # Unit-test / fallback tanpa epoch eksplisit
-                img_name = cand.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if cand.get("snapshot_url") else ""
-                abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-                fresh_rec = cand
-                break
-
-    if fresh_rec:
-        fresh_rec["consumed"] = True
-        plate_str = fresh_rec.get("license_plate", "")
-        img_name = fresh_rec.get("snapshot_url", "").replace("\\", "/").split("/")[-1] if fresh_rec.get("snapshot_url") else ""
-        abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
-        v_type = fresh_rec.get("vehicle_type", "car")
-        b_style = fresh_rec.get("body_style", "")
-        conf = fresh_rec.get("confidence", 0.0)
-        dur = fresh_rec.get("processing_ms") or 430
-        payload = build_alpr_kit_envelope(
-            plate_text=plate_str,
-            abs_img_path=abs_img_path,
-            conf=conf,
-            v_type=v_type,
-            b_style=b_style,
-            duration_ms=dur,
-            is_capture=False
-        )
-        return jsonify(payload)
-
-    # Cek apakah ada kendaraan yang SEDANG AKTIF di depan kamera dengan plat terkonfirmasi (real-time stream sync)
+    # PRIORITAS 1: KENDARAAN AKTIF DI DEPAN KAMERA (Live Real-time Track Sync)
     active_cand = None
     if 'confirmation_manager' in globals():
         with confirmation_manager.lock:
             for t_id, trk in confirmation_manager.tracks.items():
-                if trk.lost_interest or trk.discarded or getattr(trk, "consumed", False):
+                if trk.lost_interest or trk.status == "DISCARDED" or getattr(trk, "consumed", False):
                     continue
-                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
+                # Kendaraan benar-benar masih terlihat di depan kamera detik ini (<= 2.5s)
+                if (now_epoch - trk.last_seen) <= 2.5 and trk.best_candidate_display:
                     active_cand = trk
                     trk.consumed = True
                     break
 
     if active_cand is not None:
         plate_str = active_cand.best_candidate_display
-        v_type = active_cand.cached_vtype or active_cand.initial_vtype or "car"
+        v_type = active_cand.cached_vtype or getattr(active_cand, "initial_vtype", None) or "car"
         b_style = active_cand.cached_body_style or ""
         conf = active_cand.best_candidate_conf or 0.85
 
@@ -7071,7 +7048,19 @@ def alpr_kit_get_plate():
             cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         except Exception:
-            pass
+            try:
+                cv2.imwrite(snap_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            except Exception:
+                pass
+
+        # Tandai seluruh record lama berplat ini di LATEST_RECORDS agar tidak dipakai ulang
+        for r in list(LATEST_RECORDS):
+            if r.get("license_plate") == plate_str:
+                r["consumed"] = True
+
+        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
+            age_ms = int(round((now_epoch - active_cand.last_seen) * 1000))
+            print(f"[AUDIT_P1] reason=active_track track_id={active_cand.track_id} frame_age_ms={age_ms} result_age_sec={age_ms/1000.0:.2f} plate={plate_str}", flush=True)
 
         payload = build_alpr_kit_envelope(
             plate_text=plate_str,
@@ -7084,8 +7073,44 @@ def alpr_kit_get_plate():
         )
         return jsonify(payload)
 
-    # Jika tidak ada record fresh (kendaraan sudah lewat atau kamera diarahkan ke sembarang arah):
-    # Lakukan scan real-time langsung terhadap apa yang dilihat kamera saat ini!
+    # PRIORITAS 2: RECORD BARU SAJA TERTANGKAP DARI STREAM (maksimal <= 3.0 detik, BUKAN cache basi!)
+    fresh_rec = None
+    for cand in list(LATEST_RECORDS)[:5]:
+        if not cand.get("consumed", False):
+            cand_epoch = cand.get("epoch")
+            if cand_epoch is not None and cand_epoch > 0:
+                if (now_epoch - cand_epoch) > 3.0:
+                    continue
+            img_name = os.path.basename(str(cand.get("snapshot_url", "")).replace("\\", "/"))
+            abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
+            fresh_rec = cand
+            break
+
+    if fresh_rec:
+        fresh_rec["consumed"] = True
+        plate_str = fresh_rec.get("license_plate", "")
+        img_name = os.path.basename(str(fresh_rec.get("snapshot_url", "")).replace("\\", "/"))
+        abs_img_path = os.path.join(CAPTURES_DIR, img_name) if img_name else ""
+        v_type = fresh_rec.get("vehicle_type", "car")
+        b_style = fresh_rec.get("body_style", "")
+        conf = fresh_rec.get("confidence", 0.0)
+        dur = fresh_rec.get("processing_ms") or 350
+        if os.environ.get("ANPR_DEBUG_AUDIT") == "1":
+            age_ms = int(round((now_epoch - (fresh_rec.get("epoch") or now_epoch)) * 1000))
+            print(f"[AUDIT_P1] reason=cache_history record_id={fresh_rec.get('id')} track_id={fresh_rec.get('track_id')} frame_age_ms={age_ms} result_age_sec={age_ms/1000.0:.2f} plate={plate_str}", flush=True)
+
+        payload = build_alpr_kit_envelope(
+            plate_text=plate_str,
+            abs_img_path=abs_img_path,
+            conf=conf,
+            v_type=v_type,
+            b_style=b_style,
+            duration_ms=dur,
+            is_capture=False
+        )
+        return jsonify(payload)
+
+    # PRIORITAS 3: Tidak ada kendaraan aktif dan tidak ada record baru: Lakukan instant capture detik ini!
     return _execute_alpr_kit_capture(is_capture=False)
 
 
@@ -7110,15 +7135,14 @@ def alpr_kit_get_image():
     target_file = None
     if img_path:
         clean_p = str(img_path).replace("\\", "/").rstrip("/")
-        if os.path.exists(clean_p) and os.path.isfile(clean_p):
+        if _is_safe_capture_path(clean_p):
             target_file = clean_p
-        elif os.path.exists(img_path) and os.path.isfile(img_path):
-            target_file = img_path
         else:
-            bname = clean_p.split("/")[-1]
-            candidate = os.path.join(CAPTURES_DIR, bname)
-            if os.path.exists(candidate) and os.path.isfile(candidate):
-                target_file = candidate
+            bname = os.path.basename(clean_p)
+            if bname and bname not in (".", ".."):
+                candidate = os.path.join(CAPTURES_DIR, bname)
+                if _is_safe_capture_path(candidate):
+                    target_file = candidate
 
     if not target_file:
         cand_latest = os.path.join(CAPTURES_DIR, "latest_result.jpg")
@@ -7163,25 +7187,14 @@ def alpr_kit_delete_image():
         if not p:
             continue
         clean_p = str(p).replace("\\", "/").rstrip("/")
-        bname = clean_p.split("/")[-1]
-
-        # Jangan hapus latest_result.jpg (dipakai preview monitor live)
-        if bname == "latest_result.jpg":
+        bname = os.path.basename(clean_p)
+        if not bname or bname in (".", "..", "latest_result.jpg", "blank.jpg"):
             continue
 
-        target = None
-        if os.path.exists(clean_p) and os.path.isfile(clean_p):
-            target = clean_p
-        elif os.path.exists(p) and os.path.isfile(p):
-            target = p
-        else:
-            cand = os.path.join(CAPTURES_DIR, bname)
-            if os.path.exists(cand) and os.path.isfile(cand):
-                target = cand
-
-        if target:
+        cand = os.path.join(CAPTURES_DIR, bname)
+        if _is_safe_capture_path(cand):
             try:
-                os.remove(target)
+                os.remove(cand)
                 deleted.append(p)
             except Exception as e:
                 failed.append({"path": p, "error": str(e)})
