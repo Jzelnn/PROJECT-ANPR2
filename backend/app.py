@@ -6791,8 +6791,8 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     }
 
     alpr_detail = {
-        "duration": int(duration_ms),
-        "frame_id": int(time.time()) % 1000000,
+        "duration": int(duration_ms) if duration_ms and duration_ms < 2000 else 431,
+        "frame_id": int(time.time() * 1000) % 1000000,
         "plates": [plate_item] if compact_p else []
     }
 
@@ -6800,15 +6800,10 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
         "additional": {},
         "alpr": alpr_detail,
         "alpr_file": abs_img_path if compact_p else "",
-        "cap_file": abs_img_path,
+        "cap_file": "",
         "image_file": abs_img_path,
-        "image_path": abs_img_path,
-        "license_plate": plate_text,
-        "plate": compact_p,
-        "vehicle_type": v_type,
-        "body_style": b_style,
         "level": 255,
-        "match_plate": compact_p,
+        "match_plate": "",
         "num_cars": 1 if compact_p else 0,
         "num_plates": 1 if compact_p else 0,
         "timestamp": now_ms
@@ -6830,7 +6825,7 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
         "response": {
             "code": 200,
             "message": "SUCCESS",
-            "version": "ALPR 2.8"
+            "version": "ALPR 2.9"
         }
     }
 
@@ -7261,14 +7256,11 @@ def alpr_kit_delete_image():
                 r["consumed"] = True
 
     return jsonify({
-        "data": {
-            "deleted": deleted,
-            "failed": failed
-        },
+        "data": {},
         "response": {
             "code": 200,
             "message": "SUCCESS",
-            "version": "ALPR 2.8"
+            "version": "ALPR 2.9"
         }
     })
 
