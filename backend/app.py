@@ -6800,7 +6800,7 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
         "additional": {},
         "alpr": alpr_detail,
         "alpr_file": abs_img_path if compact_p else "",
-        "cap_file": "",
+        "cap_file": abs_img_path if is_capture else "",
         "image_file": abs_img_path,
         "level": 255,
         "match_plate": "",
