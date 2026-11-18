@@ -23,6 +23,15 @@ os.environ["TORCH_NUM_THREADS"] = _CONFIGURED_THREADS
 import re
 import time
 import datetime
+try:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from tools.audit import parkour_audit_logger as _pk_audit
+    _ENG_COMMIT, _ENG_BRANCH = _pk_audit.get_git_info()
+    print(f"[ENGINE_START] commit={_ENG_COMMIT} branch={_ENG_BRANCH} started_at={_pk_audit.now_iso_tz()}", flush=True)
+    if _pk_audit.is_enabled():
+        _pk_audit.emit_json({"event": "engine_start", "commit": _ENG_COMMIT, "branch": _ENG_BRANCH, "started_at": _pk_audit.now_iso_tz()})
+except Exception:
+    _pk_audit = None
 import shutil
 import io
 import csv
@@ -52,7 +61,7 @@ import numpy as np
 import cv2
 # Batasi thread pool internal OpenCV agar tidak oversubscribe CPU cores bersama PyTorch & PaddleOCR
 cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "1" if IS_ARM_CPU else "2")))
-from flask import Flask, request, jsonify, Response, send_from_directory, send_file
+from flask import Flask, request, jsonify, Response, send_from_directory, send_file, g
 from flask_cors import CORS
 from flask_sock import Sock
 
@@ -976,6 +985,18 @@ def _save_parking_record_internal(det, source_img=None, source_img_path=None):
     LAST_RECORDED_PLATES[safe_plate] = {"time": now_epoch, "rec": rec}
     if track_id is not None:
         LAST_RECORDED_TRACK_IDS[track_id] = {"time": now_epoch, "rec": rec}
+    if _pk_audit and _pk_audit.is_enabled():
+        _pk_audit.emit_json({
+            "event": "lifecycle",
+            "action": "record_created",
+            "record_id": rec.get("id"),
+            "track_id": track_id,
+            "plate_masked": _pk_audit.mask_plate(rec.get("license_plate")),
+            "vehicle_type": rec.get("vehicle_type"),
+            "consumed": rec.get("consumed", False),
+            "age_ms": 0,
+            "snapshot_file": _pk_audit.mask_path_plates(snapshot_filename),
+        })
     
     # Broadcast langsung ke WebSocket clients seketika
     ws_broadcaster.broadcast({
@@ -3985,6 +4006,16 @@ class VehicleConfirmationManager:
                 trk = self.tracks[tid]
                 trk.lifecycle_state = "EXPIRED"
                 print(f"[TRACK_EXPIRED]\ntrack_id={tid}", flush=True)
+                if _pk_audit and _pk_audit.is_enabled():
+                    _pk_audit.emit_json({
+                        "event": "lifecycle",
+                        "action": "track_expired",
+                        "track_id": tid,
+                        "plate_masked": _pk_audit.mask_plate(trk.best_candidate_display),
+                        "status": trk.status,
+                        "age_ms": int(round((now - trk.created_at) * 1000)),
+                        "unseen_ms": int(round((now - trk.last_seen) * 1000)),
+                    })
                 del self.tracks[tid]
 
             if stale_ids:
@@ -4055,6 +4086,16 @@ class VehicleConfirmationManager:
                 trk = self.tracks[tid]
                 trk.lifecycle_state = "EXPIRED"
                 print(f"[TRACK_EXPIRED]\ntrack_id={tid}", flush=True)
+                if _pk_audit and _pk_audit.is_enabled():
+                    _pk_audit.emit_json({
+                        "event": "lifecycle",
+                        "action": "track_expired",
+                        "track_id": tid,
+                        "plate_masked": _pk_audit.mask_plate(trk.best_candidate_display),
+                        "status": trk.status,
+                        "age_ms": int(round((now - trk.created_at) * 1000)),
+                        "unseen_ms": int(round((now - trk.last_seen) * 1000)),
+                    })
                 del self.tracks[tid]
             if stale_ids:
                 active_ids = [t for t, tr in self.tracks.items() if tr.lifecycle_state == "ACTIVE"]
@@ -6906,6 +6947,124 @@ def _is_stream_worker_fresh(now_epoch=None, max_age_sec=2.5):
     return (now_epoch - float(ts)) <= max_age_sec
 
 
+def _set_req_audit(**kw):
+    if _pk_audit and _pk_audit.is_enabled():
+        try:
+            meta = getattr(g, "_parkour_audit", None)
+            if meta is not None:
+                meta.update(kw)
+        except Exception:
+            pass
+
+
+_PARKOUR_AUDIT_PATHS = {
+    "/get_plate", "/api/get_plate",
+    "/capture_image", "/api/capture_image",
+    "/get_image", "/api/get_image",
+    "/delete_image", "/api/delete_image",
+}
+
+
+@app.before_request
+def _parkour_audit_before():
+    if not (_pk_audit and _pk_audit.is_enabled()):
+        return None
+    if request.path not in _PARKOUR_AUDIT_PATHS or request.method == "OPTIONS":
+        return None
+    body_json = request.get_json(silent=True)
+    body_keys = sorted(list(body_json.keys())) if isinstance(body_json, dict) else []
+    g._parkour_audit = {
+        "request_id": _pk_audit.new_request_id(),
+        "t_start": time.time(),
+        "received_at": _pk_audit.now_iso_tz(),
+        "method": request.method,
+        "path": request.path,
+        "query_keys": sorted(list(request.args.keys())),
+        "body_keys": body_keys,
+        "result_source": "none",
+        "record_id": None,
+        "track_id": None,
+        "plate_masked": "",
+        "vehicle_type": "",
+        "frame_age_ms": None,
+        "image_filename": "",
+        "image_exists": False,
+        "consumed_before": None,
+        "consumed_after": None,
+        "status_code": None,
+        "response_bytes": 0,
+        "client_disconnected": False,
+        "client_disconnect_ms": None,
+    }
+    return None
+
+
+@app.after_request
+def _parkour_audit_after(response):
+    if not (_pk_audit and _pk_audit.is_enabled()):
+        return response
+    meta = getattr(g, "_parkour_audit", None)
+    if meta is None:
+        return response
+    meta["status_code"] = response.status_code
+    try:
+        cl = response.calculate_content_length()
+        if cl is not None:
+            meta["response_bytes"] = int(cl)
+        elif not response.direct_passthrough:
+            meta["response_bytes"] = len(response.get_data(as_text=False))
+    except Exception:
+        pass
+    return response
+
+
+@app.teardown_request
+def _parkour_audit_teardown(exc):
+    if not (_pk_audit and _pk_audit.is_enabled()):
+        return
+    meta = getattr(g, "_parkour_audit", None)
+    if meta is None:
+        return
+    g._parkour_audit = None
+    t_end = time.time()
+    dur_ms = round((t_end - meta["t_start"]) * 1000.0, 2)
+    disconnected = bool(meta.get("client_disconnected"))
+    if exc is not None and isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError)):
+        disconnected = True
+    clock_info = _pk_audit.extract_osd_timestamp(None)
+    rec = {
+        "event": "http_request",
+        "request_id": meta["request_id"],
+        "received_at": meta["received_at"],
+        "system_time_iso": clock_info["system_time_iso"],
+        "system_epoch_ms": clock_info["system_epoch_ms"],
+        "osd_time_str": meta.get("osd_time_str", clock_info["osd_time_str"]),
+        "osd_diff_sec": meta.get("osd_diff_sec", clock_info["osd_diff_sec"]),
+        "method": meta["method"],
+        "path": meta["path"],
+        "query_keys": meta["query_keys"],
+        "body_keys": meta["body_keys"],
+        "duration_ms": dur_ms,
+        "result_source": meta.get("result_source", "none"),
+        "record_id": meta.get("record_id"),
+        "track_id": meta.get("track_id"),
+        "plate_masked": meta.get("plate_masked", ""),
+        "vehicle_type": meta.get("vehicle_type", ""),
+        "frame_age_ms": meta.get("frame_age_ms"),
+        "image_filename": meta.get("image_filename", ""),
+        "image_exists": bool(meta.get("image_exists", False)),
+        "consumed_before": meta.get("consumed_before"),
+        "consumed_after": meta.get("consumed_after"),
+        "status_code": meta.get("status_code"),
+        "response_bytes": meta.get("response_bytes", 0),
+        "client_disconnected": disconnected,
+        "client_disconnect_ms": dur_ms if disconnected else meta.get("client_disconnect_ms"),
+    }
+    if "delete_details" in meta:
+        rec["delete_details"] = meta["delete_details"]
+    _pk_audit.emit_json(rec)
+
+
 def _remember_alpr_response_image(path):
     LAST_ALPR_RESPONSE_IMAGE["path"] = path or ""
 
@@ -6977,6 +7136,17 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             is_capture=is_capture
         )
         _remember_alpr_response_image(snap_path)
+        _set_req_audit(
+            result_source="active_track",
+            track_id=active_cand.track_id,
+            plate_masked=_pk_audit.mask_plate(plate_str) if _pk_audit else "",
+            vehicle_type=v_type,
+            frame_age_ms=int(round((time.time() - active_cand.last_seen) * 1000)),
+            image_filename=_pk_audit.mask_path_plates(snap_filename) if _pk_audit else snap_filename,
+            image_exists=os.path.isfile(snap_path),
+            consumed_before=getattr(active_cand, "consumed", False),
+            consumed_after=getattr(active_cand, "consumed", False),
+        )
         return jsonify(payload)
 
     frame = None
@@ -7034,6 +7204,14 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             is_capture=is_capture
         )
         _remember_alpr_response_image(snap_path)
+        _set_req_audit(
+            result_source="dummy",
+            plate_masked="",
+            vehicle_type="car",
+            frame_age_ms=0,
+            image_filename=snap_filename,
+            image_exists=os.path.isfile(snap_path),
+        )
         return jsonify(payload)
 
     # Jika StreamInferenceWorker aktif memantau stream kamera dan tidak ada kendaraan di depan kamera saat ini,
@@ -7059,6 +7237,15 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
             is_capture=is_capture
         )
         _remember_alpr_response_image(snap_path)
+        f_age = int(round((time.time() - (camera_stream_manager.latest_frame_time or time.time())) * 1000)) if camera_stream_manager.running else 0
+        _set_req_audit(
+            result_source="none",
+            plate_masked="",
+            vehicle_type="car",
+            frame_age_ms=f_age,
+            image_filename=snap_filename,
+            image_exists=os.path.isfile(snap_path),
+        )
         return jsonify(payload)
 
     # Auto-Downscale ke 720p (1280x720) jika frame > 1280px untuk optimasi latensi rendah di Raspberry Pi
@@ -7107,6 +7294,19 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
         is_capture=is_capture
     )
     _remember_alpr_response_image(snap_path)
+    rec_obj = primary_det.get("record") or {}
+    _set_req_audit(
+        result_source="fresh_capture" if plate_text else "none",
+        record_id=rec_obj.get("id"),
+        track_id=primary_det.get("track_id"),
+        plate_masked=_pk_audit.mask_plate(plate_text) if _pk_audit else "",
+        vehicle_type=v_type if plate_text else "",
+        frame_age_ms=int(round((time.time() - (camera_stream_manager.latest_frame_time or t0)) * 1000)) if camera_stream_manager.running else 0,
+        image_filename=_pk_audit.mask_path_plates(snap_filename) if _pk_audit else snap_filename,
+        image_exists=os.path.isfile(snap_path),
+        consumed_before=False if rec_obj else None,
+        consumed_after=rec_obj.get("consumed") if rec_obj else None,
+    )
     return jsonify(payload)
 
 
@@ -7209,12 +7409,22 @@ def alpr_kit_get_image():
             target_file = paired
 
     if target_file and os.path.exists(target_file):
+        _set_req_audit(
+            result_source="file" if img_path else "paired_last",
+            image_filename=_pk_audit.mask_path_plates(os.path.basename(target_file)) if _pk_audit else os.path.basename(target_file),
+            image_exists=True,
+        )
         return send_file(target_file, mimetype="image/jpeg")
 
     # Fallback blank JPEG bila file belum/tidak ada di disk agar klien decoder Parkour tidak crash
     blank_fallback = np.zeros((240, 320, 3), dtype=np.uint8)
     ret, buf = cv2.imencode(".jpg", blank_fallback, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
     if ret:
+        _set_req_audit(
+            result_source="dummy",
+            image_filename=_pk_audit.mask_path_plates(os.path.basename(str(img_path).replace("\\", "/"))) if (_pk_audit and img_path) else "",
+            image_exists=False,
+        )
         return Response(buf.tobytes(), mimetype="image/jpeg")
 
     return jsonify({"error": "File gambar tidak ditemukan", "image_path": img_path}), 404
@@ -7241,6 +7451,7 @@ def alpr_kit_delete_image():
 
     deleted = []
     failed = []
+    audit_del_items = []
 
     for p in paths:
         if not p:
@@ -7248,23 +7459,64 @@ def alpr_kit_delete_image():
         clean_p = str(p).replace("\\", "/").rstrip("/")
         bname = os.path.basename(clean_p)
         if not bname or bname in (".", "..", "latest_result.jpg", "blank.jpg"):
+            audit_del_items.append({
+                "raw_path": _pk_audit.mask_path_plates(str(p)) if _pk_audit else str(p),
+                "normalized_basename": bname,
+                "file_found": False,
+                "file_deleted": False,
+                "skipped_protected": True,
+                "records_marked_consumed": [],
+            })
             continue
 
         cand = os.path.join(CAPTURES_DIR, bname)
-        if _is_safe_capture_path(cand):
+        was_found = _is_safe_capture_path(cand)
+        was_deleted = False
+        if was_found:
             try:
                 os.remove(cand)
                 deleted.append(p)
+                was_deleted = True
             except Exception as e:
                 failed.append({"path": p, "error": str(e)})
         else:
             failed.append({"path": p, "error": "File tidak ditemukan"})
 
         # Tandai record yang sesuai di LATEST_RECORDS sebagai sudah dikonsumsi
+        consumed_rec_ids = []
         for r in list(LATEST_RECORDS):
             snap_name = os.path.basename(r.get("snapshot_url", "").replace("\\", "/"))
             if snap_name == bname or bname in r.get("snapshot_url", ""):
                 r["consumed"] = True
+                consumed_rec_ids.append(r.get("id"))
+
+        if _pk_audit and _pk_audit.is_enabled():
+            audit_del_items.append({
+                "raw_path": _pk_audit.mask_path_plates(str(p)),
+                "normalized_basename": _pk_audit.mask_path_plates(bname),
+                "file_found": was_found,
+                "file_deleted": was_deleted,
+                "state_reset": {
+                    "records_marked_consumed": consumed_rec_ids,
+                    "active_tracks_reset": False,
+                    "last_response_image_reset": False,
+                },
+            })
+            _pk_audit.emit_json({
+                "event": "lifecycle",
+                "action": "file_deleted" if was_deleted else "delete_attempted",
+                "image_filename": _pk_audit.mask_path_plates(bname),
+                "file_found": was_found,
+                "file_deleted": was_deleted,
+                "records_marked_consumed": consumed_rec_ids,
+            })
+
+    _set_req_audit(
+        result_source="delete_image",
+        image_filename=audit_del_items[0]["normalized_basename"] if audit_del_items else "",
+        image_exists=bool(audit_del_items and audit_del_items[0]["file_found"]),
+        delete_details=audit_del_items,
+    )
 
     return jsonify({
         "data": {},
