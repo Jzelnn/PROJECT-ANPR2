@@ -2611,22 +2611,6 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
     except (TypeError, ValueError):
         char_conf_thresh = 0.15
 
-    # 1. Pass Utama: YOLO Character Model pada baris nomor polisi
-    c_raw, c_conf, line1 = read_plate_with_char_model(row_crop, conf=char_conf_thresh)
-    c_raw = c_raw.upper() if c_raw else ""
-    c_fused = refine_indonesian_plate(c_raw) if c_raw else ""
-    c_valid = bool(c_fused) and is_valid_indonesian_plate_structure(c_fused)[0]
-    print(f"[CHAR_OCR] variant=orig raw='{c_raw}' conf={c_conf:.2f} fused='{c_fused}' valid={c_valid}", flush=True)
-
-    final_formatted = ""
-    method_used = "pure_char_yolo"
-    best_conf = c_conf if c_raw else 0.0
-    r_text, r_conf, r_all_texts = "", 0.0, []
-
-    if c_raw:
-        c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
-        final_formatted = c_fixed or c_fused or c_raw
-
     # Ambang lama 0.52 membuat bacaan sedang (mis. 0.53) memblokir mesin berikutnya.
     # ANPR_CHAR_SKIP_RAPID=0.52 mengembalikan ambang lama.
     try:
@@ -2634,12 +2618,18 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
     except (TypeError, ValueError):
         skip_rapid_at = 0.85
 
-    winner_fused = c_fused if c_valid else ""
-    winner_conf = c_conf if c_raw else 0.0
-    winner_valid = c_valid
+    final_formatted = ""
+    method_used = "pure_char_yolo"
+    best_conf = 0.0
+    c_raw, c_conf, c_fused, c_valid = "", 0.0, "", False
+    r_text, r_conf, r_all_texts = "", 0.0, []
+    winner_fused = ""
+    winner_conf = 0.0
+    winner_valid = False
 
-    # 2. cct-xs pada baris nomor. Murah di CPU. ANPR_FAST_PLATE=0 mematikannya.
-    if fast_plate_enabled() and not (winner_valid and winner_conf >= skip_rapid_at):
+    # 1. Pass Utama Cepat: cct-xs (ONNX, ~65ms di Raspberry Pi 4) pada baris nomor polisi.
+    #    Jika sudah valid dengan keyakinan tinggi (>= skip_rapid_at), langsung selesai tanpa YOLO Char (~1180ms)!
+    if fast_plate_enabled():
         t_cct = time.perf_counter()
         cct_row = plate_number_row(plate_crop, ratio=cct_row_ratio(vehicle_type))
         cct_raw, cct_conf = cct_read_plate(cct_row)
@@ -2651,11 +2641,27 @@ def ensemble_plate_reading(plate_crop, should_skip_fallbacks=None, vehicle_type=
                 f"[CCT_OCR] raw='{cct_raw}' conf={cct_conf:.2f} fused='{cct_fused}' valid={cct_valid} ms={cct_ms:.1f}",
                 flush=True,
             )
-            if prefer_rapid_reading(winner_fused, winner_conf, winner_valid, cct_fused, cct_conf, cct_valid):
+            if cct_valid:
                 final_formatted = verify_and_fix_plate_digits(raw_plate_crop, cct_fused, vehicle_type=vehicle_type) or cct_fused
                 best_conf = cct_conf
-                method_used = "hybrid_char_cct" if c_raw else "cct_xs"
+                method_used = "cct_xs"
                 winner_fused, winner_conf, winner_valid = cct_fused, cct_conf, True
+                c_valid = True
+
+    # 2. Pass Kedua: YOLO Character Model hanya jika cct-xs belum yakin (< skip_rapid_at) atau dimatikan
+    if not (winner_valid and winner_conf >= skip_rapid_at):
+        c_raw, c_conf, line1 = read_plate_with_char_model(row_crop, conf=char_conf_thresh)
+        c_raw = c_raw.upper() if c_raw else ""
+        c_fused = refine_indonesian_plate(c_raw) if c_raw else ""
+        char_is_valid = bool(c_fused) and is_valid_indonesian_plate_structure(c_fused)[0]
+        print(f"[CHAR_OCR] variant=orig raw='{c_raw}' conf={c_conf:.2f} fused='{c_fused}' valid={char_is_valid}", flush=True)
+        if c_raw and prefer_rapid_reading(winner_fused, winner_conf, winner_valid, c_fused or c_raw, c_conf, char_is_valid):
+            c_fixed = verify_and_fix_plate_digits(raw_plate_crop, c_fused or c_raw, vehicle_type=vehicle_type)
+            final_formatted = c_fixed or c_fused or c_raw
+            best_conf = c_conf
+            method_used = "hybrid_char_cct" if winner_valid else "pure_char_yolo"
+            if char_is_valid:
+                winner_fused, winner_conf, winner_valid = c_fused, c_conf, True
                 c_valid = True
 
     # 3. RapidOCR. Pemenang saat ini (karakter atau cct-xs) yang sudah sangat yakin melewati mesin ini.
@@ -3503,7 +3509,7 @@ timestamp={self.first_good_ocr_time:.3f}""")
                 is_struct = best_obs["struct"]
                 p_type = best_obs["type"]
 
-                best_parts = best_obs.get("text", "").split()
+                best_parts = format_license_plate(best_obs.get("text", ""), compact=False).split()
                 has_full_suffix = (len(best_parts) == 3 and len(best_parts[2]) >= 2) or p_type == "military"
                 can_finalize = (is_struct and best_count >= 2 and best_conf >= 0.55) or \
                                (is_struct and has_full_suffix and best_conf >= 0.65 and (len(best_cln) >= 5 or p_type == "military"))
@@ -3570,7 +3576,7 @@ timestamp={self.first_good_ocr_time:.3f}""")
         # 1. Instant Single-Frame Confirmation:
         # Jika plat berstruktur Samsat valid dengan keyakinan tinggi (conf >= 0.75 atau conf >= 0.65 dengan crop_q >= 14.0),
         # langsung kunci konfirmasi pada Frame 1 tanpa harus menunggu frame kedua!
-        best_parts = best_plate.split() if best_plate else []
+        best_parts = format_license_plate(best_plate, compact=False).split() if best_plate else []
         has_full_suffix = (len(best_parts) == 3 and len(best_parts[2]) >= 2) or p_type == "military"
         has_std_digits = len(best_parts) == 3 and (1 <= len(best_parts[1]) <= 4)
         best_crop_q = float(best_obs.get("crop_q") or 0.0)
@@ -5233,9 +5239,9 @@ def run_anpr(image_input, vehicle_conf=None, motorcycle_conf=None, plate_conf=No
                                 should_detect_plate = True
                         else:
                             should_detect_plate = True
-                    else:
-                        # Post-confirmation: lightweight periodic plate alignment only
-                        # Triggered every 4 frames or >= 0.20s to keep plate bbox aligned with moving bumper
+                    elif os.environ.get("ANPR_POST_CONFIRM_PLATE_ALIGN", "0") == "1":
+                        # Post-confirmation plate alignment dimatikan secara default di RPi 4 karena memakan ~1.4s CPU/frame.
+                        # Posisi bbox plat sudah otomatis mengikuti kendaraan via rel_plate_bbox (0ms CPU).
                         frames_since = (frame_id - getattr(existing_trk, 'last_plate_check_frame_id', 0)) if frame_id is not None else 99
                         time_since = now_plate - getattr(existing_trk, 'last_plate_check_time', 0.0)
                         if frames_since >= 4 or time_since >= 0.20:
@@ -5986,7 +5992,7 @@ class StreamInferenceWorker:
                 payload = {
                     "type": "detection_update",
                     "frame_id": frame_id,
-                    "timestamp": t0,
+                    "timestamp": now_broadcast,
                     "capture_timestamp": frame_capture_time,
                     "frame_age_ms": frame_age_ms,
                     "latency_ms": det_time_ms,
