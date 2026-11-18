@@ -6817,13 +6817,11 @@ def build_alpr_kit_envelope(plate_text, abs_img_path, conf=1.0, v_type="car", b_
     if is_capture:
         data_block = {
             "capture": alpr_record,
-            "alpr": [alpr_record],
             "timestamp": now_ms
         }
     else:
         data_block = {
             "alpr": [alpr_record],
-            "capture": alpr_record,
             "timestamp": now_ms
         }
 
@@ -6844,6 +6842,63 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     Jika is_capture=True -> data.capture (untuk /capture_image).
     Jika is_capture=False -> data.alpr (untuk /get_plate).
     """
+    now_epoch = time.time()
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+
+    # Jalur Super-Cepat: Jika ada kendaraan aktif di depan kamera yang sudah terkonfirmasi di background stream,
+    # kembalikan hasil aktif seketika (< 50ms) tanpa perlu cold scan 4.5s di CPU!
+    active_cand = None
+    if not stream_url_param and 'confirmation_manager' in globals() and camera_stream_manager.running:
+        with confirmation_manager.lock:
+            for t_id, trk in confirmation_manager.tracks.items():
+                if trk.lost_interest or trk.status == "DISCARDED":
+                    continue
+                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
+                    active_cand = trk
+                    break
+
+    if active_cand is not None:
+        plate_str = active_cand.best_candidate_display
+        v_type = active_cand.cached_vtype or getattr(active_cand, "initial_vtype", None) or "car"
+        b_style = active_cand.cached_body_style or ""
+        conf = active_cand.best_candidate_conf or 0.85
+
+        frame = camera_stream_manager.get_latest_frame() if camera_stream_manager.running else None
+        safe_p = re.sub(r'[^A-Za-z0-9]', '', plate_str) if plate_str else "LIVE"
+        snap_filename = f"ALPR_{now_str}_{safe_p}.jpg"
+        snap_path = os.path.join(CAPTURES_DIR, snap_filename)
+        if frame is None:
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        try:
+            active_det = {
+                "license_plate": plate_str,
+                "plate_confidence": conf,
+                "vehicle_type": v_type,
+                "body_style": b_style,
+                "bbox": active_cand.last_bbox,
+                "plate_bbox": active_cand.last_plate_bbox
+            }
+            ann_img = draw_annotations_on_image(frame.copy(), active_det, interest_area=INTEREST_AREA)
+            cv2.imwrite(snap_path, ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            cv2.imwrite(os.path.join(CAPTURES_DIR, "latest_result.jpg"), ann_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        except Exception:
+            try:
+                cv2.imwrite(snap_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            except Exception:
+                pass
+
+        payload = build_alpr_kit_envelope(
+            plate_text=plate_str,
+            abs_img_path=snap_path,
+            conf=conf,
+            v_type=v_type,
+            b_style=b_style,
+            duration_ms=45,
+            is_capture=is_capture
+        )
+        return jsonify(payload)
+
     frame = None
     if stream_url_param:
         try:
@@ -6876,8 +6931,6 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
                     threading.Thread(target=camera_stream_manager.start, args=(cctv_url,), daemon=True).start()
             except Exception as e_cctv:
                 print(f"[WARN] Fallback capture error: {e_cctv}")
-
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
 
     if frame is None:
         # Jika kamera tidak dapat diakses, buat placeholder frame agar Parkour tidak error/hang
@@ -7013,10 +7066,10 @@ def alpr_kit_get_plate():
     if 'confirmation_manager' in globals():
         with confirmation_manager.lock:
             for t_id, trk in confirmation_manager.tracks.items():
-                if trk.lost_interest or trk.status == "DISCARDED" or getattr(trk, "consumed", False):
+                if trk.lost_interest or trk.status == "DISCARDED":
                     continue
-                # Kendaraan benar-benar masih terlihat di depan kamera detik ini (<= 2.5s)
-                if (now_epoch - trk.last_seen) <= 2.5 and trk.best_candidate_display:
+                # Kendaraan benar-benar masih terlihat di depan kamera detik ini (<= 4.0s)
+                if (now_epoch - trk.last_seen) <= 4.0 and trk.best_candidate_display:
                     active_cand = trk
                     trk.consumed = True
                     break
