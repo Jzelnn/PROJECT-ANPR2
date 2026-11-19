@@ -52,7 +52,7 @@ import numpy as np
 import cv2
 # Batasi thread pool internal OpenCV agar tidak oversubscribe CPU cores bersama PyTorch & PaddleOCR
 cv2.setNumThreads(int(os.environ.get("OPENCV_NUM_THREADS", "1" if IS_ARM_CPU else "2")))
-from flask import Flask, request, jsonify, Response, send_from_directory, send_file
+from flask import Flask, request, jsonify, Response, send_from_directory, send_file, g
 from flask_cors import CORS
 from flask_sock import Sock
 
@@ -6285,6 +6285,58 @@ def add_cors_headers(response):
 
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Token"
+    return response
+
+
+_PARKOUR_CORE_PATHS = {
+    "/get_plate", "/capture_image", "/get_image", "/delete_image",
+    "/api/get_plate", "/api/capture_image", "/api/get_image", "/api/delete_image"
+}
+
+
+@app.before_request
+def log_parkour_request():
+    if request.path in _PARKOUR_CORE_PATHS and request.method != "OPTIONS":
+        g._parkour_t0 = time.time()
+        body_peek = ""
+        try:
+            if request.is_json:
+                data_json = request.get_json(silent=True) or {}
+                body_peek = json.dumps(data_json, separators=(",", ":"))
+            elif request.query_string:
+                body_peek = f"?{request.query_string.decode('utf-8', errors='ignore')}"
+            else:
+                body_peek = "{}"
+        except Exception:
+            body_peek = "{}"
+        print(f"[PARKOUR_REQ] {request.method} {request.path} | Remote: {request.remote_addr} | Body: {body_peek}", flush=True)
+
+
+@app.after_request
+def log_parkour_response(response):
+    if request.path in _PARKOUR_CORE_PATHS and request.method != "OPTIONS":
+        t0 = getattr(g, "_parkour_t0", None)
+        dur_ms = int(round((time.time() - t0) * 1000)) if t0 else 0
+        ctype = response.headers.get("Content-Type", "")
+        res_body = ""
+        if "image" in ctype or getattr(response, "direct_passthrough", False):
+            cl = response.headers.get("Content-Length")
+            res_body = f"[{ctype}: {cl or 'binary'} bytes]"
+        else:
+            try:
+                if response.is_json:
+                    j_data = response.get_json(silent=True)
+                    if j_data is not None:
+                        res_body = json.dumps(j_data, separators=(",", ":"))
+                        if len(res_body) > 600:
+                            res_body = res_body[:600] + "...}"
+                    else:
+                        res_body = response.get_data(as_text=True)[:200]
+                else:
+                    res_body = response.get_data(as_text=True)[:200]
+            except Exception:
+                res_body = "[Streamed/Binary]"
+        print(f"[PARKOUR_RES] {request.method} {request.path} -> {response.status_code} ({dur_ms}ms) | Body: {res_body}", flush=True)
     return response
 
 
