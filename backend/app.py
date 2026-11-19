@@ -6982,9 +6982,10 @@ def _execute_alpr_kit_capture(is_capture=False, stream_url_param=""):
     active_cand = None
     if not stream_url_param and camera_stream_manager.running:
         active_cand = _find_live_track(now_epoch)
-        # Jika mobil baru saja masuk (< 0.5s) dan OCR background sedang berjalan, tunggu maks 0.8s (aman < 2s timeout Parkour)
+        # Jika mobil baru saja masuk (< 0.5s) dan OCR background sedang berjalan, tunggu maks 1.4s (aman < 2s timeout Parkour)
         if active_cand is None and _has_pending_live_vehicle(now_epoch):
-            wait_deadline = time.time() + 0.80
+            pending_wait_sec = float(os.environ.get("ANPR_PENDING_WAIT_SEC", "1.40"))
+            wait_deadline = time.time() + pending_wait_sec
             while time.time() < wait_deadline:
                 time.sleep(0.025)
                 active_cand = _find_live_track(time.time())
